@@ -493,6 +493,25 @@ td.strong { font-weight: 600; color: var(--text); }
 /* Key list mobile cards (desktop uses .key-list-table). */
 .key-list-cards { display: flex; flex-direction: column; gap: 10px; }
 
+/* Search + page summary above the table/cards. */
+.key-list-toolbar {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  margin-bottom: 12px;
+}
+.key-list-search {
+  flex: 1 1 220px; min-width: 0; max-width: 420px;
+}
+.key-list-summary { font-size: 12px; white-space: nowrap; }
+.key-list-pager {
+  display: flex; justify-content: center; align-items: center; gap: 12px;
+  margin-top: 14px; margin-bottom: 8px; flex-wrap: wrap;
+}
+.key-list-pager .page-info {
+  font-family: "Courier Prime", ui-monospace, Consolas, monospace;
+  font-size: 12px; color: var(--muted); min-width: 4em; text-align: center;
+}
+.key-list-pager .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
 /*
  * Desktop key list table: horizontal scroll at narrow desktop widths.
  * More-menu uses position:fixed while open, so overflow-x does not clip it.

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { listKeys } from "../api/keys";
 import type { KeyPublic, ModelRule } from "../types";
@@ -6,6 +6,9 @@ import KeyMoreMenu from "../components/KeyMoreMenu";
 import { MobileTabBar } from "../components/MobileChrome";
 import PlainKeyModal from "../components/PlainKeyModal";
 import { useT } from "../i18n";
+
+/** Default page size for the key list (client-side pagination). */
+export const KEY_LIST_PAGE_SIZE = 10;
 
 /** Deduplicate model rules by alias (case-insensitive) for chip display. */
 export function uniqueAliases(models: ModelRule[] | undefined): string[] {
@@ -19,6 +22,35 @@ export function uniqueAliases(models: ModelRule[] | undefined): string[] {
     }
   }
   return out;
+}
+
+/**
+ * Client-side filter for the key list. Matches id, name, key preview, and
+ * model aliases (case-insensitive substring). Empty query returns all keys.
+ */
+export function filterKeys(keys: KeyPublic[], query: string): KeyPublic[] {
+  const q = query.trim().toLowerCase();
+  if (!q) return keys;
+  return keys.filter((k) => {
+    if (k.id.toLowerCase().includes(q)) return true;
+    if ((k.name ?? "").toLowerCase().includes(q)) return true;
+    if ((k.key_preview ?? "").toLowerCase().includes(q)) return true;
+    for (const a of uniqueAliases(k.models)) {
+      if (a.toLowerCase().includes(q)) return true;
+    }
+    return false;
+  });
+}
+
+/** Slice one page from a filtered list (0-based page index). */
+export function paginateKeys<T>(
+  items: T[],
+  page: number,
+  pageSize: number = KEY_LIST_PAGE_SIZE,
+): T[] {
+  const safePage = Math.max(0, page);
+  const start = safePage * pageSize;
+  return items.slice(start, start + pageSize);
 }
 
 function fmtUsd(n: number): string {
@@ -41,6 +73,8 @@ export default function KeyList() {
   const [loading, setLoading] = useState(true);
   const [plain, setPlain] = useState<string | null>(null);
   const [plainTitle, setPlainTitle] = useState("");
+  const [query, setQuery] = useState("");
+  const [page, setPage] = useState(0);
 
   // silent: refresh after reset/rotate/delete without swapping the whole list for "loading…".
   const load = useCallback(async (mode: "full" | "silent" = "full") => {
@@ -62,6 +96,28 @@ export default function KeyList() {
     void load("full");
   }, [load]);
 
+  const filtered = useMemo(() => filterKeys(keys, query), [keys, query]);
+  const pageCount = Math.max(1, Math.ceil(filtered.length / KEY_LIST_PAGE_SIZE));
+  const safePage = Math.min(page, pageCount - 1);
+  const pageItems = useMemo(
+    () => paginateKeys(filtered, safePage, KEY_LIST_PAGE_SIZE),
+    [filtered, safePage],
+  );
+
+  // Keep page index in range when filter shrinks; reset to first page on new query.
+  useEffect(() => {
+    setPage(0);
+  }, [query]);
+
+  useEffect(() => {
+    setPage((p) => Math.min(p, Math.max(0, pageCount - 1)));
+  }, [pageCount]);
+
+  const onRotated = (plainKey: string) => {
+    setPlain(plainKey);
+    setPlainTitle(t("keys.rotated"));
+  };
+
   return (
     <div className="key-list">
       <div className="fp-head mobile-hidden" style={{ margin: "0 0 16px" }}>
@@ -77,50 +133,86 @@ export default function KeyList() {
         <div className="card muted">{t("keys.empty")}</div>
       ) : (
         <>
-          <div className="card table-wrap key-list-table mobile-hidden">
-            <table>
-              <thead>
-                <tr>
-                  <th>{t("keys.colIdName")}</th>
-                  <th>{t("keys.colStatus")}</th>
-                  <th>{t("keys.colPreview")}</th>
-                  <th>{t("keys.colRpm")}</th>
-                  <th>{t("keys.colUsage")}</th>
-                  <th>{t("keys.colModels")}</th>
-                  <th>{t("keys.colAliases")}</th>
-                  <th>{t("keys.colActions")}</th>
-                </tr>
-              </thead>
-              <tbody>
-                {keys.map((k) => (
-                  <KeyTableRow
+          <div className="key-list-toolbar">
+            <input
+              className="input key-list-search"
+              type="search"
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              placeholder={t("keys.searchPlaceholder")}
+              aria-label={t("keys.searchPlaceholder")}
+            />
+            <span className="muted key-list-summary">
+              {t("keys.pageSummary", { total: filtered.length })}
+            </span>
+          </div>
+          {filtered.length === 0 ? (
+            <div className="card muted">{t("keys.searchNoMatch")}</div>
+          ) : (
+            <>
+              <div className="card table-wrap key-list-table mobile-hidden">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>{t("keys.colIdName")}</th>
+                      <th>{t("keys.colStatus")}</th>
+                      <th>{t("keys.colPreview")}</th>
+                      <th>{t("keys.colRpm")}</th>
+                      <th>{t("keys.colUsage")}</th>
+                      <th>{t("keys.colModels")}</th>
+                      <th>{t("keys.colAliases")}</th>
+                      <th>{t("keys.colActions")}</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {pageItems.map((k) => (
+                      <KeyTableRow
+                        key={k.id}
+                        k={k}
+                        onResetComplete={refreshSilent}
+                        onRotated={onRotated}
+                        onDeleted={refreshSilent}
+                      />
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              <div className="key-list-cards mobile-only">
+                {pageItems.map((k) => (
+                  <KeyMobileCard
                     key={k.id}
                     k={k}
                     onResetComplete={refreshSilent}
-                    onRotated={(plainKey) => {
-                      setPlain(plainKey);
-                      setPlainTitle(t("keys.rotated"));
-                    }}
+                    onRotated={onRotated}
                     onDeleted={refreshSilent}
                   />
                 ))}
-              </tbody>
-            </table>
-          </div>
-          <div className="key-list-cards mobile-only">
-            {keys.map((k) => (
-              <KeyMobileCard
-                key={k.id}
-                k={k}
-                onResetComplete={refreshSilent}
-                onRotated={(plainKey) => {
-                  setPlain(plainKey);
-                  setPlainTitle(t("keys.rotated"));
-                }}
-                onDeleted={refreshSilent}
-              />
-            ))}
-          </div>
+              </div>
+              {pageCount > 1 && (
+                <div className="key-list-pager" role="navigation" aria-label="pagination">
+                  <button
+                    type="button"
+                    className="btn sm"
+                    disabled={safePage <= 0}
+                    onClick={() => setPage(safePage - 1)}
+                  >
+                    {t("keys.prevPage")}
+                  </button>
+                  <span className="page-info">
+                    {t("keys.pageInfo", { cur: safePage + 1, total: pageCount })}
+                  </span>
+                  <button
+                    type="button"
+                    className="btn sm"
+                    disabled={safePage >= pageCount - 1}
+                    onClick={() => setPage(safePage + 1)}
+                  >
+                    {t("keys.nextPage")}
+                  </button>
+                </div>
+              )}
+            </>
+          )}
         </>
       )}
 
