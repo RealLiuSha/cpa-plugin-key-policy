@@ -3,10 +3,12 @@ import { useNavigate, useParams, useLocation } from "react-router-dom";
 import { listKeys, patchKey, rotateKey, deleteKey } from "../api/keys";
 import type { KeyPublic, ModelRule } from "../types";
 import KeyForm from "../components/KeyForm";
-import KeyResetMenu from "../components/KeyResetMenu";
+import KeyMoreMenu, { type KeyMoreMenuItem } from "../components/KeyMoreMenu";
+import { MobileFormHeader, MobileTabBar } from "../components/MobileChrome";
 import PlainKeyModal from "../components/PlainKeyModal";
-import { MobileFormHeader, MobileTabBar } from "./KeyList";
 import { useT } from "../i18n";
+
+const EDIT_RESET_ITEMS: KeyMoreMenuItem[] = ["daily", "weekly", "rpm"];
 
 export default function KeyEdit() {
   const { id } = useParams<{ id: string }>();
@@ -72,13 +74,19 @@ export default function KeyEdit() {
     }
   };
 
+  const resetMenuProps = {
+    keyId: key.id,
+    items: EDIT_RESET_ITEMS,
+    summaryLabel: t("keys.reset"),
+  };
+
   return (
     <div className="form-page">
       <div className="fp-head mobile-hidden">
         <h1>{t("edit.hTitle")}</h1>
         <div className="fp-actions">
-          <KeyResetMenu keyId={key.id} />
-          <button className="btn sm" onClick={onRotate}>{t("keys.rotate")}</button>
+          <KeyMoreMenu {...resetMenuProps} />
+          <button className="btn sm" onClick={onRotate}>{t("keys.resetKey")}</button>
           <button className="btn sm" onClick={() => nav("/keys")}>{t("keyForm.cancel")}</button>
         </div>
       </div>
@@ -87,7 +95,7 @@ export default function KeyEdit() {
       </div>
       <MobileFormHeader title={title} backTo="/keys" />
       <div className="mobile-only mobile-key-reset">
-        <KeyResetMenu keyId={key.id} />
+        <KeyMoreMenu {...resetMenuProps} />
       </div>
       <KeyForm
         initial={initial}

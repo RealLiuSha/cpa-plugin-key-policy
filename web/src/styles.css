@@ -191,6 +191,7 @@ a:hover { color: var(--accent-2); text-decoration: underline; }
 .btn.danger { background-color: var(--danger); color: var(--on-accent); border-color: var(--danger); }
 .btn.danger:hover { background-color: var(--accent-3); filter: brightness(0.95); }
 .btn.sm { padding: 8px 10px; font-size: 13px; }
+a.btn { text-decoration: none; color: var(--text); }
 /* danger-outline: transparent bg, red text + border (for destructive actions
  * that shouldn't compete with the primary save button, e.g. 删除 Key). */
 .btn.danger-outline {
@@ -395,10 +396,15 @@ td.strong { font-weight: 600; color: var(--text); }
     max-height: 92vh;
   }
 
-  /* Tables are hidden on mobile — replaced by card stacks. The .card-stack
-     sibling is shown instead. */
+  /* Tables are hidden on mobile — replaced by card stacks / mobile layouts.
+     KeyForm pricing table re-enabled below; key-list uses mobile-hidden. */
   .card.table-wrap { display: none; }
-  .card-stack { display: block; }
+  /* Beat .mobile-only { display:block !important } so flex gap stacks cards. */
+  .key-list-cards.mobile-only {
+    display: flex !important;
+    flex-direction: column;
+    gap: 10px;
+  }
 
   /* Desktop action rows (refresh/newKey above the table) are hidden on
      mobile — FAB + pull-to-refresh replace them. */
@@ -425,8 +431,10 @@ td.strong { font-weight: 600; color: var(--text); }
     display: flex !important; justify-content: flex-end;
     position: relative; z-index: 20; margin-bottom: 14px;
   }
-  .mobile-key-reset .reset-menu-options {
-    top: calc(100% + 6px); right: 0; bottom: auto; left: auto;
+  /* Slightly larger hit targets on mobile key cards (still compact). */
+  .keycard .key-actions .btn.sm {
+    min-height: 40px;
+    padding: 10px 12px;
   }
   .form-page form.card { margin-top: 0; }
   .key-form.card { background: transparent; border: none; box-shadow: none; padding: 0; }
@@ -482,16 +490,47 @@ td.strong { font-weight: 600; color: var(--text); }
 }
 
 /* --- Mobile-only component classes (hidden on desktop, shown on mobile) --- */
-/* .card-stack: key list container. On mobile it's a vertical stack;
- * on desktop it becomes a responsive card grid (min-width:641px block). */
-.card-stack { display: flex; flex-direction: column; gap: 10px; }
-@media (min-width: 641px) {
-  .card-stack {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
-    gap: 16px;
-  }
+/* Key list mobile cards (desktop uses .key-list-table). */
+.key-list-cards { display: flex; flex-direction: column; gap: 10px; }
+
+/*
+ * Desktop key list table: horizontal scroll at narrow desktop widths.
+ * More-menu uses position:fixed while open, so overflow-x does not clip it.
+ */
+.key-list-table.card.table-wrap {
+  overflow-x: auto;
+  border-radius: var(--r-md);
 }
+.key-list-table table {
+  table-layout: auto;
+  min-width: 960px;
+}
+.key-list-table th,
+.key-list-table td { vertical-align: middle; }
+.key-list-table thead th:first-child { border-top-left-radius: var(--r-md); }
+.key-list-table thead th:last-child { border-top-right-radius: var(--r-md); }
+.key-list-table .key-id { font-weight: 600; }
+.key-list-table .key-name { font-size: 12px; margin-top: 2px; }
+.key-list-table .key-usage-cell { white-space: nowrap; font-size: 12px; }
+.key-list-table .key-actions-cell { white-space: nowrap; }
+.key-list-table .key-actions { flex-wrap: nowrap; }
+/* Dim content cells only — never the actions cell (menu is a DOM descendant;
+ * opacity on an ancestor would dim/stack-trap a position:fixed panel). */
+.key-list-table tr.row-disabled > td:not(.key-actions-cell) { opacity: 0.65; }
+.key-actions {
+  display: flex; flex-wrap: wrap; gap: 6px; align-items: center;
+}
+.key-alias-chips {
+  display: flex; flex-wrap: wrap; gap: 4px; max-width: 200px;
+}
+.key-alias-chips .chip,
+.kc-chips .chip {
+  font-size: 11px; padding: 2px 8px; border-radius: var(--r-sm);
+  background: var(--muted-bg); color: var(--muted);
+  border: 1px solid var(--border);
+}
+.key-alias-chips .chip.more,
+.kc-chips .chip.more { color: var(--muted); font-weight: 600; }
 
 /* .tabbar: bottom sticky navigation. Hidden on desktop by the min-width
    block; shown on mobile by the max-width block below. */
@@ -537,20 +576,29 @@ td.strong { font-weight: 600; color: var(--text); }
   .fab { display: inline-flex; }
 }
 
-/* .keycard: one key in the mobile list. */
+/* .keycard: one key in the mobile list (explicit edit/detail/more; no swipe).
+ * Vertical spacing comes from .key-list-cards flex gap (margin stays 0). */
 .keycard {
   background: var(--panel);
   border: 1px solid var(--border);
   border-radius: var(--r-md);
   padding: 14px;
-  margin-bottom: 10px;
-  cursor: pointer;
+  margin-bottom: 0;
+  cursor: default;
   transition: border-color var(--t-fast), box-shadow var(--t-fast);
   position: relative;
-  overflow: hidden;
+  overflow: visible;
 }
 .keycard:hover { border-color: var(--border-hover); }
-.keycard.disabled { opacity: 0.55; }
+/* Disabled: mute content only. Never opacity the whole card — that creates a
+ * stacking context and dims the fixed more-menu panel (and can lose to tabbar). */
+.keycard.disabled .kc-name,
+.keycard.disabled .kc-preview,
+.keycard.disabled .kc-meta,
+.keycard.disabled .kc-chips,
+.keycard.disabled .kc-bar {
+  opacity: 0.55;
+}
 .keycard .kc-head {
   display: flex; align-items: center; gap: 8px;
   margin-bottom: 6px;
@@ -561,7 +609,6 @@ td.strong { font-weight: 600; color: var(--text); }
 }
 .keycard.disabled .kc-dot { background: var(--danger); }
 .keycard .kc-name { font-weight: 600; font-size: 15px; flex: 1; }
-.keycard .kc-chevron { color: var(--muted); font-size: 16px; }
 .keycard .kc-preview {
   font-family: "Courier Prime", ui-monospace, Consolas, monospace;
   font-size: 12px; color: var(--muted);
@@ -585,72 +632,40 @@ td.strong { font-weight: 600; color: var(--text); }
 .keycard .kc-chips {
   display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px;
 }
-.keycard .kc-chips .chip {
-  font-size: 11px; padding: 2px 8px; border-radius: var(--r-sm);
-  background: var(--muted-bg); color: var(--muted);
-  border: 1px solid var(--border);
-}
-.keycard .kc-chips .chip.more { color: var(--muted); font-weight: 600; }
-/* swipe-to-revoke layer */
-.keycard .kc-revoke {
-  position: absolute; top: 0; right: 0; bottom: 0;
-  width: 88px; display: flex; flex-direction: column;
-  align-items: center; justify-content: center; gap: 4px;
-  background: var(--danger-soft); color: var(--danger);
-  font-size: 11px; font-weight: 700; letter-spacing: 0.04em;
-  border-radius: 0 var(--r-md) var(--r-md) 0;
-}
-.keycard .kc-revoke .revoke-icon { font-size: 18px; }
-
-/* Desktop hover action row (>= 641px). Not an overlay — it sits at the
- * card footer and expands on hover/focus-within, so card info stays visible
- * and the 5 buttons never get clipped (Stitch's inset-0 overlay clipped them
- * on short cards). */
 .keycard .kc-actions {
-  display: none; /* hidden on mobile; grid shown on desktop */
-}
-@media (min-width: 641px) {
-  .keycard { cursor: default; margin-bottom: 0; }
-  .keycard:hover { border-color: var(--border-hover); box-shadow: 0 0 0 3px var(--accent-ring); }
-  .keycard .kc-actions {
-    display: flex; flex-wrap: wrap; gap: 6px;
-    margin-top: 12px; padding-top: 12px;
-    border-top: 1px solid var(--border);
-    max-height: 0; overflow: hidden; opacity: 0;
-    pointer-events: none;
-    margin-top: 0; padding-top: 0; border-top-width: 0;
-    transition: max-height var(--t-fast), opacity var(--t-fast), margin-top var(--t-fast), padding-top var(--t-fast), border-top-width var(--t-fast);
-  }
-  .keycard:hover .kc-actions,
-  .keycard:focus-within .kc-actions,
-  .keycard.reset-open .kc-actions {
-    max-height: 80px; opacity: 1; pointer-events: auto;
-    margin-top: 12px; padding-top: 12px; border-top-width: 1px;
-  }
-  .keycard.disabled .kc-actions { max-height: 0 !important; opacity: 0 !important; overflow: hidden; pointer-events: none; }
-  .keycard .kc-actions .btn { flex: 0 0 auto; }
-  .keycard.reset-open { overflow: visible; z-index: 10; }
-  .keycard.reset-open .kc-actions { overflow: visible; }
+  display: flex; flex-wrap: wrap; gap: 6px;
+  margin-top: 12px; padding-top: 12px;
+  border-top: 1px solid var(--border);
+  /* No z-index / no stacking context: fixed more-menu must paint against the
+   * root so it can sit above the tab bar (z-index 100). */
 }
 
-.reset-menu { position: relative; }
-.reset-menu > summary { list-style: none; }
-.reset-menu > summary::-webkit-details-marker { display: none; }
-.reset-menu-options {
-  position: absolute; left: 0; bottom: calc(100% + 6px); z-index: 20;
-  min-width: 112px; padding: 4px;
+/* More menu: panel is position:fixed while open (inline style from JS). */
+.more-menu { position: relative; display: inline-block; }
+.more-menu > summary { list-style: none; }
+.more-menu > summary::-webkit-details-marker { display: none; }
+.more-menu-options {
+  position: absolute; right: 0; bottom: calc(100% + 6px); z-index: 30;
+  min-width: 128px; padding: 4px;
   background: var(--panel); border: 1px solid var(--border);
   border-radius: var(--r-md); box-shadow: var(--shadow-lg);
 }
-.reset-menu-options button {
+.more-menu-options button {
   display: block; width: 100%; padding: 8px 10px;
   border: 0; border-radius: var(--r-sm); background: transparent;
   color: var(--text); cursor: pointer; font: inherit; font-size: 13px;
   text-align: left; white-space: nowrap;
 }
-.reset-menu-options button:hover,
-.reset-menu-options button:focus-visible {
+.more-menu-options button:hover,
+.more-menu-options button:focus-visible {
   background: var(--muted-bg); outline: none;
+}
+.more-menu-options button.danger {
+  color: var(--danger);
+}
+.more-menu-options button.danger:hover,
+.more-menu-options button.danger:focus-visible {
+  background: var(--danger-soft);
 }
 
 /* .usage-hero: the big-number card at the top of the mobile usage page. */
@@ -900,11 +915,10 @@ td.strong { font-weight: 600; color: var(--text); }
 .sechead { display: flex; justify-content: space-between; align-items: center; margin: 16px 0 10px; }
 .sechead .sh-chevron { color: var(--muted); cursor: pointer; }
 
-/* Hide mobile-only blocks on desktop. .card-stack is NOT hidden — it
- * becomes the desktop card grid (see above). .usage-hero stays hidden on
- * desktop because the desktop usage page uses .usage-hero-d instead.
- * .seg is hidden on desktop globally, but the KeyUsage header's toggle is
- * un-hidden below so daily/weekly still works on desktop. */
+/* Hide mobile-only blocks on desktop. .usage-hero stays hidden on desktop
+ * because the desktop usage page uses .usage-hero-d instead. .seg is hidden
+ * on desktop globally, but the KeyUsage header's toggle is un-hidden below
+ * so daily/weekly still works on desktop. */
 @media (min-width: 641px) {
   .tabbar, .fab, .bar-rank,
   .detail-card, .mmodels, .section-label, .sechead, .seg,

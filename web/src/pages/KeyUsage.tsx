@@ -3,7 +3,7 @@ import { Link, useParams } from "react-router-dom";
 import { fetchKeyUsage } from "../api/keys";
 import type { AliasUsageEntry, KeyUsageResponse, UsageWindow } from "../types";
 import { useT } from "../i18n";
-import { MobileTabBar } from "./KeyList";
+import { MobileTabBar } from "../components/MobileChrome";
 
 // Window switch for the per-alias breakdown table: each alias row has its own
 // daily and rolling-weekly window, and the user toggles which one all rows

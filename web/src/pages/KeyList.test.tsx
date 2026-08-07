@@ -24,7 +24,7 @@ vi.mock("../i18n", () => ({
 }));
 
 import KeyList from "./KeyList";
-import { listKeys, resetRPM, resetUsage } from "../api/keys";
+import { deleteKey, listKeys, resetRPM, resetUsage, rotateKey } from "../api/keys";
 
 const key: KeyPublic = {
   id: "team-a",
@@ -32,7 +32,10 @@ const key: KeyPublic = {
   enabled: true,
   key_preview: "cpa_te...am-a",
   rpm: 60,
-  models: [],
+  models: [
+    { alias: "gpt-4o", provider: "openai", target_model: "gpt-4o" },
+    { alias: "claude", provider: "anthropic", target_model: "claude-3" },
+  ],
   daily_limit_usd: 10,
   weekly_limit_usd: 50,
   usage: {
@@ -45,7 +48,7 @@ const key: KeyPublic = {
 
 const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
 
-describe("KeyList reset menu", () => {
+describe("KeyList table and more menu", () => {
   let container: HTMLDivElement;
   let root: ReturnType<typeof createRoot>;
 
@@ -53,6 +56,13 @@ describe("KeyList reset menu", () => {
     container = document.createElement("div");
     document.body.appendChild(container);
     (listKeys as ReturnType<typeof vi.fn>).mockResolvedValue([key]);
+    (rotateKey as ReturnType<typeof vi.fn>).mockResolvedValue({
+      plain_key: "cpa_new_plain_secret",
+      key,
+    });
+    (deleteKey as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
+    (resetRPM as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
+    (resetUsage as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
     vi.stubGlobal("confirm", vi.fn(() => true));
   });
 
@@ -63,14 +73,26 @@ describe("KeyList reset menu", () => {
     vi.clearAllMocks();
   });
 
-  const resetButton = (label: string) =>
-    Array.from(container.querySelectorAll<HTMLButtonElement>(".reset-menu button")).find(
+  const renderList = async () => {
+    await act(async () => {
+      root = createRoot(container);
+      root.render(
+        <MemoryRouter>
+          <KeyList />
+        </MemoryRouter>,
+      );
+      await tick();
+    });
+  };
+
+  const menuButton = (label: string) =>
+    Array.from(container.querySelectorAll<HTMLButtonElement>(".more-menu button")).find(
       (button) => button.textContent === label,
     );
 
-  const openResetMenu = async () => {
-    const details = container.querySelector<HTMLDetailsElement>(".reset-menu");
-    if (!details) throw new Error("reset menu not found");
+  const openMoreMenu = async () => {
+    const details = container.querySelector<HTMLDetailsElement>(".key-list-table .more-menu");
+    if (!details) throw new Error("more menu not found");
     await act(async () => {
       details.open = true;
       details.dispatchEvent(new Event("toggle"));
@@ -79,109 +101,248 @@ describe("KeyList reset menu", () => {
     return details;
   };
 
-  it("dispatches daily, weekly, and RPM resets from one menu", async () => {
-    await act(async () => {
-      root = createRoot(container);
-      root.render(
-        <MemoryRouter>
-          <KeyList />
-        </MemoryRouter>,
-      );
-      await tick();
-    });
+  it("renders a desktop table with required columns and cell content", async () => {
+    await renderList();
 
-    const details = container.querySelector<HTMLDetailsElement>(".reset-menu");
+    const table = container.querySelector(".key-list-table table");
+    expect(table).not.toBeNull();
+
+    const headers = Array.from(table!.querySelectorAll("thead th")).map((th) => th.textContent);
+    expect(headers).toEqual([
+      "keys.colIdName",
+      "keys.colStatus",
+      "keys.colPreview",
+      "keys.colRpm",
+      "keys.colUsage",
+      "keys.colModels",
+      "keys.colAliases",
+      "keys.colActions",
+    ]);
+
+    const row = table!.querySelector("tbody tr");
+    expect(row).not.toBeNull();
+    expect(row!.textContent).toContain("team-a");
+    expect(row!.textContent).toContain("Team A");
+    expect(row!.textContent).toContain("keys.enabled");
+    expect(row!.textContent).toContain("cpa_te...am-a");
+    expect(row!.textContent).toContain("60");
+    expect(row!.textContent).toContain("gpt-4o");
+    expect(row!.textContent).toContain("claude");
+  });
+
+  it("exposes edit and detail links with correct routes", async () => {
+    await renderList();
+
+    const edit = container.querySelector<HTMLAnchorElement>(
+      '.key-list-table a[href="/keys/team-a/edit"]',
+    );
+    const detail = container.querySelector<HTMLAnchorElement>(
+      '.key-list-table a[href="/keys/team-a/usage"]',
+    );
+    expect(edit).not.toBeNull();
+    expect(edit?.textContent).toBe("keys.edit");
+    expect(detail).not.toBeNull();
+    expect(detail?.textContent).toBe("keys.detail");
+  });
+
+  it("lists more-menu items in fixed order including danger delete", async () => {
+    await renderList();
+
+    const details = container.querySelector<HTMLDetailsElement>(".key-list-table .more-menu");
     expect(details).not.toBeNull();
-    expect(details?.textContent).toContain("keys.resetDaily");
-    expect(details?.textContent).toContain("keys.resetWeekly");
-    expect(details?.textContent).toContain("keys.resetRpm");
+    expect(details?.querySelector("summary")?.textContent).toContain("keys.more");
+
+    const labels = Array.from(details!.querySelectorAll<HTMLButtonElement>("button")).map(
+      (b) => b.textContent,
+    );
+    expect(labels).toEqual([
+      "keys.resetDaily",
+      "keys.resetWeekly",
+      "keys.resetRpm",
+      "keys.resetKey",
+      "keys.delete",
+    ]);
+    const deleteBtn = menuButton("keys.delete");
+    expect(deleteBtn?.classList.contains("danger")).toBe(true);
+  });
+
+  it("dispatches daily, weekly, and RPM resets with correct confirm/API paths", async () => {
+    await renderList();
 
     await act(async () => {
-      resetButton("keys.resetDaily")?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      menuButton("keys.resetDaily")?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
       await tick();
     });
-
     expect(confirm).toHaveBeenCalledWith("keys.resetDailyConfirm");
     expect(resetUsage).toHaveBeenCalledWith("team-a", "daily");
 
     await act(async () => {
-      resetButton("keys.resetWeekly")?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      menuButton("keys.resetWeekly")?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
       await tick();
     });
     expect(confirm).toHaveBeenCalledWith("keys.resetWeeklyConfirm");
     expect(resetUsage).toHaveBeenCalledWith("team-a", "weekly");
 
     await act(async () => {
-      resetButton("keys.resetRpm")?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      menuButton("keys.resetRpm")?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
       await tick();
     });
     expect(resetRPM).toHaveBeenCalledWith("team-a");
+    // RPM has no confirm; only daily + weekly confirmed above.
     expect(confirm).toHaveBeenCalledTimes(2);
   });
 
-  it("does not reset a usage window when confirmation is cancelled", async () => {
-    vi.mocked(confirm).mockReturnValue(false);
+  it("rotates with confirm, API call, and one-time plain key modal", async () => {
+    await renderList();
+
     await act(async () => {
-      root = createRoot(container);
-      root.render(
-        <MemoryRouter>
-          <KeyList />
-        </MemoryRouter>,
-      );
+      menuButton("keys.resetKey")?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
       await tick();
     });
 
-    await act(async () => {
-      resetButton("keys.resetWeekly")?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
-      await tick();
-    });
-
-    expect(confirm).toHaveBeenCalledWith("keys.resetWeeklyConfirm");
-    expect(resetUsage).not.toHaveBeenCalled();
+    expect(confirm).toHaveBeenCalledWith("keys.rotateConfirm");
+    expect(rotateKey).toHaveBeenCalledWith("team-a");
+    expect(container.textContent).toContain("cpa_new_plain_secret");
+    expect(container.querySelector(".modal")).not.toBeNull();
   });
 
-  it("closes the reset menu on an outside pointer press", async () => {
+  it("deletes with confirm and deleteKey API", async () => {
+    await renderList();
+
     await act(async () => {
-      root = createRoot(container);
-      root.render(
-        <MemoryRouter>
-          <KeyList />
-        </MemoryRouter>,
-      );
+      menuButton("keys.delete")?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
       await tick();
     });
 
-    const details = await openResetMenu();
+    expect(confirm).toHaveBeenCalledWith("keys.deleteConfirm");
+    expect(deleteKey).toHaveBeenCalledWith("team-a");
+  });
+
+  it("does not call API when confirmation is cancelled", async () => {
+    vi.mocked(confirm).mockReturnValue(false);
+    await renderList();
+
+    await act(async () => {
+      menuButton("keys.resetWeekly")?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      await tick();
+    });
+    expect(resetUsage).not.toHaveBeenCalled();
+
+    await act(async () => {
+      menuButton("keys.resetKey")?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      await tick();
+    });
+    expect(rotateKey).not.toHaveBeenCalled();
+
+    await act(async () => {
+      menuButton("keys.delete")?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      await tick();
+    });
+    expect(deleteKey).not.toHaveBeenCalled();
+  });
+
+  it("closes the more menu on outside pointer press and Escape", async () => {
+    await renderList();
+
+    const details = await openMoreMenu();
     expect(details.open).toBe(true);
-    expect(details.closest(".keycard")?.classList.contains("reset-open")).toBe(true);
 
     await act(async () => {
       document.body.dispatchEvent(new Event("pointerdown", { bubbles: true }));
       await tick();
     });
-
     expect(details.open).toBe(false);
-    expect(details.closest(".keycard")?.classList.contains("reset-open")).toBe(false);
-  });
 
-  it("closes the reset menu on Escape", async () => {
-    await act(async () => {
-      root = createRoot(container);
-      root.render(
-        <MemoryRouter>
-          <KeyList />
-        </MemoryRouter>,
-      );
-      await tick();
-    });
-
-    const details = await openResetMenu();
+    await openMoreMenu();
     await act(async () => {
       document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
       await tick();
     });
-
     expect(details.open).toBe(false);
     expect(document.activeElement).toBe(details.querySelector("summary"));
+  });
+
+  it("does not navigate when the table row body is clicked", async () => {
+    await renderList();
+
+    const row = container.querySelector(".key-list-table tbody tr");
+    expect(row).not.toBeNull();
+    // No onClick / role=link / data-nav on the row — only explicit action links.
+    expect(row!.getAttribute("onclick")).toBeNull();
+    expect(row!.getAttribute("role")).not.toBe("link");
+    const rowLinks = row!.querySelectorAll("a");
+    // Only the action column links, not a whole-row wrapper.
+    expect(rowLinks.length).toBe(2);
+    expect(Array.from(rowLinks).every((a) => a.closest(".key-actions"))).toBe(true);
+  });
+
+  it("mobile cards expose edit/detail/more without swipe revoke or whole-card nav", async () => {
+    await renderList();
+
+    const stack = container.querySelector(".key-list-cards.mobile-only");
+    expect(stack).not.toBeNull();
+    const card = stack!.querySelector(".keycard");
+    expect(card).not.toBeNull();
+    expect(card!.querySelector(".kc-revoke")).toBeNull();
+    expect(card!.querySelector(".kc-actions .more-menu")).not.toBeNull();
+
+    const edit = card!.querySelector('a[href="/keys/team-a/edit"]');
+    const detail = card!.querySelector('a[href="/keys/team-a/usage"]');
+    expect(edit).not.toBeNull();
+    expect(detail).not.toBeNull();
+
+    // Card itself is not a navigation control.
+    expect(card!.getAttribute("role")).not.toBe("link");
+    expect(card!.getAttribute("onclick")).toBeNull();
+  });
+
+  it("styles keep mobile card stack as flex+gap so spacing survives .mobile-only block", async () => {
+    // Structural guard: .mobile-only { display:block !important } would zero out
+    // flex gap unless .key-list-cards.mobile-only reasserts flex with !important.
+    const { readFileSync } = await import("node:fs");
+    const { resolve } = await import("node:path");
+    const css = readFileSync(resolve(__dirname, "../styles.css"), "utf8");
+    expect(css).toMatch(/\.key-list-cards\.mobile-only\s*\{[^}]*display:\s*flex\s*!important/s);
+    expect(css).toMatch(/\.key-list-cards\.mobile-only\s*\{[^}]*gap:\s*10px/s);
+    expect(css).toMatch(/\.key-list-cards\s*\{[^}]*display:\s*flex/s);
+    expect(css).not.toMatch(
+      /@media\s*\(max-width:\s*640px\)[\s\S]*?\.key-list-cards\s*\{\s*display:\s*block/,
+    );
+  });
+
+  it("does not create ancestor stacking contexts that trap the fixed more-menu", async () => {
+    const { readFileSync } = await import("node:fs");
+    const { resolve } = await import("node:path");
+    const css = readFileSync(resolve(__dirname, "../styles.css"), "utf8");
+    // Regression: z-index on .kc-actions or .keycard.menu-open re-traps fixed
+    // panels under tabbar (z-index 100). Assert neither exists as a property.
+    const actionsBlock = css.match(/\.keycard \.kc-actions\s*\{[^}]*\}/s)?.[0] ?? "";
+    expect(actionsBlock).not.toMatch(/(?<![\w-])z-index\s*:/);
+    expect(css).not.toMatch(/\.keycard\.menu-open\s*\{[^}]*z-index\s*:/);
+    // Whole-card/row opacity would dim fixed menus and create stacking contexts.
+    expect(css).not.toMatch(/\.keycard\.disabled\s*\{[^}]*opacity\s*:/);
+    expect(css).not.toMatch(/tr\.row-disabled\s*>\s*td\s*\{[^}]*opacity\s*:/);
+    expect(css).toMatch(
+      /tr\.row-disabled\s*>\s*td:not\(\.key-actions-cell\)\s*\{[^}]*opacity\s*:/,
+    );
+    // Narrow desktop: table scrolls horizontally instead of collapsing columns.
+    expect(css).toMatch(/\.key-list-table\.card\.table-wrap\s*\{[^}]*overflow-x:\s*auto/s);
+    expect(css).toMatch(/\.key-list-table table\s*\{[^}]*min-width:\s*960px/s);
+  });
+
+  it("positions the open more-menu panel with fixed so it escapes overflow/stacking", async () => {
+    await renderList();
+    const details = container.querySelector<HTMLDetailsElement>(".key-list-table .more-menu");
+    expect(details).not.toBeNull();
+    await act(async () => {
+      details!.open = true;
+      details!.dispatchEvent(new Event("toggle"));
+      await tick();
+      await tick();
+    });
+    const panel = details!.querySelector<HTMLElement>(".more-menu-options");
+    expect(panel).not.toBeNull();
+    expect(panel!.style.position).toBe("fixed");
+    expect(panel!.style.zIndex).toBe("200");
   });
 });

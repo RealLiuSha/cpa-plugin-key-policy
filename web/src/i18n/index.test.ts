@@ -31,7 +31,7 @@ describe("translate", () => {
   it("interpolates {{name}} placeholders", () => {
     _resetLocale("en");
     expect(translate("keys.rotateConfirm", { id: "team-a" })).toBe(
-      "Rotate the key for team-a? The old key becomes invalid immediately.",
+      "Reset the secret for key team-a? The old key becomes invalid immediately.",
     );
     expect(translate("edit.title", { id: "foo" })).toBe("Edit Key · foo");
   });
@@ -43,13 +43,25 @@ describe("translate", () => {
     expect(translate("login.memoryNote")).toContain("記憶體");
   });
 
-  it("uses compact labels for the shared reset menu", () => {
+  it("provides more-menu and table labels in all four locales", () => {
     _resetLocale("zh-CN");
+    expect(translate("keys.more")).toBe("更多");
     expect(translate("keys.reset")).toBe("重置");
-    expect(translate("keys.resetRpm")).toBe("RPM");
+    expect(translate("keys.resetRpm")).toBe("重置 RPM");
+    expect(translate("keys.resetKey")).toBe("重置密钥");
+    expect(translate("keys.colAliases")).toBe("模型别名");
     _resetLocale("en");
+    expect(translate("keys.more")).toBe("More");
     expect(translate("keys.reset")).toBe("Reset");
-    expect(translate("keys.resetRpm")).toBe("RPM");
+    expect(translate("keys.resetRpm")).toBe("Reset RPM");
+    expect(translate("keys.resetKey")).toBe("Reset key");
+    expect(translate("keys.colAliases")).toBe("Aliases");
+    _resetLocale("zh-TW");
+    expect(translate("keys.more")).toBe("更多");
+    expect(translate("keys.resetKey")).toBe("重設金鑰");
+    _resetLocale("ru");
+    expect(translate("keys.more")).toBe("Ещё");
+    expect(translate("keys.resetKey")).toBe("Сбросить ключ");
   });
 
   it("falls back to zh-CN base for a key missing in the requested locale", () => {

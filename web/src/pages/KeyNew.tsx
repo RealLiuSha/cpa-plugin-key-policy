@@ -3,7 +3,7 @@ import { useNavigate, useLocation } from "react-router-dom";
 import { createKey } from "../api/keys";
 import KeyForm from "../components/KeyForm";
 import PlainKeyModal from "../components/PlainKeyModal";
-import { MobileFormHeader, MobileTabBar } from "./KeyList";
+import { MobileFormHeader, MobileTabBar } from "../components/MobileChrome";
 import { useT } from "../i18n";
 import type { KeyPublic, ModelRule } from "../types";
 

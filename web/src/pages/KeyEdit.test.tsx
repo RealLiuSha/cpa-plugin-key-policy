@@ -50,7 +50,7 @@ const key: KeyPublic = {
 
 const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
 
-describe("KeyEdit reset menu", () => {
+describe("KeyEdit reset more-menu", () => {
   let container: HTMLDivElement;
   let root: ReturnType<typeof createRoot>;
 
@@ -81,10 +81,11 @@ describe("KeyEdit reset menu", () => {
       await tick();
     });
 
-    const desktopDetails = container.querySelector<HTMLDetailsElement>(".fp-head .reset-menu");
+    const desktopDetails = container.querySelector<HTMLDetailsElement>(".fp-head .more-menu");
     expect(desktopDetails).not.toBeNull();
+    expect(desktopDetails?.querySelector("summary")?.textContent).toContain("keys.reset");
 
-    const mobileDetails = container.querySelector<HTMLDetailsElement>(".mobile-key-reset .reset-menu");
+    const mobileDetails = container.querySelector<HTMLDetailsElement>(".mobile-key-reset .more-menu");
     expect(mobileDetails).not.toBeNull();
     expect(mobileDetails?.querySelector("summary")?.textContent).toContain("keys.reset");
     const buttons = Array.from(mobileDetails?.querySelectorAll<HTMLButtonElement>("button") ?? []);
@@ -93,6 +94,9 @@ describe("KeyEdit reset menu", () => {
       "keys.resetWeekly",
       "keys.resetRpm",
     ]);
+    // Edit page stays reset-only — no rotate/delete in the more menu.
+    expect(buttons.some((b) => b.textContent === "keys.resetKey")).toBe(false);
+    expect(buttons.some((b) => b.textContent === "keys.delete")).toBe(false);
 
     await act(async () => {
       buttons[0]?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
