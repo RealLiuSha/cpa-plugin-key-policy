@@ -1,5 +1,6 @@
 import { act } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { Simulate } from "react-dom/test-utils";
 
 (globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -23,8 +24,19 @@ vi.mock("../i18n", () => ({
   useT: () => translate,
 }));
 
-import KeyList from "./KeyList";
+import KeyList, {
+  KEY_LIST_PAGE_SIZE,
+  filterKeys,
+  paginateKeys,
+} from "./KeyList";
 import { deleteKey, listKeys, resetRPM, resetUsage, rotateKey } from "../api/keys";
+
+const baseUsage = {
+  daily_usd: 1,
+  weekly_usd: 2,
+  daily_limit_usd: 10,
+  weekly_limit_usd: 50,
+};
 
 const key: KeyPublic = {
   id: "team-a",
@@ -45,6 +57,21 @@ const key: KeyPublic = {
     weekly_limit_usd: 50,
   },
 };
+
+function makeKey(id: string, overrides: Partial<KeyPublic> = {}): KeyPublic {
+  return {
+    id,
+    name: overrides.name ?? id,
+    enabled: true,
+    key_preview: overrides.key_preview ?? `cpa_${id.slice(0, 4)}...`,
+    rpm: 0,
+    models: overrides.models ?? [],
+    daily_limit_usd: 0,
+    weekly_limit_usd: 0,
+    usage: baseUsage,
+    ...overrides,
+  };
+}
 
 const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
 
@@ -344,5 +371,89 @@ describe("KeyList table and more menu", () => {
     expect(panel).not.toBeNull();
     expect(panel!.style.position).toBe("fixed");
     expect(panel!.style.zIndex).toBe("200");
+  });
+
+  it("filters and paginates the list client-side (default page size 10)", async () => {
+    const many = Array.from({ length: 12 }, (_, i) =>
+      makeKey(`key-${String(i + 1).padStart(2, "0")}`, {
+        name: i === 0 ? "Alpha Team" : `Key ${i + 1}`,
+        models: i === 1 ? [{ alias: "special-model", provider: "p", target_model: "m" }] : [],
+      }),
+    );
+    (listKeys as ReturnType<typeof vi.fn>).mockResolvedValue(many);
+    await renderList();
+
+    // Default page: first 10 of 12.
+    expect(KEY_LIST_PAGE_SIZE).toBe(10);
+    expect(container.querySelectorAll(".key-list-table tbody tr")).toHaveLength(10);
+    expect(container.textContent).toContain("key-01");
+    expect(container.textContent).not.toContain("key-11");
+
+    const pager = container.querySelector(".key-list-pager");
+    expect(pager).not.toBeNull();
+    expect(pager!.textContent).toContain("keys.pageInfo");
+
+    const next = Array.from(pager!.querySelectorAll("button")).find(
+      (b) => b.textContent === "keys.nextPage",
+    );
+    expect(next).not.toBeNull();
+    await act(async () => {
+      next!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      await tick();
+    });
+    expect(container.querySelectorAll(".key-list-table tbody tr")).toHaveLength(2);
+    expect(container.textContent).toContain("key-11");
+    expect(container.textContent).toContain("key-12");
+    expect(container.textContent).not.toContain("key-01");
+
+    const search = container.querySelector<HTMLInputElement>(".key-list-search");
+    expect(search).not.toBeNull();
+    await act(async () => {
+      Simulate.change(search!, { target: { value: "Alpha" } } as never);
+      await tick();
+    });
+    expect(container.querySelectorAll(".key-list-table tbody tr")).toHaveLength(1);
+    expect(container.textContent).toContain("key-01");
+    expect(container.textContent).toContain("Alpha Team");
+    // Search collapses to one page — pager hidden.
+    expect(container.querySelector(".key-list-pager")).toBeNull();
+
+    await act(async () => {
+      Simulate.change(search!, { target: { value: "special-model" } } as never);
+      await tick();
+    });
+    expect(container.querySelectorAll(".key-list-table tbody tr")).toHaveLength(1);
+    expect(container.textContent).toContain("key-02");
+
+    await act(async () => {
+      Simulate.change(search!, { target: { value: "no-such-key-zzzz" } } as never);
+      await tick();
+    });
+    expect(container.textContent).toContain("keys.searchNoMatch");
+    expect(container.querySelector(".key-list-table")).toBeNull();
+  });
+});
+
+describe("filterKeys and paginateKeys", () => {
+  const sample = [
+    makeKey("alpha", { name: "Alpha", models: [{ alias: "gpt-4o", provider: "o", target_model: "g" }] }),
+    makeKey("beta", { name: "Beta", key_preview: "cpa_be...ta" }),
+    makeKey("gamma", { name: "Other" }),
+  ];
+
+  it("matches id, name, preview, and model alias", () => {
+    expect(filterKeys(sample, "ALP").map((k) => k.id)).toEqual(["alpha"]);
+    expect(filterKeys(sample, "beta").map((k) => k.id)).toEqual(["beta"]);
+    expect(filterKeys(sample, "cpa_be").map((k) => k.id)).toEqual(["beta"]);
+    expect(filterKeys(sample, "gpt-4o").map((k) => k.id)).toEqual(["alpha"]);
+    expect(filterKeys(sample, "  ").map((k) => k.id)).toEqual(["alpha", "beta", "gamma"]);
+  });
+
+  it("slices pages with the default page size of 10", () => {
+    const items = Array.from({ length: 25 }, (_, i) => i);
+    expect(paginateKeys(items, 0)).toEqual(items.slice(0, 10));
+    expect(paginateKeys(items, 1)).toEqual(items.slice(10, 20));
+    expect(paginateKeys(items, 2)).toEqual(items.slice(20, 25));
+    expect(KEY_LIST_PAGE_SIZE).toBe(10);
   });
 });
