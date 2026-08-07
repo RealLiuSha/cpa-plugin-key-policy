@@ -500,7 +500,8 @@ func (a *App) managementRegistration() ManagementRegistrationResponse {
 			{Method: http.MethodPost, Path: base + "/catalog", Description: "Build auth-file model picker catalog with classify + built-in groups."},
 		},
 		Resources: []ResourceRoute{
-			{Path: web.IndexPath, Menu: "Key Policy", Description: "Web UI for managing downstream CPA key policies (create keys, pick models)."},
+			// TRADEOFF: host menu is static Chinese only, revisit when CPA supports locale maps
+			{Path: web.IndexPath, Menu: "密钥策略", Description: "Web UI for managing downstream CPA key policies (create keys, pick models)."},
 		},
 	}
 }

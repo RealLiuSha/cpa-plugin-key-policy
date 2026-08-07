@@ -322,6 +322,9 @@ func TestManagementRegistrationDeclaresResource(t *testing.T) {
 	for _, r := range resp.Resources {
 		if r.Path == "/index.html" {
 			found = true
+			if r.Menu != "密钥策略" {
+				t.Fatalf("Menu = %q, want 密钥策略", r.Menu)
+			}
 		}
 	}
 	if !found {

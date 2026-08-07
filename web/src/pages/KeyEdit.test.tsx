@@ -50,7 +50,7 @@ const key: KeyPublic = {
 
 const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
 
-describe("KeyEdit reset menu", () => {
+describe("KeyEdit reset more-menu", () => {
   let container: HTMLDivElement;
   let root: ReturnType<typeof createRoot>;
 
@@ -68,7 +68,7 @@ describe("KeyEdit reset menu", () => {
     vi.clearAllMocks();
   });
 
-  it("uses the same daily, weekly, and RPM reset menu as the key list", async () => {
+  it("exposes the same daily, weekly, and RPM reset menu on desktop and mobile", async () => {
     await act(async () => {
       root = createRoot(container);
       root.render(
@@ -81,15 +81,22 @@ describe("KeyEdit reset menu", () => {
       await tick();
     });
 
-    const details = container.querySelector<HTMLDetailsElement>(".reset-menu");
-    expect(details).not.toBeNull();
-    expect(details?.querySelector("summary")?.textContent).toContain("keys.reset");
-    const buttons = Array.from(details?.querySelectorAll<HTMLButtonElement>("button") ?? []);
+    const desktopDetails = container.querySelector<HTMLDetailsElement>(".fp-head .more-menu");
+    expect(desktopDetails).not.toBeNull();
+    expect(desktopDetails?.querySelector("summary")?.textContent).toContain("keys.reset");
+
+    const mobileDetails = container.querySelector<HTMLDetailsElement>(".mobile-key-reset .more-menu");
+    expect(mobileDetails).not.toBeNull();
+    expect(mobileDetails?.querySelector("summary")?.textContent).toContain("keys.reset");
+    const buttons = Array.from(mobileDetails?.querySelectorAll<HTMLButtonElement>("button") ?? []);
     expect(buttons.map((button) => button.textContent)).toEqual([
       "keys.resetDaily",
       "keys.resetWeekly",
       "keys.resetRpm",
     ]);
+    // Edit page stays reset-only — no rotate/delete in the more menu.
+    expect(buttons.some((b) => b.textContent === "keys.resetKey")).toBe(false);
+    expect(buttons.some((b) => b.textContent === "keys.delete")).toBe(false);
 
     await act(async () => {
       buttons[0]?.dispatchEvent(new MouseEvent("click", { bubbles: true }));

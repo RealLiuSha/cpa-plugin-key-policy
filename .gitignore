@@ -38,3 +38,10 @@ scripts/patch-pi-mcp-sdk.mjs
 stitch_*.png
 nul
 .npm-cache/
+
+scripts
+
+# docs
+goals
+plans
+memories
