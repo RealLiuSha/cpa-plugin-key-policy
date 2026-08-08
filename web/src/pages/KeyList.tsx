@@ -66,6 +66,22 @@ function formatUsageWindow(
   return fmtUsd(used) + " / " + (limit > 0 ? fmtUsd(limit) : unlimitedLabel);
 }
 
+/** True when a window has a positive limit and used has reached/exceeded it. */
+export function isLimitHit(used: number, limit: number): boolean {
+  return limit > 0 && used >= limit;
+}
+
+/** Daily OR weekly limit hit → usage should be marked red. */
+export function isAnyLimitHit(usage: {
+  daily_usd: number;
+  weekly_usd: number;
+  daily_limit_usd: number;
+  weekly_limit_usd: number;
+}): boolean {
+  return isLimitHit(usage.daily_usd, usage.daily_limit_usd)
+    || isLimitHit(usage.weekly_usd, usage.weekly_limit_usd);
+}
+
 export default function KeyList() {
   const t = useT();
   const [keys, setKeys] = useState<KeyPublic[]>([]);
@@ -275,9 +291,12 @@ function KeyTableRow({
   const unlimited = t("usage.unlimited");
   const daily = formatUsageWindow(k.usage.daily_usd, k.usage.daily_limit_usd, unlimited);
   const weekly = formatUsageWindow(k.usage.weekly_usd, k.usage.weekly_limit_usd, unlimited);
+  const dailyHit = isLimitHit(k.usage.daily_usd, k.usage.daily_limit_usd);
+  const weeklyHit = isLimitHit(k.usage.weekly_usd, k.usage.weekly_limit_usd);
+  const anyHit = dailyHit || weeklyHit;
 
   return (
-    <tr className={k.enabled ? undefined : "row-disabled"}>
+    <tr className={[!k.enabled && "row-disabled", anyHit && "usage-limit-hit"].filter(Boolean).join(" ") || undefined}>
       <td>
         <div className="key-id">{k.id}</div>
         {k.name ? <div className="muted key-name">{k.name}</div> : null}
@@ -289,9 +308,13 @@ function KeyTableRow({
       </td>
       <td className="mono">{k.key_preview}</td>
       <td>{k.rpm > 0 ? k.rpm : t("usage.unlimited")}</td>
-      <td className="key-usage-cell">
-        <div>{t("usage.today")} {daily}</div>
-        <div className="muted">{t("usage.thisWeek")} {weekly}</div>
+      <td className={"key-usage-cell" + (anyHit ? " usage-over" : "")} data-testid={`usage-cell-${k.id}`}>
+        <div className={dailyHit ? "usage-line over" : undefined} data-testid={`usage-daily-${k.id}`}>
+          {t("usage.today")} {daily}
+        </div>
+        <div className={"muted" + (weeklyHit ? " usage-line over" : "")} data-testid={`usage-weekly-${k.id}`}>
+          {t("usage.thisWeek")} {weekly}
+        </div>
       </td>
       <td>{aliases.length}</td>
       <td>
@@ -337,28 +360,47 @@ function KeyMobileCard({
   const aliases = uniqueAliases(k.models);
   const shownChips = aliases.slice(0, 2);
   const moreCount = Math.max(0, aliases.length - 2);
-  const limit = k.usage.daily_limit_usd > 0 ? k.usage.daily_limit_usd : 0;
-  const pct = limit > 0 ? Math.min(100, (k.usage.daily_usd / limit) * 100) : 0;
-  const over = limit > 0 && k.usage.daily_usd >= limit;
+  const dailyLimit = k.usage.daily_limit_usd > 0 ? k.usage.daily_limit_usd : 0;
+  const weeklyLimit = k.usage.weekly_limit_usd > 0 ? k.usage.weekly_limit_usd : 0;
+  const dailyHit = isLimitHit(k.usage.daily_usd, k.usage.daily_limit_usd);
+  const weeklyHit = isLimitHit(k.usage.weekly_usd, k.usage.weekly_limit_usd);
+  const over = dailyHit || weeklyHit;
+  // Prefer daily bar when daily has a limit; otherwise show weekly progress.
+  const barLimit = dailyLimit > 0 ? dailyLimit : weeklyLimit;
+  const barUsed = dailyLimit > 0 ? k.usage.daily_usd : k.usage.weekly_usd;
+  const pct = barLimit > 0 ? Math.min(100, (barUsed / barLimit) * 100) : 0;
+  const unlimited = t("usage.unlimited");
 
   return (
-    <div className={"keycard" + (k.enabled ? "" : " disabled") + (over ? " over" : "")}>
+    <div
+      className={"keycard" + (k.enabled ? "" : " disabled") + (over ? " over" : "")}
+      data-testid={`keycard-${k.id}`}
+    >
       <div className="kc-head">
         <span className="kc-dot" />
         <span className="kc-name">{k.name || k.id}</span>
       </div>
       <div className="kc-preview">{k.key_preview}</div>
-      {limit > 0 ? (
+      {barLimit > 0 ? (
         <>
           <div className="kc-bar"><span style={{ width: pct + "%" }} /></div>
           <div className="kc-meta">
-            <span>{fmtUsd(k.usage.daily_usd)} / {fmtUsd(limit)}</span>
+            <span className={dailyHit ? "usage-line over" : undefined} data-testid={`usage-daily-${k.id}`}>
+              {t("usage.today")} {formatUsageWindow(k.usage.daily_usd, k.usage.daily_limit_usd, unlimited)}
+            </span>
+            <span className={weeklyHit ? "usage-line over" : undefined} data-testid={`usage-weekly-${k.id}`}>
+              {t("usage.thisWeek")} {formatUsageWindow(k.usage.weekly_usd, k.usage.weekly_limit_usd, unlimited)}
+            </span>
+          </div>
+          <div className="kc-meta">
             <span>{aliases.length} {t("keys.mobile.modelsSuffix")}</span>
           </div>
         </>
       ) : (
         <div className="kc-meta">
-          <span>{fmtUsd(k.usage.daily_usd)} · {t("keys.mobile.noLimit")}</span>
+          <span data-testid={`usage-daily-${k.id}`}>
+            {t("usage.today")} {fmtUsd(k.usage.daily_usd)} · {t("keys.mobile.noLimit")}
+          </span>
           <span>{aliases.length} {t("keys.mobile.modelsSuffix")}</span>
         </div>
       )}
