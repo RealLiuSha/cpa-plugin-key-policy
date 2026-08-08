@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { useNavigate, useParams, useLocation } from "react-router-dom";
+import { Link, useNavigate, useParams, useLocation } from "react-router-dom";
 import { listKeys, patchKey, rotateKey, deleteKey } from "../api/keys";
 import type { KeyPublic, ModelRule } from "../types";
 import KeyForm from "../components/KeyForm";
@@ -20,6 +20,10 @@ export default function KeyEdit() {
   const [loading, setLoading] = useState(true);
   const [plain, setPlain] = useState<string | null>(null);
   const [plainTitle, setPlainTitle] = useState("");
+  // Post-save unpriced guidance. Must live here (not only in KeyForm): after a
+  // successful patch we would otherwise nav("/keys") and unmount KeyForm before
+  // its local unpricedHint could render.
+  const [unpricedAfterSave, setUnpricedAfterSave] = useState(0);
 
   useEffect(() => {
     (async () => {
@@ -97,6 +101,16 @@ export default function KeyEdit() {
       <div className="mobile-only mobile-key-reset">
         <KeyMoreMenu {...resetMenuProps} />
       </div>
+      {unpricedAfterSave > 0 && (
+        <div className="kf-unpriced-after-save" data-testid="unpriced-after-save">
+          {t("keyForm.unpricedAfterSave", { n: unpricedAfterSave })}{" "}
+          <Link to="/mapping">{t("keyForm.unpricedGoMapping")}</Link>
+          {" · "}
+          <button type="button" className="btn sm" onClick={() => nav("/keys")}>
+            {t("keyForm.cancel")}
+          </button>
+        </div>
+      )}
       <KeyForm
         initial={initial}
         idReadOnly
@@ -105,7 +119,7 @@ export default function KeyEdit() {
         onCancel={() => nav("/keys")}
         dangerLabel={t("keys.delete")}
         onDanger={onDelete}
-        onSubmit={async (v) => {
+        onSubmit={async (v, meta) => {
           await patchKey({
             id: v.id,
             name: v.name || undefined,
@@ -116,6 +130,12 @@ export default function KeyEdit() {
             weekly_limit_usd: v.weekly_limit_usd,
             allow_models_endpoint: v.allow_models_endpoint,
           });
+          // Stay when newly-added aliases still need pricing so the user can
+          // follow the mapping link; otherwise return to the list as before.
+          if (meta.newUnpricedCount > 0) {
+            setUnpricedAfterSave(meta.newUnpricedCount);
+            return;
+          }
           nav("/keys");
         }}
       />

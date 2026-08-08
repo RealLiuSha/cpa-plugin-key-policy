@@ -61,6 +61,27 @@ func (a *App) deleteAlias(raw []byte) ManagementResponse {
 	return jsonResponse(http.StatusOK, map[string]any{"deleted": true})
 }
 
+// importPricesRequest is the body for POST /aliases/import-prices.
+type importPricesRequest struct {
+	DryRun  bool                      `json:"dry_run"`
+	Matches []policy.PriceImportMatch `json:"matches"`
+}
+
+func (a *App) importAliasPrices(raw []byte) ManagementResponse {
+	var req importPricesRequest
+	if err := json.Unmarshal(raw, &req); err != nil {
+		return jsonError(http.StatusBadRequest, "bad_request", err.Error())
+	}
+	if req.Matches == nil {
+		req.Matches = []policy.PriceImportMatch{}
+	}
+	result, err := a.store.ImportAliasPrices(req.Matches, req.DryRun)
+	if err != nil {
+		return jsonError(http.StatusInternalServerError, "import_failed", err.Error())
+	}
+	return jsonResponse(http.StatusOK, result)
+}
+
 // --- Classification rule management handlers ---
 
 // classifyRuleUpsertRequest is the body for POST /classify-rules.

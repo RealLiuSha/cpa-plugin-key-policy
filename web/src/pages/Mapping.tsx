@@ -1,8 +1,28 @@
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, useMemo } from "react";
 import { useNavigate, useParams, useLocation } from "react-router-dom";
 import { useT } from "../i18n";
-import type { AliasMapping, AliasTarget, ClassifyRule, ClassifyPreviewResponse, CredentialDescriptor } from "../types";
-import { fetchAliases, upsertAlias, deleteAlias, fetchClassifyRules, upsertClassifyRule, deleteClassifyRule, reorderClassifyRules, classifyPreview, fetchCredentialDescriptors } from "../api/mappings";
+import type {
+  AliasMapping,
+  AliasTarget,
+  ClassifyRule,
+  ClassifyPreviewResponse,
+  CredentialDescriptor,
+  PriceImportMatch,
+  PriceImportResult,
+} from "../types";
+import {
+  fetchAliases,
+  upsertAlias,
+  deleteAlias,
+  fetchClassifyRules,
+  upsertClassifyRule,
+  deleteClassifyRule,
+  reorderClassifyRules,
+  classifyPreview,
+  fetchCredentialDescriptors,
+  importAliasPrices,
+} from "../api/mappings";
+import { getPriceTable, lookupPrice, type PriceTable } from "../store/modelPrices";
 
 export default function Mapping() {
   const t = useT();
@@ -32,6 +52,22 @@ export default function Mapping() {
   );
 }
 
+// --- helpers ---
+
+/** tokens (default) with all three prices at 0 → unpriced. */
+export function isUnpricedAlias(a: AliasMapping): boolean {
+  if (a.billing_mode === "per_call") return false;
+  return (a.input_price_per_million ?? 0) === 0
+    && (a.output_price_per_million ?? 0) === 0
+    && (a.cache_read_price_per_million ?? 0) === 0;
+}
+
+/** 1:1 pass-through: single target whose target_model equals the alias name. */
+export function isPassThroughAlias(a: AliasMapping): boolean {
+  if (!a.targets || a.targets.length !== 1) return false;
+  return a.alias.toLowerCase() === (a.targets[0].target_model ?? "").toLowerCase();
+}
+
 // --- Alias List Tab ---
 
 function AliasListTab() {
@@ -40,6 +76,9 @@ function AliasListTab() {
   const [aliases, setAliases] = useState<AliasMapping[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const [filter, setFilter] = useState<"all" | "unpriced" | "orphan">("all");
+  const [passThroughOpen, setPassThroughOpen] = useState(false);
+  const [importOpen, setImportOpen] = useState(false);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -64,12 +103,42 @@ function AliasListTab() {
     }
   };
 
+  const filtered = useMemo(() => {
+    return aliases.filter((a) => {
+      const ref = a.ref_count ?? 0;
+      if (filter === "unpriced") return isUnpricedAlias(a);
+      if (filter === "orphan") return ref === 0;
+      return true;
+    });
+  }, [aliases, filter]);
+
+  const manual = filtered.filter((a) => !isPassThroughAlias(a));
+  const passThrough = filtered.filter((a) => isPassThroughAlias(a));
+
   return (
     <>
       <div className="map-toolbar">
-        <button className="btn primary" onClick={() => nav("/mapping/alias/new")}>
-          + {t("mapping.newAlias")}
-        </button>
+        <div className="map-toolbar-left">
+          <div className="map-filter-seg" role="group">
+            <button type="button" className={"map-filter-btn" + (filter === "all" ? " active" : "")} onClick={() => setFilter("all")}>
+              {t("mapping.filterAll")}
+            </button>
+            <button type="button" className={"map-filter-btn" + (filter === "unpriced" ? " active" : "")} onClick={() => setFilter("unpriced")}>
+              {t("mapping.filterUnpriced")}
+            </button>
+            <button type="button" className={"map-filter-btn" + (filter === "orphan" ? " active" : "")} onClick={() => setFilter("orphan")}>
+              {t("mapping.filterOrphan")}
+            </button>
+          </div>
+        </div>
+        <div className="map-toolbar-right">
+          <button className="btn" type="button" onClick={() => setImportOpen(true)}>
+            {t("mapping.importPrices")}
+          </button>
+          <button className="btn primary" onClick={() => nav("/mapping/alias/new")}>
+            + {t("mapping.newAlias")}
+          </button>
+        </div>
       </div>
       {error && <div className="error">{error}</div>}
       {loading ? (
@@ -77,11 +146,57 @@ function AliasListTab() {
       ) : aliases.length === 0 ? (
         <div className="muted" style={{ padding: 20 }}>No aliases</div>
       ) : (
-        <div className="alias-grid">
-          {aliases.map((a) => (
-            <AliasCard key={a.alias} alias={a} onDelete={handleDelete} onEdit={(name) => nav(`/mapping/alias/${encodeURIComponent(name)}`)} />
-          ))}
-        </div>
+        <>
+          {manual.length > 0 && (
+            <div className="alias-grid">
+              {manual.map((a) => (
+                <AliasCard
+                  key={a.alias}
+                  alias={a}
+                  onDelete={handleDelete}
+                  onEdit={(name) => nav(`/mapping/alias/${encodeURIComponent(name)}`)}
+                />
+              ))}
+            </div>
+          )}
+          {passThrough.length > 0 && (
+            <div className="alias-passthrough-section">
+              <button
+                type="button"
+                className="alias-passthrough-toggle"
+                onClick={() => setPassThroughOpen((v) => !v)}
+                aria-expanded={passThroughOpen}
+                data-testid="passthrough-toggle"
+              >
+                <span>{passThroughOpen ? "▾" : "▸"}</span>
+                {t("mapping.passThroughFold", { n: passThrough.length })}
+              </button>
+              {passThroughOpen && (
+                <div className="alias-grid">
+                  {passThrough.map((a) => (
+                    <AliasCard
+                      key={a.alias}
+                      alias={a}
+                      onDelete={handleDelete}
+                      onEdit={(name) => nav(`/mapping/alias/${encodeURIComponent(name)}`)}
+                    />
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+          {manual.length === 0 && passThrough.length === 0 && (
+            <div className="muted" style={{ padding: 20 }}>{t("mapping.filterEmpty")}</div>
+          )}
+        </>
+      )}
+      {importOpen && (
+        <ImportPricesModal
+          onClose={() => setImportOpen(false)}
+          onApplied={async () => {
+            await load();
+          }}
+        />
       )}
     </>
   );
@@ -89,16 +204,20 @@ function AliasListTab() {
 
 function AliasCard({ alias, onDelete, onEdit }: { alias: AliasMapping; onDelete: (n: string) => void; onEdit: (n: string) => void }) {
   const t = useT();
-  const [refCount] = useState<number | null>(null);
-  // refCount would come from a separate API call or be included in the list response.
-  // For now, show "unreferenced" as placeholder.
+  const refCount = alias.ref_count ?? 0;
+  const unpriced = isUnpricedAlias(alias);
+  const orphan = refCount === 0;
   return (
-    <div className="alias-card">
+    <div className="alias-card" data-testid={`alias-card-${alias.alias}`}>
       <div className="alias-card-head">
         <span className="alias-card-name">{alias.alias}</span>
         <span className="alias-dispatch-badge">
           {alias.dispatch === "priority" ? t("mapping.alias.priority") : t("mapping.alias.roundRobin")}
         </span>
+      </div>
+      <div className="alias-badges">
+        {unpriced && <span className="alias-badge unpriced" data-testid="badge-unpriced">{t("mapping.badgeUnpriced")}</span>}
+        {orphan && <span className="alias-badge orphan" data-testid="badge-orphan">{t("mapping.badgeOrphan")}</span>}
       </div>
       <div className="alias-targets">
         {alias.targets.slice(0, 3).map((tgt, i) => (
@@ -120,20 +239,200 @@ function AliasCard({ alias, onDelete, onEdit }: { alias: AliasMapping; onDelete:
           <>{t("mapping.alias.input")} ${alias.input_price_per_million ?? 0} / {t("mapping.alias.output")} ${alias.output_price_per_million ?? 0} / {t("mapping.alias.cache")} ${alias.cache_read_price_per_million ?? 0} {t("mapping.alias.perMillion")}</>
         )}
       </div>
-      <div className={"alias-refs" + (refCount === 0 ? " zero" : "")}>
-        {refCount && refCount > 0 ? t("mapping.refs", { n: refCount }) : t("mapping.unreferenced")}
+      <div className={"alias-refs" + (orphan ? " zero" : "")} data-testid="alias-refs">
+        {refCount > 0 ? t("mapping.refs", { n: refCount }) : t("mapping.unreferenced")}
       </div>
       <div className="alias-actions">
         <button className="btn sm" onClick={() => onEdit(alias.alias)}>{t("mapping.edit")}</button>
         <button
           className="btn sm danger-outline"
-          disabled={refCount !== null && refCount > 0}
-          title={refCount && refCount > 0 ? t("mapping.deleteBlocked", { n: refCount }) : ""}
+          disabled={refCount > 0}
+          title={refCount > 0 ? t("mapping.deleteBlocked", { n: refCount }) : ""}
+          data-testid={`delete-${alias.alias}`}
           onClick={() => onDelete(alias.alias)}
         >
           {t("mapping.delete")}
         </button>
       </div>
+    </div>
+  );
+}
+
+// --- Import prices modal ---
+
+/** Parse optional numeric field: missing/null → omit (do not coerce to 0). */
+function optImportPrice(o: Record<string, unknown>, key: string): number | undefined {
+  if (!(key in o) || o[key] === null || o[key] === undefined || o[key] === "") return undefined;
+  const n = Number(o[key]);
+  return Number.isFinite(n) ? n : undefined;
+}
+
+function parseImportPayload(raw: string): PriceImportMatch[] {
+  const parsed = JSON.parse(raw) as unknown;
+  if (!parsed || typeof parsed !== "object") throw new Error("invalid JSON");
+  const root = parsed as Record<string, unknown>;
+  const matches = root.matches;
+  if (!Array.isArray(matches)) throw new Error("missing matches array");
+  const out: PriceImportMatch[] = [];
+  for (const item of matches) {
+    if (!item || typeof item !== "object") continue;
+    const o = item as Record<string, unknown>;
+    const model = typeof o.model === "string" ? o.model.trim() : "";
+    if (!model) continue;
+    const row: PriceImportMatch = { model };
+    const prompt = optImportPrice(o, "prompt_price_per_1m");
+    const completion = optImportPrice(o, "completion_price_per_1m");
+    const cacheRead = optImportPrice(o, "cache_read_price_per_1m");
+    const cacheWrite = optImportPrice(o, "cache_write_price_per_1m");
+    if (prompt !== undefined) row.prompt_price_per_1m = prompt;
+    if (completion !== undefined) row.completion_price_per_1m = completion;
+    if (cacheRead !== undefined) row.cache_read_price_per_1m = cacheRead;
+    // Accepted for wire compat; server ignores.
+    if (cacheWrite !== undefined) row.cache_write_price_per_1m = cacheWrite;
+    // Need at least one token price field to import.
+    if (prompt === undefined && completion === undefined && cacheRead === undefined) continue;
+    out.push(row);
+  }
+  if (out.length === 0) throw new Error("no valid matches");
+  return out;
+}
+
+function ImportPricesModal({ onClose, onApplied }: { onClose: () => void; onApplied: () => void | Promise<void> }) {
+  const t = useT();
+  const [text, setText] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [preview, setPreview] = useState<PriceImportResult | null>(null);
+  const [result, setResult] = useState<PriceImportResult | null>(null);
+
+  const runDryRun = async () => {
+    setError("");
+    setResult(null);
+    setBusy(true);
+    try {
+      const matches = parseImportPayload(text);
+      const res = await importAliasPrices({ dry_run: true, matches });
+      setPreview(res);
+    } catch (e: unknown) {
+      setPreview(null);
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const runApply = async () => {
+    if (!preview) return;
+    setError("");
+    setBusy(true);
+    try {
+      const matches = parseImportPayload(text);
+      const res = await importAliasPrices({ dry_run: false, matches });
+      setResult(res);
+      setPreview(null);
+      // Refresh list in parent but keep modal open so the user sees the summary.
+      await onApplied();
+    } catch (e: unknown) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const onFile = async (file: File | null) => {
+    if (!file) return;
+    try {
+      const raw = await file.text();
+      setText(raw);
+      setPreview(null);
+      setResult(null);
+    } catch (e: unknown) {
+      setError(String(e));
+    }
+  };
+
+  return (
+    <div className="map-modal-backdrop" data-testid="import-prices-modal">
+      <div className="map-modal">
+        <div className="map-modal-head">
+          <h2>{t("mapping.importTitle")}</h2>
+          <button type="button" className="btn sm" onClick={onClose}>{t("mapping.cancel")}</button>
+        </div>
+        <p className="muted">{t("mapping.importHint")}</p>
+        <textarea
+          className="map-import-textarea mono"
+          data-testid="import-json"
+          rows={8}
+          value={text}
+          onChange={(e) => { setText(e.target.value); setPreview(null); setResult(null); }}
+          placeholder='{"matches":[{"model":"gpt-4o","prompt_price_per_1m":5,"completion_price_per_1m":30,"cache_read_price_per_1m":1.25}]}'
+        />
+        <div className="map-import-actions">
+          <input
+            type="file"
+            accept="application/json,.json"
+            data-testid="import-file"
+            onChange={(e) => void onFile(e.target.files?.[0] ?? null)}
+          />
+          <button type="button" className="btn" disabled={busy || !text.trim()} onClick={() => void runDryRun()} data-testid="import-preview">
+            {t("mapping.importPreview")}
+          </button>
+          {preview && (
+            <button type="button" className="btn primary" disabled={busy} onClick={() => void runApply()} data-testid="import-apply">
+              {t("mapping.importApply")}
+            </button>
+          )}
+        </div>
+        {error && <div className="error">{error}</div>}
+        {preview && <ImportResultView title={t("mapping.importPreviewTitle")} result={preview} />}
+        {result && <ImportResultView title={t("mapping.importResultTitle")} result={result} />}
+      </div>
+    </div>
+  );
+}
+
+function ImportResultView({ title, result }: { title: string; result: PriceImportResult }) {
+  const t = useT();
+  return (
+    <div className="map-import-result" data-testid="import-result">
+      <h3>{title}</h3>
+      <div className="muted">
+        {t("mapping.importSummary", {
+          applied: result.applied?.length ?? 0,
+          unchanged: result.unchanged?.length ?? 0,
+          skipped: result.skipped?.length ?? 0,
+          keys: result.affected_keys?.length ?? 0,
+        })}
+      </div>
+      {(result.applied?.length ?? 0) > 0 && (
+        <table className="map-import-table">
+          <thead>
+            <tr>
+              <th>{t("mapping.importColAlias")}</th>
+              <th>{t("mapping.importColOld")}</th>
+              <th>{t("mapping.importColNew")}</th>
+              <th>{t("mapping.importColNote")}</th>
+            </tr>
+          </thead>
+          <tbody>
+            {result.applied.map((row) => (
+              <tr key={row.alias}>
+                <td className="mono">{row.alias}</td>
+                <td className="mono">{row.old_input_price_per_million}/{row.old_output_price_per_million}/{row.old_cache_read_price_per_million}</td>
+                <td className="mono">{row.new_input_price_per_million}/{row.new_output_price_per_million}/{row.new_cache_read_price_per_million}</td>
+                <td>{row.note ?? ""}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+      {(result.skipped?.length ?? 0) > 0 && (
+        <ul className="map-import-skipped">
+          {result.skipped.map((s, i) => (
+            <li key={i}>{s.alias || s.model}: {s.reason}</li>
+          ))}
+        </ul>
+      )}
     </div>
   );
 }
@@ -156,8 +455,6 @@ function ClassifyTab() {
         fetchCredentialDescriptors().catch(() => [] as CredentialDescriptor[]),
       ]);
       setRules(list);
-      // Evaluate the current rules against real credential descriptors so
-      // each rule card shows the true match count + file list.
       const preview = await classifyPreview(descriptors).catch(() => null as ClassifyPreviewResponse | null);
       setPreviewData(preview);
     } catch (e: unknown) {
@@ -207,7 +504,6 @@ function ClassifyTab() {
         <div className="muted" style={{ padding: 20 }}>Loading...</div>
       ) : (
         <div className="rule-list">
-          {/* Built-in rules (read-only) */}
           <div className="rule-builtin-card">
             <h3>{t("mapping.rule.builtin")} ({t("mapping.rule.builtinReadOnly")})</h3>
             <div className="rule-builtin-row">
@@ -221,7 +517,6 @@ function ClassifyTab() {
             <div className="rule-builtin-desc">{t("mapping.rule.builtinDesc")}</div>
           </div>
 
-          {/* Custom rules */}
           <div className="section-label" style={{ marginTop: 16 }}>{t("mapping.rule.custom")}</div>
           {rules.length === 0 ? (
             <div className="muted" style={{ padding: 20 }}>No custom rules</div>
@@ -265,11 +560,6 @@ function RuleCard({
   const [page, setPage] = useState(0);
   const pageSize = 50;
 
-  // Compute the match count + matched file list up front from previewData
-  // (fetched by ClassifyTab once the rules + descriptors load). The badge
-  // shows the count even when collapsed, so this must not be gated on
-  // `expanded`. Re-run whenever the preview or this rule's target group
-  // changes; the matchedFiles list drives the expanded detail pagination.
   useEffect(() => {
     const files = previewData?.groups[rule.group.toLowerCase()] ?? [];
     setMatchCount(files.length);
@@ -340,6 +630,7 @@ function RuleCard({
 // state alone — without this, filling the alias name then picking targets
 // wipes the name when AliasEditForm remounts empty.
 const ALIAS_FORM_DRAFT_KEY = "cpa-key-policy:alias-form-draft";
+const ALIAS_FORM_FROM_PICKER_KEY = "cpa-key-policy:alias-form-from-picker";
 
 function readAliasFormDraft(): AliasMapping | null {
   try {
@@ -362,8 +653,55 @@ function writeAliasFormDraft(draft: AliasMapping) {
 function clearAliasFormDraft() {
   try {
     sessionStorage.removeItem(ALIAS_FORM_DRAFT_KEY);
+    sessionStorage.removeItem(ALIAS_FORM_FROM_PICKER_KEY);
   } catch {
     /* ignore */
+  }
+}
+
+/** Scope for the fromPicker mark: "new" or the alias being edited. */
+function pickerScope(isNew: boolean, routeAliasName: string | undefined, formAlias?: string): string {
+  if (isNew) return "new";
+  const fromRoute = (routeAliasName ?? "").trim();
+  if (fromRoute && fromRoute !== "new") {
+    try {
+      return decodeURIComponent(fromRoute);
+    } catch {
+      return fromRoute;
+    }
+  }
+  return (formAlias ?? "").trim() || "new";
+}
+
+function markFromPicker(scope: string) {
+  try {
+    sessionStorage.setItem(ALIAS_FORM_FROM_PICKER_KEY, scope);
+  } catch {
+    /* ignore */
+  }
+}
+
+/** True only when the stored mark matches this form's scope (not a global bool). */
+function peekFromPicker(scope: string): boolean {
+  try {
+    const v = sessionStorage.getItem(ALIAS_FORM_FROM_PICKER_KEY);
+    return !!v && v === scope;
+  } catch {
+    return false;
+  }
+}
+
+/** Consume mark if it matches scope. Mismatched marks are left alone (other form's). */
+function consumeFromPicker(scope: string): boolean {
+  try {
+    const v = sessionStorage.getItem(ALIAS_FORM_FROM_PICKER_KEY);
+    if (v === scope) {
+      sessionStorage.removeItem(ALIAS_FORM_FROM_PICKER_KEY);
+      return true;
+    }
+    return false;
+  } catch {
+    return false;
   }
 }
 
@@ -377,17 +715,46 @@ export function AliasEditForm() {
   const locState = loc.state as { draftAlias?: AliasMapping; pickedTargets?: AliasTarget[] } | null;
   const returnDraft = locState?.draftAlias;
   const returnTargets = locState?.pickedTargets;
+  // Scope the fromPicker mark to this form ("new" or alias name). A global
+  // boolean leaked across forms: abandoned new+picker left the mark set, and
+  // the next edit mounted the wrong draft and skipped fetch.
+  const scope = pickerScope(isNew, aliasName);
+  // Explicit picker-return signal: router state or *matching* session mark.
+  // Do NOT treat "session draft has same alias name" as a draft — that was the
+  // P0 bug that skipped fetch and left 0 prices.
+  const fromPickerReturn = !!(returnDraft || returnTargets || peekFromPicker(scope));
 
   const [alias, setAlias] = useState<AliasMapping>(() => {
-    const draft = returnDraft ?? readAliasFormDraft();
-    if (draft) {
-      return {
-        ...draft,
-        targets: returnTargets ?? draft.targets ?? [],
-      };
+    if (fromPickerReturn) {
+      const draft = returnDraft ?? readAliasFormDraft();
+      // Only accept draft when it belongs to this form's scope.
+      if (draft) {
+        const draftOk = isNew
+          || draft.alias.toLowerCase() === scope.toLowerCase()
+          || !draft.alias; // empty name mid-new is ok
+        if (draftOk || returnDraft || returnTargets) {
+          return {
+            ...draft,
+            // Edit route wins for the name so a mismatched leftover never renames the form.
+            alias: isNew ? (draft.alias ?? "") : scope,
+            targets: returnTargets ?? draft.targets ?? [],
+          };
+        }
+      }
+    }
+    // New form may still recover in-progress work from draft when scope is "new"
+    // and the draft is not a leftover from a different edit session.
+    if (isNew && peekFromPicker("new")) {
+      const draft = returnDraft ?? readAliasFormDraft();
+      if (draft) {
+        return {
+          ...draft,
+          targets: returnTargets ?? draft.targets ?? [],
+        };
+      }
     }
     return {
-      alias: isNew ? "" : decodeURIComponent(aliasName ?? ""),
+      alias: isNew ? "" : scope,
       targets: [],
       dispatch: "round-robin",
       billing_mode: "tokens",
@@ -399,25 +766,51 @@ export function AliasEditForm() {
   });
   const [error, setError] = useState("");
   const [saving, setSaving] = useState(false);
+  const [priceTable, setPriceTable] = useState<PriceTable | null>(null);
+  // Do not persist the 0-price mount shell for edit mode until server data (or
+  // an explicit picker draft) is in place — otherwise a clean list→edit can
+  // pollute sessionStorage with a zero-price draft for this alias name.
+  const [draftPersistReady, setDraftPersistReady] = useState(isNew || fromPickerReturn);
 
-  // Keep session draft in sync while editing so a picker trip never loses fields.
+  // Keep session draft in sync once we have real form data (picker return,
+  // new form, or post-fetch edit). Gated by draftPersistReady.
   useEffect(() => {
+    if (!draftPersistReady) return;
     writeAliasFormDraft(alias);
-  }, [alias]);
+  }, [alias, draftPersistReady]);
 
-  // Load existing alias if editing — skip when this form already has a draft
-  // for the same alias (picker return / in-progress edit).
+  // Load existing alias if editing — ALWAYS fetch unless this mount is a
+  // picker return for *this* alias (returnTargets / returnDraft / scoped mark).
   useEffect(() => {
-    if (isNew) return;
-    if (returnDraft) return;
-    const name = decodeURIComponent(aliasName ?? "");
-    const session = readAliasFormDraft();
-    if (session && session.alias === name) return;
+    if (isNew) {
+      // Consume a matching "new" mark so it cannot leak into a later edit.
+      if (returnDraft || returnTargets || peekFromPicker("new")) {
+        consumeFromPicker("new");
+      }
+      setDraftPersistReady(true);
+      return;
+    }
+    if (returnDraft || returnTargets) {
+      consumeFromPicker(scope);
+      setDraftPersistReady(true);
+      return;
+    }
+    if (consumeFromPicker(scope)) {
+      // Draft already applied in useState; do not overwrite with server.
+      setDraftPersistReady(true);
+      return;
+    }
+    const name = scope;
     void fetchAliases().then((list) => {
-      const found = list.find((a) => a.alias === name);
+      const found = list.find((a) => a.alias === name || a.alias.toLowerCase() === name.toLowerCase());
       if (found) setAlias(found);
-    }).catch((e: unknown) => setError(String(e)));
-  }, [aliasName, isNew, returnDraft]);
+      // Persist only after server hydration (or not-found), never the 0-shell.
+      setDraftPersistReady(true);
+    }).catch((e: unknown) => {
+      setError(String(e));
+      setDraftPersistReady(true);
+    });
+  }, [aliasName, isNew, returnDraft, returnTargets, scope]);
 
   // Apply targets returned from ModelPick (draft fields come from session/router).
   useEffect(() => {
@@ -427,6 +820,15 @@ export function AliasEditForm() {
       return { ...base, targets: returnTargets };
     });
   }, [returnTargets, returnDraft]);
+
+  // LiteLLM price table for recommend button (single-target only).
+  useEffect(() => {
+    let alive = true;
+    void getPriceTable().then((tbl) => {
+      if (alive) setPriceTable(tbl);
+    });
+    return () => { alive = false; };
+  }, []);
 
   const leaveForm = (toMapping = true) => {
     clearAliasFormDraft();
@@ -447,8 +849,10 @@ export function AliasEditForm() {
   };
 
   const addTarget = () => {
-    // Persist draft before leaving so name/dispatch/pricing survive the picker.
+    // Persist draft + mark fromPicker (scoped to this form) so remount after
+    // picker keeps edits and does not re-fetch over them.
     writeAliasFormDraft(alias);
+    markFromPicker(pickerScope(isNew, aliasName, alias.alias));
     const here = `/mapping/alias/${isNew ? "new" : encodeURIComponent(alias.alias || aliasName || "new")}`;
     nav("/mapping/pick-target", {
       state: {
@@ -461,6 +865,21 @@ export function AliasEditForm() {
 
   const removeTarget = (idx: number) => {
     setAlias((prev) => ({ ...prev, targets: prev.targets.filter((_, i) => i !== idx) }));
+  };
+
+  const singleTarget = alias.targets.length === 1;
+  const recommendHint = singleTarget && alias.billing_mode !== "per_call"
+    ? lookupPrice(priceTable, alias.targets[0].target_model)
+    : null;
+
+  const applyRecommend = () => {
+    if (!recommendHint) return;
+    setAlias((prev) => ({
+      ...prev,
+      input_price_per_million: recommendHint.input_price_per_million,
+      output_price_per_million: recommendHint.output_price_per_million,
+      cache_read_price_per_million: recommendHint.cache_read_price_per_million,
+    }));
   };
 
   return (
@@ -480,6 +899,7 @@ export function AliasEditForm() {
             onChange={(e) => setAlias({ ...alias, alias: e.target.value })}
             disabled={!isNew}
             placeholder="my-alias"
+            data-testid="alias-name"
           />
         </div>
         <div className="map-form-row">
@@ -505,7 +925,7 @@ export function AliasEditForm() {
         </div>
         <div className="map-form-row">
           <label>{t("mapping.alias.targets")}</label>
-          <div className="map-form-targets">
+          <div className="map-form-targets" data-testid="alias-targets">
             {alias.targets.map((tgt, i) => (
               <div key={i} className="map-form-target-row">
                 <span className="mono">{tgt.provider} · {tgt.target_model} {tgt.group ? `· ${tgt.group}` : ""}</span>
@@ -522,6 +942,7 @@ export function AliasEditForm() {
               type="checkbox"
               checked={alias.billing_mode === "per_call"}
               onChange={(e) => setAlias({ ...alias, billing_mode: e.target.checked ? "per_call" : "tokens" })}
+              data-testid="billing-mode"
             />
             <span className="track"><span className="thumb" /></span>
             <span>{alias.billing_mode === "per_call" ? t("mapping.alias.perCall") : t("mapping.alias.tokens")}</span>
@@ -535,6 +956,7 @@ export function AliasEditForm() {
                 className="mono"
                 type="number"
                 step="0.01"
+                data-testid="price-input"
                 value={alias.input_price_per_million ?? 0}
                 onChange={(e) => setAlias({ ...alias, input_price_per_million: parseFloat(e.target.value) || 0 })}
               />
@@ -545,6 +967,7 @@ export function AliasEditForm() {
                 className="mono"
                 type="number"
                 step="0.01"
+                data-testid="price-output"
                 value={alias.output_price_per_million ?? 0}
                 onChange={(e) => setAlias({ ...alias, output_price_per_million: parseFloat(e.target.value) || 0 })}
               />
@@ -555,10 +978,24 @@ export function AliasEditForm() {
                 className="mono"
                 type="number"
                 step="0.01"
+                data-testid="price-cache"
                 value={alias.cache_read_price_per_million ?? 0}
                 onChange={(e) => setAlias({ ...alias, cache_read_price_per_million: parseFloat(e.target.value) || 0 })}
               />
             </div>
+            {recommendHint && (
+              <div className="map-form-row">
+                <button
+                  type="button"
+                  className="btn sm"
+                  data-testid="recommend-price"
+                  onClick={applyRecommend}
+                  title={t("mapping.alias.recommendTitle")}
+                >
+                  {t("mapping.alias.recommend")}
+                </button>
+              </div>
+            )}
           </>
         ) : (
           <div className="map-form-row">
@@ -567,6 +1004,7 @@ export function AliasEditForm() {
               className="mono"
               type="number"
               step="0.01"
+              data-testid="price-per-call"
               value={alias.per_call_usd ?? 0}
               onChange={(e) => setAlias({ ...alias, per_call_usd: parseFloat(e.target.value) || 0 })}
             />
@@ -607,7 +1045,6 @@ export function RuleEditForm() {
   const [error, setError] = useState("");
   const [saving, setSaving] = useState(false);
 
-  // Load existing rule if editing.
   useEffect(() => {
     if (isNew) return;
     void fetchClassifyRules().then((list) => {
@@ -624,7 +1061,6 @@ export function RuleEditForm() {
     }).catch((e: unknown) => setError(String(e)));
   }, [ruleName, isNew]);
 
-  // Live regex validation.
   useEffect(() => {
     if (!rule.pattern) {
       setRegexError("");
