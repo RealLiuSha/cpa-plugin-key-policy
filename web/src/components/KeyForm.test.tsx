@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 (globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
 import { createRoot } from "react-dom/client";
+import { Simulate } from "react-dom/test-utils";
 import { MemoryRouter } from "react-router-dom";
 import type { AliasMapping, KeyPublic, ModelRule } from "../types";
 
@@ -27,6 +28,8 @@ vi.mock("../i18n", () => ({
     // Mirror real templates for keys that only carry {{n}} in locale files.
     let s = key;
     if (key === "keyForm.unpricedAfterSave") s = "{{n}} alias(es) still unpriced";
+    if (key === "keyForm.currentUsage") s = "Current usage {{amount}}";
+    if (key === "keyForm.limitBelowUsageConfirm") s = "Blocking limits:\n{{details}}";
     for (const [k, v] of Object.entries(vars)) {
       s = s.replace(new RegExp(`\\{\\{${k}\\}\\}`, "g"), String(v));
     }
@@ -35,7 +38,7 @@ vi.mock("../i18n", () => ({
 }));
 
 import { fetchAliases } from "../api/mappings";
-import KeyForm, { isUnpricedAlias, modelsWithoutPrices } from "./KeyForm";
+import KeyForm, { isUnpricedAlias, keyWriteRequestFromForm, modelsWithoutPrices } from "./KeyForm";
 
 const tick = () => new Promise((r) => setTimeout(r, 0));
 const flush = async () => {
@@ -76,6 +79,10 @@ const initial: KeyPublic = {
     { alias: "priced", provider: "openai", target_model: "priced" },
     { alias: "unpriced", provider: "openai", target_model: "unpriced" },
   ],
+  aliases: [
+    { alias: "priced", daily_limit_usd: 2, input_price_per_million: 4 },
+    { alias: "unpriced", daily_limit_usd: 0 },
+  ],
   daily_limit_usd: 0,
   weekly_limit_usd: 0,
   usage: { daily_usd: 0, weekly_usd: 0, daily_limit_usd: 0, weekly_limit_usd: 0 },
@@ -104,6 +111,27 @@ describe("modelsWithoutPrices / isUnpricedAlias", () => {
   it("detects unpriced tokens aliases", () => {
     expect(isUnpricedAlias(globalAliases[1])).toBe(true);
     expect(isUnpricedAlias(globalAliases[0])).toBe(false);
+  });
+
+  it("builds one complete API request so page wrappers cannot drop new limit fields", () => {
+    expect(keyWriteRequestFromForm({
+      id: "k1",
+      name: "",
+      enabled: true,
+      rpm: 10,
+      models: initial.models,
+      aliases: initial.aliases ?? [],
+      daily_limit_usd: 10,
+      weekly_limit_usd: 20,
+      monthly_limit_usd: 30,
+      allow_models_endpoint: true,
+    })).toMatchObject({
+      id: "k1",
+      name: undefined,
+      aliases: initial.aliases,
+      monthly_limit_usd: 30,
+      allow_models_endpoint: true,
+    });
   });
 });
 
@@ -318,5 +346,82 @@ describe("KeyForm de-price + unpriced warnings", () => {
     await flush();
 
     expect(gotMeta).toEqual({ newUnpricedCount: 0 });
+  });
+
+  it("shows current window usage and confirms a limit that would block immediately", async () => {
+    const onSubmit = vi.fn(async () => undefined);
+    const confirm = vi.fn(() => false);
+    vi.stubGlobal("confirm", confirm);
+    const used: KeyPublic = {
+      ...initial,
+      daily_limit_usd: 10,
+      weekly_limit_usd: 20,
+      monthly_limit_usd: 30,
+      usage: {
+        daily_usd: 8,
+        weekly_usd: 12,
+        monthly_usd: 18,
+        daily_limit_usd: 10,
+        weekly_limit_usd: 20,
+        monthly_limit_usd: 30,
+      },
+    };
+    await act(async () => {
+      root = createRoot(container);
+      root.render(
+        <MemoryRouter>
+          <KeyForm initial={used} submitLabel="Save" onCancel={() => {}} onSubmit={onSubmit} />
+        </MemoryRouter>,
+      );
+    });
+    await flush();
+    const currentUsage = Array.from(container.querySelectorAll(".mobile-hidden .kf-current-usage")).map((element) => element.textContent);
+    expect(currentUsage).toEqual(["Current usage 8.00", "Current usage 12.00", "Current usage 18.00"]);
+    const numericInputs = container.querySelectorAll<HTMLInputElement>('.mobile-hidden input[type="number"]');
+    const dailyInput = numericInputs[1];
+    await act(async () => {
+      Simulate.change(dailyInput, { target: { value: "7" } } as never);
+    });
+    await flush();
+    await act(async () => {
+      container.querySelector("form")!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+    });
+    await flush();
+    expect(confirm).toHaveBeenCalledWith(expect.stringContaining("$8.00 → $7.00"));
+    expect(onSubmit).not.toHaveBeenCalled();
+    vi.unstubAllGlobals();
+  });
+
+  it("edits and submits per-alias daily limits without dropping alias refs", async () => {
+    let submittedAliases: KeyPublic["aliases"] = undefined;
+    await act(async () => {
+      root = createRoot(container);
+      root.render(
+        <MemoryRouter>
+          <KeyForm
+            initial={initial}
+            submitLabel="Save"
+            onCancel={() => {}}
+            onSubmit={async (values) => { submittedAliases = values.aliases; }}
+          />
+        </MemoryRouter>,
+      );
+    });
+    await flush();
+
+    const pricedLimit = container.querySelector<HTMLInputElement>('.mobile-hidden [data-alias-limit="priced"]');
+    expect(pricedLimit?.value).toBe("2");
+    await act(async () => {
+      Simulate.change(pricedLimit!, { target: { value: "3.5" } } as never);
+    });
+    await act(async () => {
+      container.querySelector("form")!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+    });
+    await flush();
+
+    expect(submittedAliases).toEqual([
+      expect.objectContaining({ alias: "priced", daily_limit_usd: 3.5, input_price_per_million: 4 }),
+      expect.objectContaining({ alias: "unpriced", daily_limit_usd: 0 }),
+    ]);
   });
 });

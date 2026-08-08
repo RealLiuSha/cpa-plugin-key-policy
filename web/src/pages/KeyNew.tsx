@@ -1,7 +1,7 @@
 import { useMemo, useState } from "react";
 import { Link, useNavigate, useLocation } from "react-router-dom";
 import { createKey } from "../api/keys";
-import KeyForm from "../components/KeyForm";
+import KeyForm, { keyWriteRequestFromForm } from "../components/KeyForm";
 import PlainKeyModal from "../components/PlainKeyModal";
 import { MobileFormHeader, MobileTabBar } from "../components/MobileChrome";
 import { useT } from "../i18n";
@@ -42,16 +42,7 @@ export default function KeyNew() {
         submitLabel={t("new.create")}
         onCancel={() => nav("/keys")}
         onSubmit={async (v, meta) => {
-          const r = await createKey({
-            id: v.id,
-            name: v.name || undefined,
-            enabled: v.enabled,
-            rpm: v.rpm,
-            models: v.models,
-            daily_limit_usd: v.daily_limit_usd,
-            weekly_limit_usd: v.weekly_limit_usd,
-            allow_models_endpoint: v.allow_models_endpoint,
-          });
+          const r = await createKey(keyWriteRequestFromForm(v));
           if (meta.newUnpricedCount > 0) {
             setUnpricedAfterSave(meta.newUnpricedCount);
           }

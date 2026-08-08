@@ -9,6 +9,7 @@ import KeyEdit from "./pages/KeyEdit";
 import KeyUsage from "./pages/KeyUsage";
 import ModelPick from "./pages/ModelPick";
 import Mapping, { AliasEditForm, RuleEditForm } from "./pages/Mapping";
+import Audit from "./pages/Audit";
 
 function useAuthTick() {
   const [, setTick] = useState(0);
@@ -29,6 +30,7 @@ function TopNav() {
   const onKeys = loc.pathname === "/keys" || loc.pathname.startsWith("/keys/");
   const onNew = loc.pathname === "/keys/new" || loc.pathname.startsWith("/keys/new/");
   const onMapping = loc.pathname === "/mapping" || loc.pathname.startsWith("/mapping/");
+  const onAudit = loc.pathname === "/audit";
   return (
     <div className="topnav">
       <div className="topnav-inner">
@@ -40,6 +42,7 @@ function TopNav() {
           <Link to="/keys" className={"tn-link" + (onKeys && !onNew ? " active" : "")}>{t("header.keyList")}</Link>
           <Link to="/keys/new" className={"tn-link" + (onNew ? " active" : "")}>{t("header.newKey")}</Link>
           <Link to="/mapping" className={"tn-link" + (onMapping ? " active" : "")}>{t("header.mapping")}</Link>
+          <Link to="/audit" className={"tn-link" + (onAudit ? " active" : "")}>{t("header.audit")}</Link>
           <button
             className="btn sm"
             onClick={() => { clearSession(); nav("/login"); }}
@@ -97,6 +100,7 @@ function Shell() {
         <Route path="/mapping" element={<Mapping />} />
         <Route path="/mapping/alias/:aliasName" element={<AliasEditForm />} />
         <Route path="/mapping/rule/:ruleName" element={<RuleEditForm />} />
+        <Route path="/audit" element={<Audit />} />
         <Route path="*" element={<Navigate to="/keys" replace />} />
       </Routes>
     </div>

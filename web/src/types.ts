@@ -28,22 +28,31 @@ export interface ModelRule {
 export interface UsageSummary {
   daily_usd: number;
   weekly_usd: number;
+  monthly_usd?: number;
   daily_limit_usd: number;
   weekly_limit_usd: number;
+  monthly_limit_usd?: number;
   daily_reset_at?: string;
   weekly_reset_at?: string;
   // Cache reporting (omitted when zero). Hit-rate is derived client-side as
   // cache_read_tokens / (cache_read_tokens + input_tokens).
   daily_cache_cost_usd?: number;
   weekly_cache_cost_usd?: number;
+  monthly_cache_cost_usd?: number;
   daily_cache_read_tokens?: number;
   weekly_cache_read_tokens?: number;
+  monthly_cache_read_tokens?: number;
   daily_input_tokens?: number;
   weekly_input_tokens?: number;
+  monthly_input_tokens?: number;
   // Call counts: successful requests billed into the window (token or
   // per-call). Failed requests don't count. Display only.
   daily_call_count?: number;
   weekly_call_count?: number;
+  monthly_call_count?: number;
+  soft_limit_hit?: boolean;
+  timezone?: string;
+  limits_changed_at?: string;
 }
 
 export interface KeyPublic {
@@ -56,6 +65,7 @@ export interface KeyPublic {
   aliases?: KeyAliasRef[];
   daily_limit_usd: number;
   weekly_limit_usd: number;
+  monthly_limit_usd?: number;
   // Per-key override for GET /v1/models (see KeyFormValues).
   allow_models_endpoint?: boolean;
   usage: UsageSummary;
@@ -73,6 +83,7 @@ export interface KeyWriteRequest {
   aliases?: KeyAliasRef[];
   daily_limit_usd?: number;
   weekly_limit_usd?: number;
+  monthly_limit_usd?: number;
   allow_models_endpoint?: boolean;
 }
 
@@ -90,7 +101,7 @@ export interface RotateKeyResponse {
 
 // UsageWindow mirrors policy.UsageWindow: a dollar total bound to a window
 // start, plus cache/input/output/call counters for display. The key detail
-// page reads one Daily and one Weekly per alias.
+// page reads daily, trailing-7-day, and trailing-30-day values per alias.
 export interface UsageWindow {
   total_usd: number;
   window_start?: string;
@@ -114,6 +125,7 @@ export interface AliasUsageEntry {
   in_config: boolean;
   daily: UsageWindow;
   weekly: UsageWindow;
+  monthly?: UsageWindow;
 }
 
 export interface KeyUsageResponse {
@@ -121,6 +133,7 @@ export interface KeyUsageResponse {
   key_name: string;
   daily_limit_usd: number;
   weekly_limit_usd: number;
+  monthly_limit_usd?: number;
   aliases: AliasUsageEntry[];
 }
 
@@ -140,6 +153,7 @@ export interface StatusResponse {
   state_file: string;
   key_count: number;
   rpm_usage?: Record<string, unknown>;
+  usage?: Record<string, UsageSummary>;
 }
 
 // --- Advanced Mapping types ---
@@ -183,6 +197,7 @@ export interface ClassifyRule {
 // null/undefined = use global default.
 export interface KeyAliasRef {
   alias: string;
+  daily_limit_usd?: number;
   /** YAML-only override; Web UI does not write. */
   input_price_per_million?: number | null;
   /** YAML-only override; Web UI does not write. */
@@ -191,6 +206,39 @@ export interface KeyAliasRef {
   cache_read_price_per_million?: number | null;
   /** YAML-only override; Web UI does not write. */
   per_call_usd?: number | null;
+}
+
+export interface UsageBucket {
+  total_usd?: number;
+  call_count?: number;
+  cache_read_tokens?: number;
+  cache_cost_usd?: number;
+  input_tokens?: number;
+  output_tokens?: number;
+}
+
+export interface UsageHistoryDay extends UsageBucket {
+  date: string;
+  by_alias?: Record<string, UsageBucket>;
+}
+
+export interface KeyHistoryResponse {
+  key_id: string;
+  timezone: string;
+  days: UsageHistoryDay[];
+}
+
+export interface AuditChange {
+  from: unknown;
+  to: unknown;
+}
+
+export interface AuditEvent {
+  ts: string;
+  actor: string;
+  action: string;
+  key_id?: string;
+  changes?: Record<string, AuditChange>;
 }
 
 // --- Price import (POST /aliases/import-prices) ---

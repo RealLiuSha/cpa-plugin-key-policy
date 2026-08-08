@@ -8,8 +8,11 @@ plugins:
     cpa-key-policy:
       enabled: true
       priority: 10
-      # Runtime source of truth once created (keys, aliases, classify rules, usage).
+      # Runtime source of truth for keys, aliases, and classify rules.
+      # Usage is stored separately as cpa-key-policy-usage.json beside this file.
       state_file: "cpa-key-policy-state.json"
+      # Natural-day accounting boundary. Invalid zones fall back to UTC with a warning.
+      usage_timezone: "Asia/Shanghai"
 
       # Prefer creating keys/aliases/classify rules via Web UI or Management API.
       # Seed keys below are mainly for first boot when state_file does not exist.
@@ -20,6 +23,9 @@ plugins:
           key_hash: "sha256:replace-with-hash"
           key_preview: "cpa_abc...xyz"
           rpm: 60
+          daily_limit_usd: 10
+          weekly_limit_usd: 50
+          monthly_limit_usd: 150
           # Either bind models directly…
           models:
             - alias: "fast"
@@ -32,3 +38,4 @@ plugins:
           # …or reference global aliases created in the UI / POST /aliases:
           # aliases:
           #   - alias: "cheap-chat"
+          #     daily_limit_usd: 5 # per-key cap for this alias; 0 = unlimited

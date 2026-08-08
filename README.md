@@ -17,7 +17,7 @@ In plain words: you issue your own `cpa_…` keys to clients. Each key only sees
 
 1. **Issue keys** — create many downstream keys; each has an allow-list of models (or shared aliases).
 2. **Route** — client calls with alias name `fast`; plugin rewrites to e.g. `codex` + `gpt-5.4-mini`.
-3. **Limit** — per-key RPM, optional daily/weekly USD caps, token or per-call billing.
+3. **Limit** — per-key RPM, daily / trailing-7-day / trailing-30-day USD caps, per-alias daily caps, token or per-call billing.
 4. **Isolate credentials (tiers / groups)** — pin a request to Codex free/team/… or to a **custom classify group** so it never lands on the wrong auth file.
 5. **Multi-target aliases** — one alias can point at several backends (priority or round-robin).
 6. **Web UI** — manage keys, global aliases, and credential classification inside CPA.
@@ -32,7 +32,7 @@ A plugin-owned secret (`cpa_…`). Authenticated only by this plugin. Holds:
 
 - allowed **models** and/or **aliases**
 - RPM
-- optional daily / weekly dollar limits
+- optional daily / trailing-7-day / trailing-30-day dollar limits and per-alias daily limits
 - optional `allow_models_endpoint` (see below)
 
 ### Alias (global mapping table)
@@ -122,13 +122,23 @@ plugins:
       enabled: true
       priority: 10
       state_file: "cpa-key-policy-state.json"
+      usage_timezone: "Asia/Shanghai"
 ```
 
 Notes:
 
-- If `state_file` exists, it is the source of truth for keys / aliases / classify rules / usage.
+- If `state_file` exists, it is the source of truth for keys / aliases / classify rules. Usage is stored separately as `cpa-key-policy-usage.json` in the same directory.
+- Usage is bucketed by natural day in `usage_timezone` (default `Asia/Shanghai`) and retained for 35 days. Invalid zones fall back to UTC with a warning.
 - Prefer creating keys and aliases in the **Web UI** or Management API; seed YAML `keys` is mainly for first boot.
 - Never commit real key hashes, management secrets, or live host URLs into public docs.
+
+Before upgrading a v1 state file, back it up and inspect the deterministic migration report twice:
+
+```bash
+go run ./cmd/migrate-usage -state /path/to/cpa-key-policy-state.json -dry-run
+```
+
+The report contains `before_totals` and `after_totals`. `before_totals` reports the legacy daily/weekly windows that are still effective at migration time; its `monthly_usd` is `null` because v1 never stored a 30-day aggregate. Migration preserves effective daily usage, preserves a self-consistent weekly value, and raises an invalid `weekly < daily` value to daily so the new bucket invariant holds. Run without `-dry-run` to atomically write the independent usage file; `-out` overrides its destination.
 
 ---
 
@@ -147,8 +157,10 @@ UI areas:
 | Tab / page | Use for |
 |------------|---------|
 | Keys | Create / edit / rotate / delete keys; bind models or aliases; RPM & budgets |
+| Key usage | Today / trailing 7-day / trailing 30-day totals and a 30-day daily chart |
 | Mapping → Aliases | Global multi-target aliases, dispatch, pricing |
 | Mapping → Classification | Custom credential groups + match preview |
+| Audit | Management mutations and before/after limit values |
 | Model picker | Catalog of providers; tier / **Custom · …** subgroups |
 
 Dev UI without rebuilding the `.so`:
@@ -170,8 +182,10 @@ Exact paths (no path templates). Auth: CPA management bearer token.
 - `GET/POST/PATCH/DELETE …/keys` (`id` in query or body for mutate)
 - `POST …/keys/rotate?id=…`
 - `POST …/keys/reset-rpm?id=…`
-- `POST …/keys/reset-usage` with `{ "id": "…", "window": "daily" | "weekly" }`
+- `POST …/keys/reset-usage` with `{ "id": "…", "window": "daily" | "weekly" | "monthly" }`
 - `GET …/keys/usage?id=…`
+- `GET …/keys/history?id=…&days=30` (1–35 natural days, including per-alias buckets)
+- `GET …/audit?key_id=…&limit=100`
 - `GET …/status`
 
 **Aliases**

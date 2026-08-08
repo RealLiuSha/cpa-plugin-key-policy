@@ -115,7 +115,7 @@ describe("KeyEdit reset more-menu", () => {
     vi.clearAllMocks();
   });
 
-  it("exposes the same daily, weekly, and RPM reset menu on desktop and mobile", async () => {
+  it("exposes the same daily, weekly, monthly, and RPM reset menu on desktop and mobile", async () => {
     await act(async () => {
       root = createRoot(container);
       root.render(
@@ -140,6 +140,7 @@ describe("KeyEdit reset more-menu", () => {
     expect(buttons.map((button) => button.textContent)).toEqual([
       "keys.resetDaily",
       "keys.resetWeekly",
+      "keys.resetMonthly",
       "keys.resetRpm",
     ]);
     // Edit page stays reset-only — no rotate/delete in the more menu.
@@ -155,6 +156,13 @@ describe("KeyEdit reset more-menu", () => {
 
     await act(async () => {
       buttons[2]?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      await tick();
+    });
+    expect(confirm).toHaveBeenCalledWith("keys.resetMonthlyConfirm");
+    expect(resetUsage).toHaveBeenCalledWith("team-a", "monthly");
+
+    await act(async () => {
+      buttons[3]?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
       await tick();
     });
     expect(resetRPM).toHaveBeenCalledWith("team-a");

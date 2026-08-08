@@ -1,14 +1,15 @@
 import { useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
-import { fetchKeyUsage } from "../api/keys";
-import type { AliasUsageEntry, KeyUsageResponse, UsageWindow } from "../types";
+import { fetchKeyHistory, fetchKeyUsage } from "../api/keys";
+import { extractApiError } from "../api/error";
+import type { AliasUsageEntry, KeyHistoryResponse, KeyUsageResponse, UsageWindow } from "../types";
 import { useT } from "../i18n";
 import { MobileTabBar } from "../components/MobileChrome";
 
 // Window switch for the per-alias breakdown table: each alias row has its own
-// daily and rolling-weekly window, and the user toggles which one all rows
-// show at once. Mirrors the KeyList usage column's today/this-week framing.
-type Window = "daily" | "weekly";
+// daily, trailing-7-day and trailing-30-day windows, and the user toggles which
+// one all rows show at once. Mirrors the KeyList natural-day framing.
+type Window = "daily" | "weekly" | "monthly";
 
 function fmtUsd(n: number): string {
   return "$" + (Number.isFinite(n) ? n.toFixed(2) : "0.00");
@@ -42,6 +43,49 @@ function BillingTag({ mode }: { mode?: string }) {
   );
 }
 
+export function UsageHistoryChart({ history, dailyLimit }: { history: KeyHistoryResponse | null; dailyLimit: number }) {
+  const t = useT();
+  const days = history?.days ?? [];
+  const width = 640;
+  const height = 180;
+  const plotTop = 16;
+  const plotBottom = 150;
+  const plotHeight = plotBottom - plotTop;
+  const maxValue = Math.max(1, dailyLimit, ...days.map((day) => day.total_usd ?? 0));
+  const slot = days.length > 0 ? width / days.length : width;
+  const limitY = plotBottom - (dailyLimit / maxValue) * plotHeight;
+  return (
+    <div className="card usage-history-card" data-testid="usage-history-chart">
+      <div className="usage-history-title">
+        <strong>{t("keyUsage.historyTitle")}</strong>
+        <span className="muted">{history?.timezone ?? "Asia/Shanghai"}</span>
+      </div>
+      <svg viewBox={`0 0 ${width} ${height}`} role="img" aria-label={t("keyUsage.historyTitle")}>
+        <line x1="0" x2={width} y1={plotBottom} y2={plotBottom} className="usage-chart-axis" />
+        {dailyLimit > 0 && (
+          <line x1="0" x2={width} y1={limitY} y2={limitY} className="usage-chart-limit" data-testid="usage-history-limit-line" />
+        )}
+        {days.map((day, index) => {
+          const value = day.total_usd ?? 0;
+          const barHeight = (value / maxValue) * plotHeight;
+          return (
+            <rect
+              key={day.date}
+              x={index * slot + slot * 0.16}
+              y={plotBottom - barHeight}
+              width={Math.max(1, slot * 0.68)}
+              height={barHeight}
+              className="usage-chart-bar"
+            >
+              <title>{day.date}: {fmtUsd(value)}</title>
+            </rect>
+          );
+        })}
+      </svg>
+    </div>
+  );
+}
+
 export default function KeyUsage() {
   const { id } = useParams<{ id: string }>();
   const t = useT();
@@ -49,6 +93,7 @@ export default function KeyUsage() {
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
   const [win, setWin] = useState<Window>("daily");
+  const [history, setHistory] = useState<KeyHistoryResponse | null>(null);
 
   useEffect(() => {
     let alive = true;
@@ -61,10 +106,16 @@ export default function KeyUsage() {
           setError(t("keyUsage.notFound"));
           return;
         }
-        setData(await fetchKeyUsage(keyId));
+        const [usage, usageHistory] = await Promise.all([
+          fetchKeyUsage(keyId),
+          fetchKeyHistory(keyId, 30),
+        ]);
+        if (alive) {
+          setData(usage);
+          setHistory(usageHistory);
+        }
       } catch (e) {
-        const err = e as { response?: { data?: { error?: { message?: string } } }; message?: string };
-        setError(err.response?.data?.error?.message ?? err.message ?? t("keyUsage.loadFailed"));
+        setError(extractApiError(e, t("keyUsage.loadFailed")));
       } finally {
         if (alive) setLoading(false);
       }
@@ -79,22 +130,33 @@ export default function KeyUsage() {
   if (error || !data) return <div className="error">{error || t("keyUsage.notFound")}</div>;
 
   const aliases = data.aliases ?? [];
-  const hasUsage = aliases.some((a) => (a.daily.call_count ?? 0) > 0 || (a.weekly.call_count ?? 0) > 0 || (a.daily.total_usd ?? 0) > 0 || (a.weekly.total_usd ?? 0) > 0);
+  const hasUsage = aliases.some((a) =>
+    (a.daily.call_count ?? 0) > 0
+    || (a.weekly.call_count ?? 0) > 0
+    || (a.monthly?.call_count ?? 0) > 0
+    || (a.daily.total_usd ?? 0) > 0
+    || (a.weekly.total_usd ?? 0) > 0
+    || (a.monthly?.total_usd ?? 0) > 0,
+  );
 
-  const windowOf = (a: AliasUsageEntry): UsageWindow => (win === "daily" ? a.daily : a.weekly);
+  const windowOf = (a: AliasUsageEntry): UsageWindow => (
+    win === "daily" ? a.daily : win === "weekly" ? a.weekly : (a.monthly ?? { total_usd: 0 })
+  );
 
   // Mobile hero totals: sum across aliases for the active window.
   const heroUsd = aliases.reduce((s, a) => s + (windowOf(a).total_usd ?? 0), 0);
   const heroCalls = aliases.reduce((s, a) => s + (windowOf(a).call_count ?? 0), 0);
   const heroInput = aliases.reduce((s, a) => s + (windowOf(a).input_tokens ?? 0), 0);
   const heroOutput = aliases.reduce((s, a) => s + (windowOf(a).output_tokens ?? 0), 0);
-  const heroLimit = win === "daily" ? data.daily_limit_usd : data.weekly_limit_usd;
+  const heroLimit = win === "daily"
+    ? data.daily_limit_usd
+    : win === "weekly" ? data.weekly_limit_usd : (data.monthly_limit_usd ?? 0);
   const heroPct = heroLimit > 0 ? Math.min(100, (heroUsd / heroLimit) * 100) : 0;
   const maxAliasUsd = Math.max(1, ...aliases.map((a) => windowOf(a).total_usd ?? 0));
 
   return (
     <div>
-      {/* Header: back · key id (mono) · name · daily/weekly toggle */}
+      {/* Header: back · key id (mono) · name · three-window toggle */}
       <div className="keyusage-header">
         <div className="keyusage-idline">
           <Link to="/keys">
@@ -126,14 +188,26 @@ export default function KeyUsage() {
           >
             {t("keyUsage.tabWeekly")}
           </button>
+          <button
+            role="tab"
+            aria-selected={win === "monthly"}
+            className={"seg-btn " + (win === "monthly" ? "active" : "")}
+            onClick={() => setWin("monthly")}
+          >
+            {t("keyUsage.tabMonthly")}
+          </button>
         </div>
       </div>
+
+      <UsageHistoryChart history={history} dailyLimit={data.daily_limit_usd} />
 
       {/* Desktop: hero summary + per-alias table (unchanged) */}
       <div className="usage-hero-d">
         <div className="uhd-tiles">
           <div className="uhd-tile">
-            <span className="uhd-tk">{win === "daily" ? t("keyUsage.mobile.todaySpend") : t("keyUsage.mobile.weekSpend")}</span>
+            <span className="uhd-tk">
+              {win === "daily" ? t("keyUsage.mobile.todaySpend") : win === "weekly" ? t("keyUsage.mobile.weekSpend") : t("keyUsage.mobile.monthSpend")}
+            </span>
             <span className={"uhd-tv" + (heroLimit > 0 && heroUsd >= heroLimit ? " accent" : "")}>{fmtUsd(heroUsd)}</span>
           </div>
           <div className="uhd-tile">
@@ -211,7 +285,9 @@ export default function KeyUsage() {
       {/* Mobile: hero card + horizontal bar ranking */}
       <div className="mobile-only">
         <div className="usage-hero">
-          <div className="uh-label">{win === "daily" ? t("keyUsage.mobile.today") : t("keyUsage.mobile.thisWeek")}</div>
+          <div className="uh-label">
+            {win === "daily" ? t("keyUsage.mobile.today") : win === "weekly" ? t("keyUsage.mobile.last7Days") : t("keyUsage.mobile.last30Days")}
+          </div>
           <div className="uh-amount">{fmtUsd(heroUsd)}<span className="uh-unit">USD</span></div>
           <div className="uh-row">
             <div className="uh-ring">

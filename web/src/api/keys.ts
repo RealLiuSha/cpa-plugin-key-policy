@@ -5,6 +5,7 @@ import type {
   CreateKeyResponse,
   RotateKeyResponse,
   KeyUsageResponse,
+  KeyHistoryResponse,
 } from "../types";
 
 export async function listKeys(): Promise<KeyPublic[]> {
@@ -48,7 +49,7 @@ export async function resetRPM(id: string): Promise<void> {
   await c.post(pluginPath("/keys/reset-rpm"), { id });
 }
 
-export type UsageResetWindow = "daily" | "weekly";
+export type UsageResetWindow = "daily" | "weekly" | "monthly";
 
 export async function resetUsage(id: string, window: UsageResetWindow): Promise<void> {
   const c = apiClient();
@@ -62,6 +63,14 @@ export async function fetchKeyUsage(id: string): Promise<KeyUsageResponse> {
   const c = apiClient();
   const { data } = await c.get<KeyUsageResponse>(pluginPath("/keys/usage"), {
     params: { id },
+  });
+  return data;
+}
+
+export async function fetchKeyHistory(id: string, days = 30): Promise<KeyHistoryResponse> {
+  const c = apiClient();
+  const { data } = await c.get<KeyHistoryResponse>(pluginPath("/keys/history"), {
+    params: { id, days },
   });
   return data;
 }

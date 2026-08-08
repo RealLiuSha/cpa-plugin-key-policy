@@ -4,11 +4,23 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/url"
+	"os"
 	"path/filepath"
 	"testing"
 
 	"cpa-key-policy/internal/policy"
 )
+
+func TestNewAppDoesNotWriteStateBeforeConfigure(t *testing.T) {
+	t.Chdir(t.TempDir())
+	app := NewApp()
+	if app == nil || app.store == nil {
+		t.Fatal("NewApp returned an incomplete app")
+	}
+	if _, err := os.Stat(policy.DefaultConfig().StateFile); !os.IsNotExist(err) {
+		t.Fatalf("NewApp wrote default state before lifecycle configure: %v", err)
+	}
+}
 
 func nearly(a, b float64) bool {
 	if a < 0 {
@@ -196,11 +208,10 @@ func managementResponseFromEnvelope(t *testing.T, raw []byte) ManagementResponse
 	return resp
 }
 
-func TestAppResponseInterceptorBillsUsage(t *testing.T) {
+func TestAppResponseInterceptorPreservesUsageWithoutBilling(t *testing.T) {
 	app, plain := configureTestApp(t)
-	// Record a billing response for the configured "fast" alias. The test config
-	// has no prices, so cost stays 0 and nothing is blocked — we just verify
-	// the path doesn't break response rewriting.
+	// A response body may contain usage, but response.intercept_after only
+	// rewrites the model. Accounting is owned exclusively by usage.handle.
 	req, _ := json.Marshal(ResponseInterceptRequest{
 		RequestedModel: "fast",
 		RequestHeaders: http.Header{"Authorization": {"Bearer " + plain}},
@@ -231,6 +242,10 @@ func TestAppResponseInterceptorBillsUsage(t *testing.T) {
 	usage, ok := body["usage"].(map[string]any)
 	if !ok || usage["prompt_tokens"] != float64(100) || usage["completion_tokens"] != float64(20) {
 		t.Fatalf("usage = %+v, want preserved prompt=100 completion=20", usage)
+	}
+	key := app.store.Keys()[0]
+	if summary := app.store.UsageSummaryFor(key); summary.DailyUSD != 0 || summary.DailyCallCount != 0 {
+		t.Fatalf("response interceptor billed usage: %+v", summary)
 	}
 }
 
@@ -283,7 +298,8 @@ func TestAppPatchKeySetsLimits(t *testing.T) {
 	app, _ := configureTestApp(t)
 	f := 1.5
 	patchBody, _ := json.Marshal(map[string]any{
-		"id": "team-a", "daily_limit_usd": f, "weekly_limit_usd": 10.0,
+		"id": "team-a", "daily_limit_usd": f, "weekly_limit_usd": 10.0, "monthly_limit_usd": 30.0,
+		"aliases": []map[string]any{{"alias": "fast", "daily_limit_usd": 2.0}},
 	})
 	req, _ := json.Marshal(ManagementRequest{
 		Method: http.MethodPatch,
@@ -300,15 +316,87 @@ func TestAppPatchKeySetsLimits(t *testing.T) {
 	}
 	var payload struct {
 		Key struct {
-			DailyLimitUSD  float64 `json:"daily_limit_usd"`
-			WeeklyLimitUSD float64 `json:"weekly_limit_usd"`
+			DailyLimitUSD   float64              `json:"daily_limit_usd"`
+			WeeklyLimitUSD  float64              `json:"weekly_limit_usd"`
+			MonthlyLimitUSD float64              `json:"monthly_limit_usd"`
+			Aliases         []policy.KeyAliasRef `json:"aliases"`
+			Usage           policy.UsageSummary  `json:"usage"`
 		} `json:"key"`
 	}
 	if err := json.Unmarshal(resp.Body, &payload); err != nil {
 		t.Fatal(err)
 	}
-	if payload.Key.DailyLimitUSD != 1.5 || payload.Key.WeeklyLimitUSD != 10.0 {
+	if payload.Key.DailyLimitUSD != 1.5 || payload.Key.WeeklyLimitUSD != 10.0 || payload.Key.MonthlyLimitUSD != 30.0 {
 		t.Fatalf("limits = %+v", payload.Key)
+	}
+	if len(payload.Key.Aliases) != 1 || payload.Key.Aliases[0].Alias != "fast" || payload.Key.Aliases[0].DailyLimitUSD != 2 {
+		t.Fatalf("alias limits = %+v", payload.Key.Aliases)
+	}
+	if payload.Key.Usage.MonthlyLimitUSD != 30 || payload.Key.Usage.Timezone != "Asia/Shanghai" || payload.Key.Usage.LimitsChangedAt.IsZero() {
+		t.Fatalf("public usage fields = %+v", payload.Key.Usage)
+	}
+}
+
+func TestKeyHistoryAndAuditRoutes(t *testing.T) {
+	app, _ := configurePricedApp(t)
+	usageReq, _ := json.Marshal(UsageHandleRequest{
+		APIKey: "priced", Alias: "fast", Model: "gpt-5-codex",
+		Detail: UsageDetail{InputTokens: 200_000, OutputTokens: 100_000},
+	})
+	if _, err := app.HandleMethod(MethodUsageHandle, usageReq); err != nil {
+		t.Fatal(err)
+	}
+	historyReq, _ := json.Marshal(ManagementRequest{
+		Method: http.MethodGet,
+		Path:   "/v0/management/plugins/cpa-key-policy/keys/history",
+		Query:  url.Values{"id": {"priced"}, "days": {"30"}},
+	})
+	historyResp := managementResponseFromEnvelope(t, mustHandle(t, app, MethodManagementHandle, historyReq))
+	if historyResp.StatusCode != http.StatusOK {
+		t.Fatalf("history status=%d body=%s", historyResp.StatusCode, historyResp.Body)
+	}
+	var history struct {
+		KeyID    string                   `json:"key_id"`
+		Timezone string                   `json:"timezone"`
+		Days     []policy.UsageHistoryDay `json:"days"`
+	}
+	if err := json.Unmarshal(historyResp.Body, &history); err != nil {
+		t.Fatal(err)
+	}
+	if history.KeyID != "priced" || history.Timezone != "Asia/Shanghai" || len(history.Days) != 30 {
+		t.Fatalf("history response = %+v", history)
+	}
+	last := history.Days[len(history.Days)-1]
+	if !nearly(last.TotalUSD, 0.30) || !nearly(last.ByAlias["fast"].TotalUSD, 0.30) {
+		t.Fatalf("history last day = %+v", last)
+	}
+
+	patchBody, _ := json.Marshal(map[string]any{"id": "priced", "monthly_limit_usd": 20.0})
+	patchReq, _ := json.Marshal(ManagementRequest{Method: http.MethodPatch, Path: "/v0/management/plugins/cpa-key-policy/keys", Body: patchBody})
+	patchResp := managementResponseFromEnvelope(t, mustHandle(t, app, MethodManagementHandle, patchReq))
+	if patchResp.StatusCode != http.StatusOK {
+		t.Fatalf("patch status=%d body=%s", patchResp.StatusCode, patchResp.Body)
+	}
+	auditReq, _ := json.Marshal(ManagementRequest{
+		Method: http.MethodGet,
+		Path:   "/v0/management/plugins/cpa-key-policy/audit",
+		Query:  url.Values{"key_id": {"priced"}, "limit": {"10"}},
+	})
+	auditResp := managementResponseFromEnvelope(t, mustHandle(t, app, MethodManagementHandle, auditReq))
+	if auditResp.StatusCode != http.StatusOK {
+		t.Fatalf("audit status=%d body=%s", auditResp.StatusCode, auditResp.Body)
+	}
+	var auditBody struct {
+		Events []struct {
+			Action  string                     `json:"action"`
+			Changes map[string]json.RawMessage `json:"changes"`
+		} `json:"events"`
+	}
+	if err := json.Unmarshal(auditResp.Body, &auditBody); err != nil {
+		t.Fatal(err)
+	}
+	if len(auditBody.Events) == 0 || auditBody.Events[0].Action != "update_key" || auditBody.Events[0].Changes["monthly_limit_usd"] == nil {
+		t.Fatalf("audit response = %+v", auditBody)
 	}
 }
 
@@ -720,11 +808,31 @@ func TestManagementResetUsageEndpoint(t *testing.T) {
 
 	keys := app.Store().Keys()
 	summary := app.Store().UsageSummaryFor(keys[0])
-	if !nearly(summary.DailyUSD, 0) || !nearly(summary.WeeklyUSD, 0.30) {
-		t.Fatalf("daily reset summary = %+v, want 0/0.30", summary)
+	if !nearly(summary.DailyUSD, 0) || !nearly(summary.WeeklyUSD, 0) {
+		t.Fatalf("daily reset summary = %+v, want 0/0", summary)
 	}
 
-	badBody, _ := json.Marshal(map[string]string{"id": "priced", "window": "month"})
+	if _, err := app.HandleMethod(MethodUsageHandle, usageReq); err != nil {
+		t.Fatal(err)
+	}
+	monthlyBody, _ := json.Marshal(map[string]string{"id": "priced", "window": "monthly"})
+	monthlyReq, _ := json.Marshal(ManagementRequest{
+		Method: http.MethodPost,
+		Path:   "/v0/management/plugins/cpa-key-policy/keys/reset-usage",
+		Body:   monthlyBody,
+	})
+	monthlyResp := managementResponseFromEnvelope(t, mustHandle(t, app, MethodManagementHandle, monthlyReq))
+	if monthlyResp.StatusCode != http.StatusOK {
+		t.Fatalf("monthly reset status = %d, body = %s", monthlyResp.StatusCode, monthlyResp.Body)
+	}
+	if err := json.Unmarshal(monthlyResp.Body, &got); err != nil {
+		t.Fatalf("unmarshal monthly reset response: %v, body=%s", err, monthlyResp.Body)
+	}
+	if got.Window != policy.UsageResetMonthly || !nearly(got.BeforeMonthlyUSD, 0.30) || !nearly(got.AfterMonthlyUSD, 0) {
+		t.Fatalf("monthly reset response = %+v", got)
+	}
+
+	badBody, _ := json.Marshal(map[string]string{"id": "priced", "window": "year"})
 	badReq, _ := json.Marshal(ManagementRequest{
 		Method: http.MethodPost,
 		Path:   "/v0/management/plugins/cpa-key-policy/keys/reset-usage",

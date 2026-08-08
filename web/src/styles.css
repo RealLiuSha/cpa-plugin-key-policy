@@ -323,7 +323,7 @@ th.num, td.num { text-align: right; }
 /* "strong" = emphasized numeric value (the USD total per alias row). */
 td.strong { font-weight: 600; color: var(--text); }
 
-/* Header row: back button + key id (mono) + name on the left, daily/weekly
+/* Header row: back button + key id (mono) + name on the left, window
    window toggle on the right. Mirrors the Stitch design's header layout but
    reuses .btn instead of pill styling for consistency with the rest of the UI. */
 .keyusage-header {
@@ -636,7 +636,8 @@ td.strong { font-weight: 600; color: var(--text); }
   width: 8px; height: 8px; border-radius: var(--r-full); flex: none;
   background: var(--ok);
 }
-.keycard.disabled .kc-dot { background: var(--danger); }
+.keycard.disabled .kc-dot { background: var(--muted); }
+.keycard.over .kc-dot { background: var(--danger); }
 .keycard .kc-name { font-weight: 600; font-size: 15px; flex: 1; }
 .keycard .kc-preview {
   font-family: "Courier Prime", ui-monospace, Consolas, monospace;
@@ -735,7 +736,7 @@ td.strong { font-weight: 600; color: var(--text); }
 .usage-hero .uh-stats > span { flex: 1; text-align: center; }
 .usage-hero .uh-stats > span + span { border-left: 1px solid var(--border); }
 
-/* .seg: segmented daily/weekly toggle. */
+/* .seg: segmented accounting-window toggle. */
 .seg {
   display: inline-flex; background: var(--muted-bg);
   border-radius: var(--r-md); padding: 2px; gap: 2px; margin-bottom: 16px;
@@ -930,6 +931,26 @@ td.strong { font-weight: 600; color: var(--text); }
 }
 .model-chips-box .mc-add:hover { border-color: var(--accent); color: var(--accent); }
 .model-chips-box .mc-empty { font-size: 13px; color: var(--muted); }
+.kf-alias-limits {
+  margin-top: 12px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--bg);
+}
+.kf-alias-limits-title { margin-bottom: 8px; font-size: 12px; font-weight: 600; }
+.kf-alias-limit-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(120px, 180px);
+  align-items: center;
+  gap: 12px;
+  margin-top: 8px;
+  font-size: 13px;
+}
+.kf-alias-limit-row .input { width: 100%; }
+@media (max-width: 640px) {
+  .kf-alias-limit-row { grid-template-columns: 1fr; gap: 6px; }
+}
 @media (max-width: 640px) {
   .form-page .fp-head h1 { display: none; }
 }
@@ -947,14 +968,14 @@ td.strong { font-weight: 600; color: var(--text); }
 /* Hide mobile-only blocks on desktop. .usage-hero stays hidden on desktop
  * because the desktop usage page uses .usage-hero-d instead. .seg is hidden
  * on desktop globally, but the KeyUsage header's toggle is un-hidden below
- * so daily/weekly still works on desktop. */
+ * so the window switch still works on desktop. */
 @media (min-width: 641px) {
   .tabbar, .fab, .bar-rank,
   .detail-card, .mmodels, .section-label, .sechead, .seg,
   .mobile-only, .mobile-form-header { display: none !important; }
   /* Desktop shows the top nav; mobile keeps the legacy .header. */
   .topnav { display: block; }
-  /* KeyUsage header keeps its daily/weekly toggle on desktop. */
+  /* KeyUsage header keeps its window switch on desktop. */
   .keyusage-header .seg { display: inline-flex !important; }
 }
 @media (max-width: 640px) {
@@ -1179,4 +1200,83 @@ td.strong { font-weight: 600; color: var(--text); }
 .kf-alias-chip.selected {
   background: var(--accent-soft); border-color: var(--accent); color: var(--accent);
   font-weight: 600;
+}
+.usage-soft-warning {
+  box-shadow: inset 3px 0 0 #d69e2e;
+}
+
+.tag.state-warning,
+.keycard.warning .kc-dot {
+  color: #9a6700;
+  border-color: #d69e2e;
+  background: color-mix(in srgb, #d69e2e 14%, transparent);
+}
+
+.tag.state-limited {
+  color: var(--danger);
+  border-color: var(--danger);
+}
+
+.tag.state-disabled {
+  color: var(--muted);
+  border-color: var(--border-strong);
+  background: var(--muted-bg);
+}
+
+.key-list-mobile-refresh,
+.usage-history-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.key-list-sort {
+  width: auto;
+  min-width: 150px;
+}
+
+.usage-reset-countdown,
+.kf-current-usage {
+  display: block;
+  margin-top: 3px;
+  font-size: 0.78rem;
+}
+
+.usage-history-card {
+  margin-bottom: 16px;
+  overflow: hidden;
+}
+
+.usage-history-card svg {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+
+.usage-chart-axis {
+  stroke: var(--border);
+  stroke-width: 1;
+}
+
+.usage-chart-bar {
+  fill: var(--accent);
+  opacity: 0.78;
+}
+
+.usage-chart-limit {
+  stroke: var(--danger);
+  stroke-width: 2;
+  stroke-dasharray: 6 4;
+}
+
+.audit-changes {
+  max-width: 460px;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.state-indicator {
+  display: none;
 }

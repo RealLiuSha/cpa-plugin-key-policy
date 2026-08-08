@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { listKeys } from "../api/keys";
+import { extractApiError } from "../api/error";
 import type { KeyPublic, ModelRule } from "../types";
 import KeyMoreMenu from "../components/KeyMoreMenu";
 import { MobileTabBar } from "../components/MobileChrome";
@@ -9,6 +10,7 @@ import { useT } from "../i18n";
 
 /** Default page size for the key list (client-side pagination). */
 export const KEY_LIST_PAGE_SIZE = 10;
+export type KeySort = "daily" | "ratio" | "active";
 
 /** Deduplicate model rules by alias (case-insensitive) for chip display. */
 export function uniqueAliases(models: ModelRule[] | undefined): string[] {
@@ -71,15 +73,48 @@ export function isLimitHit(used: number, limit: number): boolean {
   return limit > 0 && used >= limit;
 }
 
-/** Daily OR weekly limit hit → usage should be marked red. */
+/** Any hard usage limit hit means the key is quota-blocked. */
 export function isAnyLimitHit(usage: {
   daily_usd: number;
   weekly_usd: number;
+  monthly_usd?: number;
   daily_limit_usd: number;
   weekly_limit_usd: number;
+  monthly_limit_usd?: number;
 }): boolean {
   return isLimitHit(usage.daily_usd, usage.daily_limit_usd)
-    || isLimitHit(usage.weekly_usd, usage.weekly_limit_usd);
+    || isLimitHit(usage.weekly_usd, usage.weekly_limit_usd)
+    || isLimitHit(usage.monthly_usd ?? 0, usage.monthly_limit_usd ?? 0);
+}
+
+function maxLimitRatio(k: KeyPublic): number {
+  const pairs = [
+    [k.usage.daily_usd, k.usage.daily_limit_usd],
+    [k.usage.weekly_usd, k.usage.weekly_limit_usd],
+    [k.usage.monthly_usd ?? 0, k.usage.monthly_limit_usd ?? 0],
+  ];
+  return Math.max(0, ...pairs.map(([used, limit]) => limit > 0 ? used / limit : 0));
+}
+
+export function sortKeys(keys: KeyPublic[], mode: KeySort): KeyPublic[] {
+  return [...keys].sort((a, b) => {
+    let delta = 0;
+    if (mode === "daily") delta = b.usage.daily_usd - a.usage.daily_usd;
+    if (mode === "ratio") delta = maxLimitRatio(b) - maxLimitRatio(a);
+    if (mode === "active") delta = Date.parse(b.updated_at ?? "") - Date.parse(a.updated_at ?? "");
+    if (!Number.isFinite(delta) || delta === 0) return a.id.localeCompare(b.id);
+    return delta;
+  });
+}
+
+export function formatResetCountdown(resetAt: string | undefined, nowMs: number): string {
+  const target = Date.parse(resetAt ?? "");
+  if (!Number.isFinite(target)) return "—";
+  const seconds = Math.max(0, Math.floor((target - nowMs) / 1000));
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const rest = seconds % 60;
+  return [hours, minutes, rest].map((part) => String(part).padStart(2, "0")).join(":");
 }
 
 export default function KeyList() {
@@ -91,6 +126,9 @@ export default function KeyList() {
   const [plainTitle, setPlainTitle] = useState("");
   const [query, setQuery] = useState("");
   const [page, setPage] = useState(0);
+  const [sort, setSort] = useState<KeySort>("daily");
+  const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
+  const [nowMs, setNowMs] = useState(() => Date.now());
 
   // silent: refresh after reset/rotate/delete without swapping the whole list for "loading…".
   const load = useCallback(async (mode: "full" | "silent" = "full") => {
@@ -98,9 +136,9 @@ export default function KeyList() {
     setError("");
     try {
       setKeys(await listKeys());
+      setLastUpdated(new Date());
     } catch (e) {
-      const err = e as { response?: { data?: { error?: { message?: string } } }; message?: string };
-      setError(err.response?.data?.error?.message ?? err.message ?? t("keys.loadFailed"));
+      setError(extractApiError(e, t("keys.loadFailed")));
     } finally {
       if (mode === "full") setLoading(false);
     }
@@ -112,12 +150,18 @@ export default function KeyList() {
     void load("full");
   }, [load]);
 
+  useEffect(() => {
+    const timer = window.setInterval(() => setNowMs(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, []);
+
   const filtered = useMemo(() => filterKeys(keys, query), [keys, query]);
-  const pageCount = Math.max(1, Math.ceil(filtered.length / KEY_LIST_PAGE_SIZE));
+  const sorted = useMemo(() => sortKeys(filtered, sort), [filtered, sort]);
+  const pageCount = Math.max(1, Math.ceil(sorted.length / KEY_LIST_PAGE_SIZE));
   const safePage = Math.min(page, pageCount - 1);
   const pageItems = useMemo(
-    () => paginateKeys(filtered, safePage, KEY_LIST_PAGE_SIZE),
-    [filtered, safePage],
+    () => paginateKeys(sorted, safePage, KEY_LIST_PAGE_SIZE),
+    [sorted, safePage],
   );
 
   // Keep page index in range when filter shrinks; reset to first page on new query.
@@ -142,6 +186,12 @@ export default function KeyList() {
           <button className="btn sm" onClick={() => void load("full")}>{t("keys.refresh")}</button>
         </div>
       </div>
+      <div className="mobile-only key-list-mobile-refresh">
+        <button className="btn sm" onClick={() => void load("silent")}>{t("keys.refresh")}</button>
+        <span className="muted" data-testid="last-updated-mobile">
+          {t("keys.lastUpdated", { time: lastUpdated ? lastUpdated.toLocaleTimeString() : "—" })}
+        </span>
+      </div>
       {error && <div className="error">{error}</div>}
       {loading ? (
         <div className="muted">{t("keys.loading")}</div>
@@ -158,8 +208,21 @@ export default function KeyList() {
               placeholder={t("keys.searchPlaceholder")}
               aria-label={t("keys.searchPlaceholder")}
             />
+            <select
+              className="input key-list-sort"
+              value={sort}
+              onChange={(e) => setSort(e.target.value as KeySort)}
+              aria-label={t("keys.sortLabel")}
+            >
+              <option value="daily">{t("keys.sortDaily")}</option>
+              <option value="ratio">{t("keys.sortRatio")}</option>
+              <option value="active">{t("keys.sortActive")}</option>
+            </select>
             <span className="muted key-list-summary">
               {t("keys.pageSummary", { total: filtered.length })}
+              <span className="mobile-hidden" data-testid="last-updated-desktop">
+                {" · "}{t("keys.lastUpdated", { time: lastUpdated ? lastUpdated.toLocaleTimeString() : "—" })}
+              </span>
             </span>
           </div>
           {filtered.length === 0 ? (
@@ -174,7 +237,9 @@ export default function KeyList() {
                       <th>{t("keys.colStatus")}</th>
                       <th>{t("keys.colPreview")}</th>
                       <th>{t("keys.colRpm")}</th>
-                      <th>{t("keys.colUsage")}</th>
+                      <th title={t("usage.windowHelp", { timezone: keys[0]?.usage.timezone || "Asia/Shanghai" })}>
+                        {t("keys.colUsage")} · {keys[0]?.usage.timezone || "Asia/Shanghai"}
+                      </th>
                       <th>{t("keys.colModels")}</th>
                       <th>{t("keys.colAliases")}</th>
                       <th>{t("keys.colActions")}</th>
@@ -188,6 +253,7 @@ export default function KeyList() {
                         onResetComplete={refreshSilent}
                         onRotated={onRotated}
                         onDeleted={refreshSilent}
+                        nowMs={nowMs}
                       />
                     ))}
                   </tbody>
@@ -201,6 +267,7 @@ export default function KeyList() {
                     onResetComplete={refreshSilent}
                     onRotated={onRotated}
                     onDeleted={refreshSilent}
+                    nowMs={nowMs}
                   />
                 ))}
               </div>
@@ -278,11 +345,13 @@ function KeyTableRow({
   onResetComplete,
   onRotated,
   onDeleted,
+  nowMs,
 }: {
   k: KeyPublic;
   onResetComplete: () => void | Promise<void>;
   onRotated: (plainKey: string) => void;
   onDeleted: () => void | Promise<void>;
+  nowMs: number;
 }) {
   const t = useT();
   const aliases = uniqueAliases(k.models);
@@ -293,17 +362,22 @@ function KeyTableRow({
   const weekly = formatUsageWindow(k.usage.weekly_usd, k.usage.weekly_limit_usd, unlimited);
   const dailyHit = isLimitHit(k.usage.daily_usd, k.usage.daily_limit_usd);
   const weeklyHit = isLimitHit(k.usage.weekly_usd, k.usage.weekly_limit_usd);
-  const anyHit = dailyHit || weeklyHit;
+  const monthlyHit = isLimitHit(k.usage.monthly_usd ?? 0, k.usage.monthly_limit_usd ?? 0);
+  const anyHit = dailyHit || weeklyHit || monthlyHit;
+  const state = !k.enabled ? "disabled" : anyHit ? "limited" : k.usage.soft_limit_hit ? "warning" : "normal";
 
   return (
-    <tr className={[!k.enabled && "row-disabled", anyHit && "usage-limit-hit"].filter(Boolean).join(" ") || undefined}>
+    <tr
+      className={[!k.enabled && "row-disabled", anyHit && "usage-limit-hit", state === "warning" && "usage-soft-warning"].filter(Boolean).join(" ") || undefined}
+      data-testid={`key-state-${state}-${k.id}`}
+    >
       <td>
         <div className="key-id">{k.id}</div>
         {k.name ? <div className="muted key-name">{k.name}</div> : null}
       </td>
       <td>
-        <span className={"tag " + (k.enabled ? "on" : "off")}>
-          {k.enabled ? t("keys.enabled") : t("keys.disabled")}
+        <span className={"tag " + (state === "normal" ? "on" : "off") + ` state-${state}`}>
+          {state === "disabled" ? t("keys.disabled") : state === "limited" ? t("keys.quotaBlocked") : state === "warning" ? t("keys.softWarning") : t("keys.enabled")}
         </span>
       </td>
       <td className="mono">{k.key_preview}</td>
@@ -313,7 +387,10 @@ function KeyTableRow({
           {t("usage.today")} {daily}
         </div>
         <div className={"muted" + (weeklyHit ? " usage-line over" : "")} data-testid={`usage-weekly-${k.id}`}>
-          {t("usage.thisWeek")} {weekly}
+          {t("usage.last7Days")} {weekly}
+        </div>
+        <div className="muted usage-reset-countdown" data-testid={`usage-reset-${k.id}`}>
+          {t("usage.nextReset")} {formatResetCountdown(k.usage.daily_reset_at, nowMs)}
         </div>
       </td>
       <td>{aliases.length}</td>
@@ -350,11 +427,13 @@ function KeyMobileCard({
   onResetComplete,
   onRotated,
   onDeleted,
+  nowMs,
 }: {
   k: KeyPublic;
   onResetComplete: () => void | Promise<void>;
   onRotated: (plainKey: string) => void;
   onDeleted: () => void | Promise<void>;
+  nowMs: number;
 }) {
   const t = useT();
   const aliases = uniqueAliases(k.models);
@@ -362,48 +441,44 @@ function KeyMobileCard({
   const moreCount = Math.max(0, aliases.length - 2);
   const dailyLimit = k.usage.daily_limit_usd > 0 ? k.usage.daily_limit_usd : 0;
   const weeklyLimit = k.usage.weekly_limit_usd > 0 ? k.usage.weekly_limit_usd : 0;
+  const monthlyLimit = (k.usage.monthly_limit_usd ?? 0) > 0 ? k.usage.monthly_limit_usd ?? 0 : 0;
   const dailyHit = isLimitHit(k.usage.daily_usd, k.usage.daily_limit_usd);
   const weeklyHit = isLimitHit(k.usage.weekly_usd, k.usage.weekly_limit_usd);
-  const over = dailyHit || weeklyHit;
-  // Prefer daily bar when daily has a limit; otherwise show weekly progress.
-  const barLimit = dailyLimit > 0 ? dailyLimit : weeklyLimit;
-  const barUsed = dailyLimit > 0 ? k.usage.daily_usd : k.usage.weekly_usd;
+  const monthlyHit = isLimitHit(k.usage.monthly_usd ?? 0, k.usage.monthly_limit_usd ?? 0);
+  const over = dailyHit || weeklyHit || monthlyHit;
+  const state = !k.enabled ? "disabled" : over ? "limited" : k.usage.soft_limit_hit ? "warning" : "normal";
+  // Prefer the shortest configured window; a monthly-only key still gets a
+  // meaningful quota progress bar rather than looking unlimited.
+  const barLimit = dailyLimit > 0 ? dailyLimit : weeklyLimit > 0 ? weeklyLimit : monthlyLimit;
+  const barUsed = dailyLimit > 0 ? k.usage.daily_usd : weeklyLimit > 0 ? k.usage.weekly_usd : k.usage.monthly_usd ?? 0;
   const pct = barLimit > 0 ? Math.min(100, (barUsed / barLimit) * 100) : 0;
   const unlimited = t("usage.unlimited");
 
   return (
     <div
-      className={"keycard" + (k.enabled ? "" : " disabled") + (over ? " over" : "")}
+      className={"keycard" + (k.enabled ? "" : " disabled") + (over ? " over" : "") + (state === "warning" ? " warning" : "")}
       data-testid={`keycard-${k.id}`}
+      data-state={state}
     >
+      <span className="state-indicator" data-testid={`key-state-${state}-${k.id}`} aria-hidden="true" />
       <div className="kc-head">
         <span className="kc-dot" />
         <span className="kc-name">{k.name || k.id}</span>
       </div>
       <div className="kc-preview">{k.key_preview}</div>
-      {barLimit > 0 ? (
-        <>
-          <div className="kc-bar"><span style={{ width: pct + "%" }} /></div>
-          <div className="kc-meta">
-            <span className={dailyHit ? "usage-line over" : undefined} data-testid={`usage-daily-${k.id}`}>
-              {t("usage.today")} {formatUsageWindow(k.usage.daily_usd, k.usage.daily_limit_usd, unlimited)}
-            </span>
-            <span className={weeklyHit ? "usage-line over" : undefined} data-testid={`usage-weekly-${k.id}`}>
-              {t("usage.thisWeek")} {formatUsageWindow(k.usage.weekly_usd, k.usage.weekly_limit_usd, unlimited)}
-            </span>
-          </div>
-          <div className="kc-meta">
-            <span>{aliases.length} {t("keys.mobile.modelsSuffix")}</span>
-          </div>
-        </>
-      ) : (
-        <div className="kc-meta">
-          <span data-testid={`usage-daily-${k.id}`}>
-            {t("usage.today")} {fmtUsd(k.usage.daily_usd)} · {t("keys.mobile.noLimit")}
-          </span>
-          <span>{aliases.length} {t("keys.mobile.modelsSuffix")}</span>
-        </div>
-      )}
+      {barLimit > 0 && <div className="kc-bar"><span style={{ width: pct + "%" }} /></div>}
+      <div className="kc-meta">
+        <span className={dailyHit ? "usage-line over" : undefined} data-testid={`usage-daily-${k.id}`}>
+          {t("usage.today")} {formatUsageWindow(k.usage.daily_usd, k.usage.daily_limit_usd, unlimited)}
+        </span>
+        <span className={weeklyHit ? "usage-line over" : undefined} data-testid={`usage-weekly-${k.id}`}>
+          {t("usage.last7Days")} {formatUsageWindow(k.usage.weekly_usd, k.usage.weekly_limit_usd, unlimited)}
+        </span>
+      </div>
+      <div className="kc-meta">
+        <span>{aliases.length} {t("keys.mobile.modelsSuffix")}</span>
+        <span>{t("usage.nextReset")} {formatResetCountdown(k.usage.daily_reset_at, nowMs)}</span>
+      </div>
       {shownChips.length > 0 && (
         <div className="kc-chips">
           {shownChips.map((a) => <span key={a} className="chip">{a}</span>)}
