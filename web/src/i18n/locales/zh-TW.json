@@ -213,7 +213,7 @@
     "filterUnpriced": "未定价",
     "filterOrphan": "无人使用",
     "filterEmpty": "没有符合筛选的别名",
-    "passThroughFold": "直通条目（{{n}}）— 默认折叠",
+    "passThroughFold": "直通条目（{{n}}）",
     "importPrices": "导入价格",
     "importTitle": "批量导入价格",
     "importHint": "粘贴 Models.dev 风格 models.json（含 matches 数组），或选择文件。先预览再确认应用；不会创建新别名，忽略 cache_write。",
