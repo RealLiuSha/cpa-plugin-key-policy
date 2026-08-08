@@ -27,6 +27,8 @@ vi.mock("../i18n", () => ({
 import KeyList, {
   KEY_LIST_PAGE_SIZE,
   filterKeys,
+  isAnyLimitHit,
+  isLimitHit,
   paginateKeys,
 } from "./KeyList";
 import { deleteKey, listKeys, resetRPM, resetUsage, rotateKey } from "../api/keys";
@@ -74,6 +76,31 @@ function makeKey(id: string, overrides: Partial<KeyPublic> = {}): KeyPublic {
 }
 
 const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+describe("isLimitHit / isAnyLimitHit", () => {
+  it("treats limit 0 as unlimited (never hit)", () => {
+    expect(isLimitHit(100, 0)).toBe(false);
+    expect(isLimitHit(0, 0)).toBe(false);
+  });
+
+  it("hits when used >= positive limit", () => {
+    expect(isLimitHit(10, 10)).toBe(true);
+    expect(isLimitHit(11, 10)).toBe(true);
+    expect(isLimitHit(9.99, 10)).toBe(false);
+  });
+
+  it("any-hit is true when daily OR weekly is at limit", () => {
+    expect(isAnyLimitHit({
+      daily_usd: 10, weekly_usd: 1, daily_limit_usd: 10, weekly_limit_usd: 50,
+    })).toBe(true);
+    expect(isAnyLimitHit({
+      daily_usd: 1, weekly_usd: 50, daily_limit_usd: 10, weekly_limit_usd: 50,
+    })).toBe(true);
+    expect(isAnyLimitHit({
+      daily_usd: 1, weekly_usd: 2, daily_limit_usd: 10, weekly_limit_usd: 50,
+    })).toBe(false);
+  });
+});
 
 describe("KeyList table and more menu", () => {
   let container: HTMLDivElement;
@@ -155,6 +182,56 @@ describe("KeyList table and more menu", () => {
     expect(row!.textContent).toContain("60");
     expect(row!.textContent).toContain("gpt-4o");
     expect(row!.textContent).toContain("claude");
+  });
+
+  it("marks daily and/or weekly usage red when either limit is hit", async () => {
+    const dailyHit = makeKey("daily-hit", {
+      usage: {
+        daily_usd: 10,
+        weekly_usd: 5,
+        daily_limit_usd: 10,
+        weekly_limit_usd: 50,
+      },
+    });
+    const weeklyHit = makeKey("weekly-hit", {
+      usage: {
+        daily_usd: 1,
+        weekly_usd: 50,
+        daily_limit_usd: 10,
+        weekly_limit_usd: 50,
+      },
+    });
+    const ok = makeKey("ok-key", {
+      usage: {
+        daily_usd: 1,
+        weekly_usd: 2,
+        daily_limit_usd: 10,
+        weekly_limit_usd: 50,
+      },
+    });
+    (listKeys as ReturnType<typeof vi.fn>).mockResolvedValue([dailyHit, weeklyHit, ok]);
+    await renderList();
+
+    const dailyLine = container.querySelector('[data-testid="usage-daily-daily-hit"]');
+    const weeklyLineOnDailyHit = container.querySelector('[data-testid="usage-weekly-daily-hit"]');
+    expect(dailyLine?.classList.contains("over")).toBe(true);
+    expect(weeklyLineOnDailyHit?.classList.contains("over")).toBe(false);
+    expect(container.querySelector('[data-testid="usage-cell-daily-hit"]')?.classList.contains("usage-over")).toBe(true);
+
+    const weeklyLine = container.querySelector('[data-testid="usage-weekly-weekly-hit"]');
+    const dailyLineOnWeeklyHit = container.querySelector('[data-testid="usage-daily-weekly-hit"]');
+    expect(weeklyLine?.classList.contains("over")).toBe(true);
+    expect(dailyLineOnWeeklyHit?.classList.contains("over")).toBe(false);
+    expect(container.querySelector('[data-testid="usage-cell-weekly-hit"]')?.classList.contains("usage-over")).toBe(true);
+
+    expect(container.querySelector('[data-testid="usage-daily-ok-key"]')?.classList.contains("over")).toBe(false);
+    expect(container.querySelector('[data-testid="usage-weekly-ok-key"]')?.classList.contains("over")).toBe(false);
+    expect(container.querySelector('[data-testid="usage-cell-ok-key"]')?.classList.contains("usage-over")).toBe(false);
+
+    // Mobile cards: over class when either limit hit.
+    expect(container.querySelector('[data-testid="keycard-daily-hit"]')?.classList.contains("over")).toBe(true);
+    expect(container.querySelector('[data-testid="keycard-weekly-hit"]')?.classList.contains("over")).toBe(true);
+    expect(container.querySelector('[data-testid="keycard-ok-key"]')?.classList.contains("over")).toBe(false);
   });
 
   it("exposes edit and detail links with correct routes", async () => {

@@ -531,6 +531,16 @@ td.strong { font-weight: 600; color: var(--text); }
 .key-list-table .key-id { font-weight: 600; }
 .key-list-table .key-name { font-size: 12px; margin-top: 2px; }
 .key-list-table .key-usage-cell { white-space: nowrap; font-size: 12px; }
+.key-list-table .key-usage-cell .usage-line.over,
+.key-list-table .key-usage-cell.usage-over .usage-line.over,
+.key-usage-cell .usage-line.over,
+.usage-line.over {
+  color: var(--danger);
+  font-weight: 600;
+}
+/* Weekly line uses .muted; over must still win. */
+.key-usage-cell .muted.usage-line.over { color: var(--danger); }
+.keycard .kc-meta .usage-line.over { color: var(--danger); font-weight: 600; }
 .key-list-table .key-actions-cell { white-space: nowrap; }
 .key-list-table .key-actions { flex-wrap: nowrap; }
 /* Dim content cells only — never the actions cell (menu is a DOM descendant;
