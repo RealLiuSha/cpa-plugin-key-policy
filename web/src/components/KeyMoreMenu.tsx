@@ -4,11 +4,12 @@ import { deleteKey, resetRPM, resetUsage, rotateKey } from "../api/keys";
 import { useT } from "../i18n";
 
 /** Menu actions the more-menu can expose; order is caller-controlled via `items`. */
-export type KeyMoreMenuItem = "daily" | "weekly" | "rpm" | "rotate" | "delete";
+export type KeyMoreMenuItem = "daily" | "weekly" | "monthly" | "rpm" | "rotate" | "delete";
 
 const DEFAULT_LIST_ITEMS: KeyMoreMenuItem[] = [
   "daily",
   "weekly",
+  "monthly",
   "rpm",
   "rotate",
   "delete",
@@ -17,6 +18,7 @@ const DEFAULT_LIST_ITEMS: KeyMoreMenuItem[] = [
 const LABEL_KEY: Record<KeyMoreMenuItem, string> = {
   daily: "keys.resetDaily",
   weekly: "keys.resetWeekly",
+  monthly: "keys.resetMonthly",
   rpm: "keys.resetRpm",
   rotate: "keys.resetKey",
   delete: "keys.delete",
@@ -162,6 +164,7 @@ export default function KeyMoreMenu({
     closeMenu();
     if (kind === "daily" && !confirm(t("keys.resetDailyConfirm", { id: keyId }))) return;
     if (kind === "weekly" && !confirm(t("keys.resetWeeklyConfirm", { id: keyId }))) return;
+    if (kind === "monthly" && !confirm(t("keys.resetMonthlyConfirm", { id: keyId }))) return;
     if (kind === "rotate" && !confirm(t("keys.rotateConfirm", { id: keyId }))) return;
     if (kind === "delete" && !confirm(t("keys.deleteConfirm", { id: keyId }))) return;
 
@@ -171,7 +174,7 @@ export default function KeyMoreMenu({
         await onResetComplete?.();
         return;
       }
-      if (kind === "daily" || kind === "weekly") {
+      if (kind === "daily" || kind === "weekly" || kind === "monthly") {
         await resetUsage(keyId, kind);
         await onResetComplete?.();
         return;

@@ -2,6 +2,7 @@ package plugin
 
 import (
 	"encoding/json"
+	"path/filepath"
 	"testing"
 
 	"cpa-key-policy/internal/policy"
@@ -12,7 +13,8 @@ import (
 func TestClassifyPreview(t *testing.T) {
 	app := NewApp()
 	cfg := policy.Config{
-		Enabled: true,
+		Enabled:   true,
+		StateFile: filepath.Join(t.TempDir(), "state.json"),
 		ClassifyRules: []policy.ClassifyRule{
 			{Name: "team-rule", Field: "plan_type", Pattern: "^team$", Group: "team", Enabled: true},
 			{Name: "free-rule", Field: "tier", Pattern: "^free$", Group: "free", Enabled: true},
@@ -65,7 +67,8 @@ func TestClassifyPreview(t *testing.T) {
 func TestClassifyPreviewCustomField(t *testing.T) {
 	app := NewApp()
 	cfg := policy.Config{
-		Enabled: true,
+		Enabled:   true,
+		StateFile: filepath.Join(t.TempDir(), "state.json"),
 		ClassifyRules: []policy.ClassifyRule{
 			{Name: "email-rule", Field: "email", Pattern: "@company\\.com$", Group: "company", Enabled: true},
 		},
@@ -104,7 +107,8 @@ func TestClassifyPreviewCustomField(t *testing.T) {
 func TestClassifyPreviewMultiGroup(t *testing.T) {
 	app := NewApp()
 	cfg := policy.Config{
-		Enabled: true,
+		Enabled:   true,
+		StateFile: filepath.Join(t.TempDir(), "state.json"),
 		ClassifyRules: []policy.ClassifyRule{
 			{Name: "by-plan", Field: "plan_type", Pattern: "^team$", Group: "team", Enabled: true},
 			{Name: "by-filename", Field: "filename", Pattern: "^codex-", Group: "codex-files", Enabled: true},
@@ -142,7 +146,8 @@ func TestClassifyPreviewMultiGroup(t *testing.T) {
 func TestSchedulerCustomClassifyRule(t *testing.T) {
 	app := NewApp()
 	cfg := policy.Config{
-		Enabled: true,
+		Enabled:   true,
+		StateFile: filepath.Join(t.TempDir(), "state.json"),
 		ClassifyRules: []policy.ClassifyRule{
 			{Name: "override-team", Field: "plan_type", Pattern: "^team$", Group: "custom-team", Enabled: true},
 		},

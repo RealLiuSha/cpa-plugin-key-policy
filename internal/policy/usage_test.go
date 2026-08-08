@@ -39,30 +39,31 @@ func newClockedStore(t *testing.T, now time.Time) (*Store, time.Time) {
 }
 
 func TestUsageLedgerLoadAndSnapshotDeepCopyAliasMap(t *testing.T) {
+	ledger := newUsageLedger(time.Now)
+	date := ledger.dateKey(time.Now())
 	sourceState := &UsageState{
-		Daily: UsageWindow{TotalUSD: 1},
-		ByAlias: map[string]AliasUsageWindows{
-			"fast": {Daily: UsageWindow{TotalUSD: 1}},
+		Days: map[string]UsageBucket{date: {TotalUSD: 1}},
+		ByAlias: map[string]map[string]UsageBucket{
+			"fast": {date: {TotalUSD: 1}},
 		},
 	}
-	ledger := newUsageLedger(time.Now)
 	ledger.loadFromState(map[string]*UsageState{"team-a": sourceState})
 
 	// Mutating the state object supplied by the persistence layer must not
 	// change the live ledger.
-	sourceState.Daily.TotalUSD = 9
-	sourceState.ByAlias["fast"] = AliasUsageWindows{Daily: UsageWindow{TotalUSD: 9}}
+	sourceState.Days[date] = UsageBucket{TotalUSD: 9}
+	sourceState.ByAlias["fast"] = map[string]UsageBucket{date: {TotalUSD: 9}}
 	first := ledger.snapshot()["team-a"]
-	if !nearly(first.Daily.TotalUSD, 1) || !nearly(first.ByAlias["fast"].Daily.TotalUSD, 1) {
+	if !nearly(first.Days[date].TotalUSD, 1) || !nearly(first.ByAlias["fast"][date].TotalUSD, 1) {
 		t.Fatalf("loaded ledger shares source state: %+v", first)
 	}
 
 	// A caller mutating a persistence/reporting snapshot must likewise leave
 	// the live ledger untouched.
-	first.Daily.TotalUSD = 7
-	first.ByAlias["fast"] = AliasUsageWindows{Daily: UsageWindow{TotalUSD: 7}}
+	first.Days[date] = UsageBucket{TotalUSD: 7}
+	first.ByAlias["fast"] = map[string]UsageBucket{date: {TotalUSD: 7}}
 	second := ledger.snapshot()["team-a"]
-	if !nearly(second.Daily.TotalUSD, 1) || !nearly(second.ByAlias["fast"].Daily.TotalUSD, 1) {
+	if !nearly(second.Days[date].TotalUSD, 1) || !nearly(second.ByAlias["fast"][date].TotalUSD, 1) {
 		t.Fatalf("ledger shares returned snapshot: %+v", second)
 	}
 }
@@ -82,7 +83,7 @@ func TestUsageRecordAndOverLimitDaily(t *testing.T) {
 	headers := map[string][]string{"Authorization": {"Bearer cpa_usage"}}
 
 	// 500K prompt × $1/M = $0.50 → under the $1 daily limit.
-	_ = store.RecordResponseCost(headers, nil, "fast", []byte(`{"usage":{"prompt_tokens":500000,"completion_tokens":0}}`))
+	_ = store.RecordUsage("team-a", "fast", "gpt-5-codex", false, UsageDetail{InputTokens: 500_000})
 	d := store.Authenticate("POST", "/v1/chat/completions", headers, nil, []byte(`{"model":"fast"}`))
 	if !d.Allowed {
 		t.Fatalf("first request should be allowed: %+v", d)
@@ -91,7 +92,7 @@ func TestUsageRecordAndOverLimitDaily(t *testing.T) {
 	// post-hoc: this request itself was allowed (the prior Authenticate
 	// passed), but the NEXT request now sees daily_usd >= limit and is
 	// rejected (Authenticate is a pre-request gate on accumulated usage).
-	_ = store.RecordResponseCost(headers, nil, "fast", []byte(`{"usage":{"prompt_tokens":500000,"completion_tokens":0}}`))
+	_ = store.RecordUsage("team-a", "fast", "gpt-5-codex", false, UsageDetail{InputTokens: 500_000})
 	d = store.Authenticate("POST", "/v1/chat/completions", headers, nil, []byte(`{"model":"fast"}`))
 	if d.Allowed || !d.CostLimited || d.Reason != "daily_exceeded" {
 		t.Fatalf("at-limit request should be rejected on the next Authenticate: %+v", d)
@@ -124,7 +125,7 @@ func TestUsageUnlimitedKeyNeverBlocked(t *testing.T) {
 	}
 	hdr := map[string][]string{"Authorization": {"Bearer cpa_free"}}
 	for i := 0; i < 50; i++ {
-		_ = store.RecordResponseCost(hdr, nil, "fast", []byte(`{"usage":{"prompt_tokens":1000000,"completion_tokens":1000000}}`))
+		_ = store.RecordUsage("free", "fast", "gpt-5-codex", false, UsageDetail{InputTokens: 1_000_000, OutputTokens: 1_000_000})
 		d := store.Authenticate("POST", "/v1/chat/completions", hdr, nil, []byte(`{"model":"fast"}`))
 		if !d.Allowed {
 			t.Fatalf("unlimited key blocked at iter %d: %+v", i, d)
@@ -149,14 +150,14 @@ func TestUsageUnpricedAliasNotBilled(t *testing.T) {
 		t.Fatal(err)
 	}
 	hdr := map[string][]string{"Authorization": {"Bearer cpa_cheap"}}
-	_ = store.RecordResponseCost(hdr, nil, "fast", []byte(`{"usage":{"prompt_tokens":99999999,"completion_tokens":99999999}}`))
+	_ = store.RecordUsage("cheap", "fast", "gpt-5-codex", false, UsageDetail{InputTokens: 99_999_999, OutputTokens: 99_999_999})
 	d := store.Authenticate("POST", "/v1/chat/completions", hdr, nil, []byte(`{"model":"fast"}`))
 	if !d.Allowed {
 		t.Fatalf("unpriced alias should never exceed: %+v", d)
 	}
 }
 
-func TestUsageStreamingBilledWhenUsageFrame(t *testing.T) {
+func TestUsageHandleBillsStreamingAndSkipsMissingReports(t *testing.T) {
 	now := time.Date(2026, 6, 29, 10, 0, 0, 0, time.UTC)
 	store := NewStore()
 	store.SetClock(func() time.Time { return now })
@@ -175,10 +176,8 @@ func TestUsageStreamingBilledWhenUsageFrame(t *testing.T) {
 	}
 	hdr := map[string][]string{"Authorization": {"Bearer cpa_stream"}}
 
-	// A streaming response whose host passed us an SSE body WITH a final usage
-	// frame is billed (post-hoc billing applies to streams too).
-	sse := []byte("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: {\"usage\":{\"prompt_tokens\":1000000,\"completion_tokens\":0}}\n\ndata: [DONE]\n\n")
-	_ = store.RecordResponseCost(hdr, nil, "fast", sse)
+	// usage.handle delivers the parsed final frame for streaming requests.
+	_ = store.RecordUsage("streamy", "fast", "gpt-5-codex", false, UsageDetail{InputTokens: 1_000_000})
 	d := store.Authenticate("POST", "/v1/chat/completions", hdr, nil, []byte(`{"model":"fast"}`))
 	// 1M tokens × $1/M = $1.00 >= $0.01 limit → rejected.
 	if d.Allowed || !d.CostLimited || d.Reason != "daily_exceeded" {
@@ -200,8 +199,6 @@ func TestUsageStreamingBilledWhenUsageFrame(t *testing.T) {
 		t.Fatal(err)
 	}
 	hdr2 := map[string][]string{"Authorization": {"Bearer cpa_stream2"}}
-	_ = store2.RecordResponseCost(hdr2, nil, "fast", nil)
-	_ = store2.RecordResponseCost(hdr2, nil, "fast", []byte(`data: {"delta":"hi"}`))
 	d = store2.Authenticate("POST", "/v1/chat/completions", hdr2, nil, []byte(`{"model":"fast"}`))
 	if !d.Allowed {
 		t.Fatalf("streaming without usage frame should not be billed: %+v", d)
@@ -211,8 +208,7 @@ func TestUsageStreamingBilledWhenUsageFrame(t *testing.T) {
 func TestUsageSummaryReflectsUsage(t *testing.T) {
 	now := time.Date(2026, 6, 29, 10, 0, 0, 0, time.UTC)
 	store, _ := newClockedStore(t, now)
-	hdr := map[string][]string{"Authorization": {"Bearer cpa_usage"}}
-	_ = store.RecordResponseCost(hdr, nil, "fast", []byte(`{"usage":{"prompt_tokens":200000,"completion_tokens":100000}}`))
+	_ = store.RecordUsage("team-a", "fast", "gpt-5-codex", false, UsageDetail{InputTokens: 200_000, OutputTokens: 100_000})
 	keys := store.Keys()
 	var key KeyConfig
 	for _, k := range keys {
@@ -255,7 +251,7 @@ func TestUsagePersistsAcrossRestart(t *testing.T) {
 	now := time.Date(2026, 6, 29, 10, 0, 0, 0, time.UTC)
 	s1 := mk(func() time.Time { return now })
 	hdr := map[string][]string{"Authorization": {"Bearer cpa_usage"}}
-	_ = s1.RecordResponseCost(hdr, nil, "fast", []byte(`{"usage":{"prompt_tokens":800000,"completion_tokens":0}}`))
+	_ = s1.RecordUsage("team-a", "fast", "gpt-5-codex", false, UsageDetail{InputTokens: 800_000})
 	if err := s1.FlushUsage(); err != nil {
 		t.Fatal(err)
 	}
@@ -311,12 +307,12 @@ func TestResetUsageWindowDailyAndWeekly(t *testing.T) {
 		t.Fatalf("daily reset before = %+v, want 0.30/0.30", dailyResult)
 	}
 	summary := store.UsageSummaryFor(store.Keys()[0])
-	if !nearly(summary.DailyUSD, 0) || !nearly(summary.WeeklyUSD, 0.30) {
-		t.Fatalf("after daily reset = %+v, want daily 0 / weekly 0.30", summary)
+	if !nearly(summary.DailyUSD, 0) || !nearly(summary.WeeklyUSD, 0) {
+		t.Fatalf("after daily reset = %+v, want daily 0 / weekly 0", summary)
 	}
 	_, aliases, ok := store.AliasUsageFor("resettable")
-	if !ok || len(aliases) != 1 || !nearly(aliases[0].Daily.TotalUSD, 0) || !nearly(aliases[0].Weekly.TotalUSD, 0.30) {
-		t.Fatalf("alias after daily reset = %+v, want daily 0 / weekly 0.30", aliases)
+	if !ok || len(aliases) != 1 || !nearly(aliases[0].Daily.TotalUSD, 0) || !nearly(aliases[0].Weekly.TotalUSD, 0) {
+		t.Fatalf("alias after daily reset = %+v, want daily 0 / weekly 0", aliases)
 	}
 
 	_ = store.RecordUsage("resettable", "fast", "gpt-5", false, UsageDetail{
@@ -326,8 +322,8 @@ func TestResetUsageWindowDailyAndWeekly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !nearly(weeklyResult.BeforeDailyUSD, 0.20) || !nearly(weeklyResult.BeforeWeeklyUSD, 0.50) {
-		t.Fatalf("weekly reset before = %+v, want 0.20/0.50", weeklyResult)
+	if !nearly(weeklyResult.BeforeDailyUSD, 0.20) || !nearly(weeklyResult.BeforeWeeklyUSD, 0.20) {
+		t.Fatalf("weekly reset before = %+v, want 0.20/0.20", weeklyResult)
 	}
 	summary = store.UsageSummaryFor(store.Keys()[0])
 	if !nearly(summary.DailyUSD, 0) || !nearly(summary.WeeklyUSD, 0) {
@@ -349,12 +345,51 @@ func TestResetUsageWindowDailyAndWeekly(t *testing.T) {
 	}
 }
 
+func TestResetUsageWindowMonthlyClearsThirtyDays(t *testing.T) {
+	loc := mustShanghai(t)
+	now := time.Date(2026, 8, 8, 12, 0, 0, 0, loc)
+	statePath := filepath.Join(t.TempDir(), "state.json")
+	store := NewStore()
+	store.SetClock(func() time.Time { return now })
+	if err := store.Configure(Config{
+		Enabled: true, StateFile: statePath,
+		Keys: []KeyConfig{{
+			ID: "monthly-reset", Enabled: true, KeyHash: hashForUsageTest(t, "cpa_monthly_reset"),
+			Models: []ModelRule{{Alias: "fast", Provider: "codex", TargetModel: "gpt-5", InputPricePerMillion: 1}},
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	now = now.AddDate(0, 0, -20)
+	_ = store.RecordUsage("monthly-reset", "fast", "gpt-5", false, UsageDetail{InputTokens: 2_000_000})
+	now = now.AddDate(0, 0, 20)
+	_ = store.RecordUsage("monthly-reset", "fast", "gpt-5", false, UsageDetail{InputTokens: 1_000_000})
+
+	result, err := store.ResetUsageWindow("monthly-reset", UsageResetMonthly)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !nearly(result.BeforeDailyUSD, 1) || !nearly(result.BeforeWeeklyUSD, 1) || !nearly(result.BeforeMonthlyUSD, 3) ||
+		!nearly(result.AfterDailyUSD, 0) || !nearly(result.AfterWeeklyUSD, 0) || !nearly(result.AfterMonthlyUSD, 0) {
+		t.Fatalf("monthly reset result = %+v", result)
+	}
+	summary := store.UsageSummaryFor(store.Keys()[0])
+	if !nearly(summary.DailyUSD, 0) || !nearly(summary.WeeklyUSD, 0) || !nearly(summary.MonthlyUSD, 0) {
+		t.Fatalf("monthly reset summary = %+v", summary)
+	}
+	_, aliases, ok := store.AliasUsageFor("monthly-reset")
+	if !ok || len(aliases) != 1 || !nearly(aliases[0].Monthly.TotalUSD, 0) {
+		t.Fatalf("monthly reset aliases = %+v", aliases)
+	}
+}
+
 func TestResetUsageWindowRejectsInvalidInput(t *testing.T) {
 	store, _ := newClockedStore(t, time.Date(2026, 8, 2, 1, 30, 0, 0, time.UTC))
 	if _, err := store.ResetUsageWindow("missing", UsageResetDaily); !errors.Is(err, ErrUnknownKey) {
 		t.Fatalf("unknown key error = %v, want ErrUnknownKey", err)
 	}
-	if _, err := store.ResetUsageWindow("team-a", UsageResetWindow("month")); err == nil {
+	if _, err := store.ResetUsageWindow("team-a", UsageResetWindow("year")); err == nil {
 		t.Fatal("invalid reset window should fail")
 	}
 }
@@ -386,8 +421,12 @@ func TestResetUsageWindowRollsBackWhenPersistenceFails(t *testing.T) {
 	if err := os.WriteFile(statePath, corruptState, 0o600); err != nil {
 		t.Fatal(err)
 	}
+	usagePath := filepath.Join(filepath.Dir(statePath), "cpa-key-policy-usage.json")
+	if err := os.Mkdir(usagePath, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := store.ResetUsageWindow("resettable", UsageResetWeekly); err == nil {
-		t.Fatal("reset should fail when the current state file cannot be loaded")
+		t.Fatal("reset should fail when the usage file cannot be replaced")
 	}
 
 	summary := store.UsageSummaryFor(store.Keys()[0])
@@ -630,8 +669,8 @@ func TestPerCallBillsFixedUSD(t *testing.T) {
 
 // TestTokenModeFreeAliasStillCounts: a token-mode alias whose configured
 // input/output/cache prices are all 0 (priced=true but free) must still
-// record token + call counters. Previously both RecordResponseCost and
-// RecordUsage gated RecordCost on `cost > 0`, dropping free-but-priced
+// record token + call counters. The usage handler previously gated ledger
+// recording on `cost > 0`, dropping free-but-priced
 // requests entirely so their usage volume / hit-rate was invisible.
 func TestTokenModeFreeAliasStillCounts(t *testing.T) {
 	now := time.Date(2026, 7, 2, 12, 0, 0, 0, time.UTC)
@@ -825,10 +864,9 @@ func TestAliasUsageUnknownKey(t *testing.T) {
 	}
 }
 
-// TestAliasUsageLegacyStateMigrates: a state file written in the legacy
-// single-window ByAlias format (map[string]UsageWindow) loads into the new
-// dual-window form: the old value lands in Daily, Weekly is zeroed, and the
-// key detail API surfaces it (InConfig=false if the alias is no longer configured).
+// TestAliasUsageLegacyStateMigrates verifies that a v1 aggregate state is
+// converted into natural-day buckets and persisted to the independent usage
+// file without losing the per-alias counters.
 func TestAliasUsageLegacyStateMigrates(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "state.json")
@@ -881,43 +919,25 @@ func TestAliasUsageLegacyStateMigrates(t *testing.T) {
 	if !nearly(fast.Daily.TotalUSD, 0.80) || fast.Daily.CallCount != 2 || fast.Daily.InputTokens != 800_000 {
 		t.Fatalf("migrated daily = %+v, want 0.80/2/800000", fast.Daily)
 	}
-	// Weekly zeroed by migration (no legacy weekly per-alias data existed).
-	if fast.Weekly.TotalUSD != 0 || fast.Weekly.CallCount != 0 {
-		t.Fatalf("migrated weekly should be zero: %+v", fast.Weekly)
+	// One natural-day bucket participates in both daily and trailing-week sums.
+	if !nearly(fast.Weekly.TotalUSD, 0.80) || fast.Weekly.CallCount != 2 {
+		t.Fatalf("migrated weekly = %+v, want 0.80/2", fast.Weekly)
 	}
-	// Persisting then reloading keeps the new dual-window shape (round-trip).
+	// Persisting then reloading keeps the v2 day-bucket shape (round-trip).
 	if err := store.FlushUsage(); err != nil {
 		t.Fatal(err)
 	}
-	raw2, err := os.ReadFile(path)
+	usage, err := LoadUsage(filepath.Join(dir, "cpa-key-policy-usage.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	var check struct {
-		Usage map[string]struct {
-			ByAlias map[string]struct {
-				Daily  UsageWindow `json:"daily"`
-				Weekly UsageWindow `json:"weekly"`
-			} `json:"by_alias"`
-		} `json:"usage"`
-	}
-	if err := json.Unmarshal(raw2, &check); err != nil {
-		t.Fatal(err)
-	}
-	a, ok := check.Usage["team-a"].ByAlias["fast"]
+	state := usage["team-a"]
+	a, ok := state.ByAlias["fast"]["2026-06-29"]
 	if !ok {
 		t.Fatal("fast not in re-persisted by_alias")
 	}
-	if !nearly(a.Daily.TotalUSD, 0.80) || !nearly(a.Weekly.TotalUSD, 0.80) {
-		// After the flush, the weekly alias window was populated by the
-		// post-migration in-memory state (RecordCost wrote both daily+weekly on
-		// the original record, but the legacy file only had the single window).
-		// The migration put 0.80 into Daily only; Weekly stays 0 here until a
-		// new write occurs. Accept either: Daily must be 0.80.
-		t.Logf("round-trip by_alias fast = %+v", a)
-	}
-	if !nearly(a.Daily.TotalUSD, 0.80) {
-		t.Fatalf("round-trip daily = %v, want 0.80", a.Daily.TotalUSD)
+	if !nearly(a.TotalUSD, 0.80) || a.CallCount != 2 || a.InputTokens != 800_000 {
+		t.Fatalf("round-trip bucket = %+v", a)
 	}
 }
 
@@ -993,56 +1013,6 @@ func TestRecordUsageCanonicalAliasCaseVariants(t *testing.T) {
 	}
 }
 
-// TestRecordResponseCostCanonicalAliasCaseVariants: non-stream response-cost
-// path also writes only the configured canonical spelling.
-func TestRecordResponseCostCanonicalAliasCaseVariants(t *testing.T) {
-	now := time.Date(2026, 6, 29, 10, 0, 0, 0, time.UTC)
-	store := NewStore()
-	store.SetClock(func() time.Time { return now })
-	if err := store.Configure(Config{
-		Enabled:   true,
-		StateFile: filepath.Join(t.TempDir(), "state.json"),
-		Keys: []KeyConfig{{
-			ID: "team-sol", Enabled: true,
-			KeyHash: hashForUsageTest(t, "cpa_sol"),
-			Models: []ModelRule{{
-				Alias: "gpt-5.6-sol", Provider: "codex", TargetModel: "gpt-5.6",
-				InputPricePerMillion: 1, OutputPricePerMillion: 1,
-			}},
-		}},
-	}); err != nil {
-		t.Fatal(err)
-	}
-	hdr := map[string][]string{"Authorization": {"Bearer cpa_sol"}}
-	body := []byte(`{"usage":{"prompt_tokens":500000,"completion_tokens":0}}`)
-
-	for _, v := range []string{"gpt-5.6-sol", "GPT-5.6-SOL", "Gpt-5.6-Sol"} {
-		cost := store.RecordResponseCost(hdr, nil, v, body)
-		if !nearly(cost, 0.50) {
-			t.Fatalf("RecordResponseCost(%q) = %v, want 0.50", v, cost)
-		}
-	}
-	_, rows, ok := store.AliasUsageFor("team-sol")
-	if !ok {
-		t.Fatal("key not found")
-	}
-	if len(rows) != 1 || rows[0].Alias != "gpt-5.6-sol" || !rows[0].InConfig {
-		t.Fatalf("rows = %+v, want single canonical gpt-5.6-sol", rows)
-	}
-	if !nearly(rows[0].Daily.TotalUSD, 1.50) || rows[0].Daily.CallCount != 3 {
-		t.Fatalf("daily = %+v, want $1.50 / 3", rows[0].Daily)
-	}
-
-	// Unknown alias on response path: zero, no empty row.
-	if c := store.RecordResponseCost(hdr, nil, "no-such-alias", body); c != 0 {
-		t.Fatalf("unknown response cost = %v, want 0", c)
-	}
-	_, rows2, _ := store.AliasUsageFor("team-sol")
-	if len(rows2) != 1 || rows2[0].Alias != "gpt-5.6-sol" {
-		t.Fatalf("unknown created rows: %+v", rows2)
-	}
-}
-
 // TestAliasUsageCaseCanonicalReadOnlyMerge: historical mixed-case ByAlias
 // buckets merge on read into the config spelling; state file bytes and ledger
 // entries are not mutated by the read.
@@ -1114,6 +1084,12 @@ func TestAliasUsageCaseCanonicalReadOnlyMerge(t *testing.T) {
 			}},
 		}},
 	}); err != nil {
+		t.Fatal(err)
+	}
+	// Configure performs the required v1-to-v2 migration. Compare the later
+	// read against the post-migration state file, not the legacy input bytes.
+	beforeBytes, err = os.ReadFile(statePath)
+	if err != nil {
 		t.Fatal(err)
 	}
 

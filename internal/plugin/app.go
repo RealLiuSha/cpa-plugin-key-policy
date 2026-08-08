@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -23,9 +24,7 @@ type App struct {
 const classifyCacheCapacity = 4096
 
 func NewApp() *App {
-	store := policy.NewStore()
-	_ = store.Configure(policy.DefaultConfig())
-	return &App{store: store, classifyCache: make(map[string][]string)}
+	return &App{store: policy.NewStore(), classifyCache: make(map[string][]string)}
 }
 
 func (a *App) HandleMethod(method string, request []byte) ([]byte, error) {
@@ -111,6 +110,7 @@ func (a *App) registration() Registration {
 			ConfigFields: []ConfigField{
 				{Name: "enabled", Type: "boolean", Description: "Enable or disable this plugin without unloading it."},
 				{Name: "state_file", Type: "string", Description: "JSON state file used for key policy changes made through the Management API."},
+				{Name: "usage_timezone", Type: "string", Description: "IANA timezone used for natural-day usage buckets. Defaults to Asia/Shanghai."},
 				{Name: "keys", Type: "array", Description: "Initial downstream key policy list. State file wins after it exists."},
 			},
 		},
@@ -486,8 +486,10 @@ func (a *App) managementRegistration() ManagementRegistrationResponse {
 			{Method: http.MethodDelete, Path: base + "/keys", Description: "Delete a downstream CPA key policy by id."},
 			{Method: http.MethodPost, Path: base + "/keys/rotate", Description: "Rotate one downstream CPA key by id."},
 			{Method: http.MethodPost, Path: base + "/keys/reset-rpm", Description: "Reset one downstream CPA key RPM counter by id."},
-			{Method: http.MethodPost, Path: base + "/keys/reset-usage", Description: "Reset one downstream CPA key daily or weekly usage window by id."},
+			{Method: http.MethodPost, Path: base + "/keys/reset-usage", Description: "Reset one downstream CPA key daily, weekly, or monthly usage window by id."},
 			{Method: http.MethodGet, Path: base + "/keys/usage", Description: "Per-alias usage breakdown for one downstream CPA key by id."},
+			{Method: http.MethodGet, Path: base + "/keys/history", Description: "Natural-day usage history for one downstream CPA key."},
+			{Method: http.MethodGet, Path: base + "/audit", Description: "Read append-only management audit events."},
 			{Method: http.MethodGet, Path: base + "/status", Description: "Show cpa-key-policy runtime status."},
 			{Method: http.MethodGet, Path: base + "/aliases", Description: "List the global alias mapping table."},
 			{Method: http.MethodPost, Path: base + "/aliases", Description: "Create or update a global alias mapping."},
@@ -540,6 +542,10 @@ func (a *App) handleManagement(raw []byte) ([]byte, error) {
 		return OKEnvelope(a.resetUsage(req.Body))
 	case req.Method == http.MethodGet && path == base+"/keys/usage":
 		return OKEnvelope(a.keyUsage(idFromRequest(req.Query, req.Body)))
+	case req.Method == http.MethodGet && path == base+"/keys/history":
+		return OKEnvelope(a.keyHistory(idFromRequest(req.Query, req.Body), intQuery(req.Query, "days", 30)))
+	case req.Method == http.MethodGet && path == base+"/audit":
+		return OKEnvelope(a.auditEvents(strings.TrimSpace(req.Query.Get("key_id")), intQuery(req.Query, "limit", 100)))
 	case req.Method == http.MethodGet && path == base+"/status":
 		return OKEnvelope(jsonResponse(http.StatusOK, a.store.Status()))
 	case req.Method == http.MethodGet && path == base+"/aliases":
@@ -577,6 +583,7 @@ type keyWriteRequest struct {
 	Aliases             []policy.KeyAliasRef `json:"aliases,omitempty"`
 	DailyLimitUSD       *float64             `json:"daily_limit_usd,omitempty"`
 	WeeklyLimitUSD      *float64             `json:"weekly_limit_usd,omitempty"`
+	MonthlyLimitUSD     *float64             `json:"monthly_limit_usd,omitempty"`
 	AllowModelsEndpoint *bool                `json:"allow_models_endpoint,omitempty"`
 }
 
@@ -590,6 +597,7 @@ type publicKey struct {
 	Aliases             []policy.KeyAliasRef `json:"aliases"`
 	DailyLimitUSD       float64              `json:"daily_limit_usd"`
 	WeeklyLimitUSD      float64              `json:"weekly_limit_usd"`
+	MonthlyLimitUSD     float64              `json:"monthly_limit_usd"`
 	AllowModelsEndpoint bool                 `json:"allow_models_endpoint,omitempty"`
 	Usage               policy.UsageSummary  `json:"usage"`
 	CreatedAt           string               `json:"created_at,omitempty"`
@@ -642,10 +650,14 @@ func (a *App) createKey(body []byte) ManagementResponse {
 		Aliases:             req.Aliases,
 		DailyLimitUSD:       applyFloat64(req.DailyLimitUSD, 0),
 		WeeklyLimitUSD:      applyFloat64(req.WeeklyLimitUSD, 0),
+		MonthlyLimitUSD:     applyFloat64(req.MonthlyLimitUSD, 0),
 		AllowModelsEndpoint: applyBool(req.AllowModelsEndpoint, false),
 	}
 	if err := a.store.UpsertKey(item, true); err != nil {
 		return jsonError(http.StatusBadRequest, "invalid_policy", err.Error())
+	}
+	if stored := a.keyByID(item.ID); stored != nil {
+		item = *stored
 	}
 	bodyMap := map[string]any{
 		"key":       a.publicKeyFromConfig(item),
@@ -691,6 +703,9 @@ func (a *App) patchKey(body []byte) ManagementResponse {
 	if req.WeeklyLimitUSD != nil {
 		current.WeeklyLimitUSD = *req.WeeklyLimitUSD
 	}
+	if req.MonthlyLimitUSD != nil {
+		current.MonthlyLimitUSD = *req.MonthlyLimitUSD
+	}
 	if req.AllowModelsEndpoint != nil {
 		current.AllowModelsEndpoint = *req.AllowModelsEndpoint
 	}
@@ -711,7 +726,20 @@ func (a *App) patchKey(body []byte) ManagementResponse {
 	if err := a.store.UpsertKey(*current, true); err != nil {
 		return jsonError(http.StatusBadRequest, "invalid_policy", err.Error())
 	}
+	if stored := a.keyByID(current.ID); stored != nil {
+		current = stored
+	}
 	return jsonResponse(http.StatusOK, map[string]any{"key": a.publicKeyFromConfig(*current)})
+}
+
+func (a *App) keyByID(id string) *policy.KeyConfig {
+	for _, key := range a.store.Keys() {
+		if key.ID == id {
+			copy := key
+			return &copy
+		}
+	}
+	return nil
 }
 
 func (a *App) deleteKey(id string) ManagementResponse {
@@ -758,12 +786,12 @@ func (a *App) resetUsage(body []byte) ManagementResponse {
 		case errors.Is(err, policy.ErrUnknownKey):
 			return jsonError(http.StatusNotFound, "not_found", "key not found")
 		case errors.Is(err, policy.ErrInvalidUsageResetWindow):
-			return jsonError(http.StatusBadRequest, "invalid_window", "window must be daily or weekly")
+			return jsonError(http.StatusBadRequest, "invalid_window", "window must be daily, weekly, or monthly")
 		default:
 			return jsonError(http.StatusInternalServerError, "reset_failed", err.Error())
 		}
 	}
-	log.Printf("cpa-key-policy: usage reset key_id=%q window=%s before_daily_usd=%.6f before_weekly_usd=%.6f", result.KeyID, result.Window, result.BeforeDailyUSD, result.BeforeWeeklyUSD)
+	log.Printf("cpa-key-policy: usage reset key_id=%q window=%s before_daily_usd=%.6f before_weekly_usd=%.6f before_monthly_usd=%.6f", result.KeyID, result.Window, result.BeforeDailyUSD, result.BeforeWeeklyUSD, result.BeforeMonthlyUSD)
 	return jsonResponse(http.StatusOK, result)
 }
 
@@ -780,12 +808,55 @@ func (a *App) keyUsage(id string) ManagementResponse {
 		return jsonError(http.StatusNotFound, "not_found", "key not found")
 	}
 	return jsonResponse(http.StatusOK, map[string]any{
-		"key_id":           key.ID,
-		"key_name":         key.Name,
-		"daily_limit_usd":  key.DailyLimitUSD,
-		"weekly_limit_usd": key.WeeklyLimitUSD,
-		"aliases":          aliases,
+		"key_id":            key.ID,
+		"key_name":          key.Name,
+		"daily_limit_usd":   key.DailyLimitUSD,
+		"weekly_limit_usd":  key.WeeklyLimitUSD,
+		"monthly_limit_usd": key.MonthlyLimitUSD,
+		"aliases":           aliases,
 	})
+}
+
+func (a *App) keyHistory(id string, days int) ManagementResponse {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return jsonError(http.StatusBadRequest, "missing_id", "id is required")
+	}
+	if days < 1 || days > 35 {
+		return jsonError(http.StatusBadRequest, "invalid_days", "days must be between 1 and 35")
+	}
+	key, history, ok := a.store.UsageHistoryFor(id, days)
+	if !ok {
+		return jsonError(http.StatusNotFound, "not_found", "key not found")
+	}
+	return jsonResponse(http.StatusOK, map[string]any{
+		"key_id":   key.ID,
+		"timezone": a.store.UsageSummaryFor(key).Timezone,
+		"days":     history,
+	})
+}
+
+func (a *App) auditEvents(keyID string, limit int) ManagementResponse {
+	if limit < 1 || limit > 1000 {
+		return jsonError(http.StatusBadRequest, "invalid_limit", "limit must be between 1 and 1000")
+	}
+	events, err := a.store.AuditEvents(keyID, limit)
+	if err != nil {
+		return jsonError(http.StatusInternalServerError, "audit_read_failed", err.Error())
+	}
+	return jsonResponse(http.StatusOK, map[string]any{"events": events})
+}
+
+func intQuery(query map[string][]string, name string, fallback int) int {
+	values := query[name]
+	if len(values) == 0 || strings.TrimSpace(values[0]) == "" {
+		return fallback
+	}
+	value, err := strconv.Atoi(strings.TrimSpace(values[0]))
+	if err != nil {
+		return -1
+	}
+	return value
 }
 
 func storeError(err error) ManagementResponse {
@@ -839,6 +910,7 @@ func (a *App) publicKeyFromConfig(key policy.KeyConfig) publicKey {
 		Aliases:             append([]policy.KeyAliasRef{}, key.Aliases...),
 		DailyLimitUSD:       key.DailyLimitUSD,
 		WeeklyLimitUSD:      key.WeeklyLimitUSD,
+		MonthlyLimitUSD:     key.MonthlyLimitUSD,
 		AllowModelsEndpoint: key.AllowModelsEndpoint,
 		Usage:               a.store.UsageSummaryFor(key),
 	}

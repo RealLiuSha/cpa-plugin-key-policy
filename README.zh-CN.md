@@ -120,13 +120,23 @@ plugins:
       enabled: true
       priority: 10
       state_file: "cpa-key-policy-state.json"
+      usage_timezone: "Asia/Shanghai"
 ```
 
 说明：
 
-- 若已有 `state_file`，则以其中的 keys / 别名 / 归类 / 用量为准。
+- 若已有 `state_file`，则以其中的 keys / 别名 / 归类为准；用量独立存放在同目录的 `cpa-key-policy-usage.json`。
+- 用量按 `usage_timezone`（默认 `Asia/Shanghai`）自然日分桶并保留 35 天；无法解析的时区会回退 UTC 并输出告警。
 - 日常请用**网页**或管理 API 建 key 和别名；YAML 种子数据主要用于首次启动。
 - 公开文档里不要写真实管理密钥、主机名或凭证内容。
+
+升级 v1 state 前先备份，并连续两次查看确定性的迁移报告：
+
+```bash
+go run ./cmd/migrate-usage -state /path/to/cpa-key-policy-state.json -dry-run
+```
+
+报告同时包含 `before_totals` 和 `after_totals`。`before_totals` 只报告迁移时刻仍有效的旧日/周窗口；旧格式没有近 30 天维度，因此其中的 `monthly_usd` 为 `null`。迁移保持有效今日值与自洽的旧周值；若旧数据已经出现 `weekly < daily`，则把新近 7 天修正为今日值，以恢复分桶不变量。去掉 `-dry-run` 后会原子写入独立用量文件；可用 `-out` 指定输出位置。
 
 ---
 
@@ -143,8 +153,10 @@ http://<你的-cpa-主机>:<api端口>/v0/resource/plugins/cpa-key-policy/index.
 | 区域 | 用途 |
 |------|------|
 | Keys | 创建/编辑/轮换/删除 key；绑模型或别名；RPM 与额度 |
+| Key 用量 | 今日 / 近 7 天 / 近 30 天与 30 天日用量图 |
 | 映射 → 别名 | 全局多目标别名、调度方式、定价 |
 | 映射 → 凭证归类 | 自定义分组规则与命中预览 |
+| 审计 | 管理变更及限额变更前后值 |
 | 选模型 | 提供商目录；内置档 / **自定义 · …** 子组 |
 
 不重编 `.so` 时开发前端：
@@ -161,8 +173,11 @@ VITE_CPA_BASE=http://127.0.0.1:8317 npm run dev
 
 路径为精确匹配。鉴权：CPA 管理 Bearer。
 
-**Key：** `GET/POST/PATCH/DELETE …/keys`，以及 `rotate` / `reset-rpm` / `usage` / `status`  
-**额度重置：** `POST …/keys/reset-usage`，请求体为 `{ "id": "…", "window": "daily" | "weekly" }`
+**Key：** `GET/POST/PATCH/DELETE …/keys`，以及 `rotate` / `reset-rpm` / `usage` / `history` / `status`
+
+**额度重置：** `POST …/keys/reset-usage`，请求体为 `{ "id": "…", "window": "daily" | "weekly" | "monthly" }`
+
+**历史与审计：** `GET …/keys/history?id=…&days=30`（1–35 个自然日，含 alias 拆分）；`GET …/audit?key_id=…&limit=100`
 
 **别名：** `GET/POST/DELETE …/aliases`  
 

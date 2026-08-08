@@ -140,6 +140,47 @@ func TestAuthenticatePerCallImagePreCharged(t *testing.T) {
 	}
 }
 
+func TestPerCallPrechargeConsumesOneUsageReport(t *testing.T) {
+	store, plain := perCallImageStore(t)
+	now := time.Date(2026, 8, 8, 12, 0, 0, 0, time.UTC)
+	store.SetClock(func() time.Time { return now })
+	headers := http.Header{"Authorization": {"Bearer " + plain}}
+	decision := store.Authenticate("POST", "/v1/images/generations", headers, nil, []byte(`{"model":"grok-imagine-image-quality"}`))
+	if !decision.PreCharged {
+		t.Fatalf("decision = %+v", decision)
+	}
+	if cost := store.RecordUsage("img-team", "grok-imagine-image-quality", "grok-imagine-image-quality", false, UsageDetail{}); cost != 0 {
+		t.Fatalf("matching usage report cost = %v, want deduped 0", cost)
+	}
+	summary := store.UsageSummaryFor(imgTeamKey(store))
+	if summary.DailyUSD != 2 || summary.DailyCallCount != 1 {
+		t.Fatalf("deduped summary = %+v, want one $2 call", summary)
+	}
+	now = now.Add(prechargeTTL + time.Second)
+	if cost := store.RecordUsage("img-team", "grok-imagine-image-quality", "grok-imagine-image-quality", false, UsageDetail{}); cost != 2 {
+		t.Fatalf("expired marker cost = %v, want 2", cost)
+	}
+	summary = store.UsageSummaryFor(imgTeamKey(store))
+	if summary.DailyUSD != 4 || summary.DailyCallCount != 2 {
+		t.Fatalf("post-expiry summary = %+v, want two $2 calls", summary)
+	}
+}
+
+func TestPerCallPrechargeQueueIsBounded(t *testing.T) {
+	store := NewStore()
+	now := time.Date(2026, 8, 8, 12, 0, 0, 0, time.UTC)
+	store.SetClock(func() time.Time { return now })
+	for range prechargeMaxQueue + 10 {
+		store.rememberPrecharge("img-team", "grok-imagine-image-quality")
+	}
+	store.mu.RLock()
+	got := len(store.precharges[prechargeKey("img-team", "grok-imagine-image-quality")])
+	store.mu.RUnlock()
+	if got != prechargeMaxQueue {
+		t.Fatalf("precharge queue length = %d, want %d", got, prechargeMaxQueue)
+	}
+}
+
 func TestAuthenticatePerCallVideoPreCharged(t *testing.T) {
 	store, plain := perCallImageStore(t)
 	headers := http.Header{"Authorization": {"Bearer " + plain}}
@@ -237,7 +278,7 @@ func TestConfigureDoesNotResurrectKeysMissingFromState(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Simulate a stale disk snapshot: write a state containing only "on-disk".
-	if err := SaveState(path, []KeyConfig{{ID: "on-disk", Enabled: true, KeyHash: onDiskHash, Models: []ModelRule{{Alias: "fast", Provider: "codex", TargetModel: "gpt-5-codex"}}}}, nil, nil, nil); err != nil {
+	if err := SaveState(path, []KeyConfig{{ID: "on-disk", Enabled: true, KeyHash: onDiskHash, Models: []ModelRule{{Alias: "fast", Provider: "codex", TargetModel: "gpt-5-codex"}}}}, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	// Reconfigure with the same path. The persisted state lacks "in-mem", so it
@@ -340,14 +381,14 @@ func TestFlushUsagePreservesDiskKeys(t *testing.T) {
 	}
 }
 
-func TestSaveUsageOnlyDoesNotOverwriteCorruptState(t *testing.T) {
+func TestSaveUsageDoesNotOverwriteCorruptState(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.json")
 	original := []byte(`{"keys":`)
 	if err := os.WriteFile(path, original, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := SaveUsageOnly(path, map[string]*UsageState{}); err == nil {
-		t.Fatal("SaveUsageOnly accepted a corrupt state file")
+	if err := SaveUsage(filepath.Join(filepath.Dir(path), "cpa-key-policy-usage.json"), map[string]*UsageState{}); err != nil {
+		t.Fatal(err)
 	}
 	current, err := os.ReadFile(path)
 	if err != nil {
@@ -440,12 +481,13 @@ func TestStopUsageFlusherFlushesWithoutWorker(t *testing.T) {
 	// serving. Shutdown must still persist usage recorded after that point.
 	store.StopUsageFlusher()
 
-	state, err := LoadState(path)
+	usageState, err := LoadUsage(filepath.Join(filepath.Dir(path), "cpa-key-policy-usage.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	usage := state.Usage["shutdown-key"]
-	if usage == nil || usage.Daily.TotalUSD != 1 || usage.Daily.CallCount != 1 {
+	usage := usageState["shutdown-key"]
+	bucket := usage.Days["2026-07-18"]
+	if usage == nil || bucket.TotalUSD != 1 || bucket.CallCount != 1 {
 		t.Fatalf("persisted usage = %#v, want one $1 call", usage)
 	}
 }

@@ -2,13 +2,13 @@ import { useEffect, useMemo, useState } from "react";
 import { Link, useNavigate, useParams, useLocation } from "react-router-dom";
 import { listKeys, patchKey, rotateKey, deleteKey } from "../api/keys";
 import type { KeyPublic, ModelRule } from "../types";
-import KeyForm from "../components/KeyForm";
+import KeyForm, { keyWriteRequestFromForm } from "../components/KeyForm";
 import KeyMoreMenu, { type KeyMoreMenuItem } from "../components/KeyMoreMenu";
 import { MobileFormHeader, MobileTabBar } from "../components/MobileChrome";
 import PlainKeyModal from "../components/PlainKeyModal";
 import { useT } from "../i18n";
 
-const EDIT_RESET_ITEMS: KeyMoreMenuItem[] = ["daily", "weekly", "rpm"];
+const EDIT_RESET_ITEMS: KeyMoreMenuItem[] = ["daily", "weekly", "monthly", "rpm"];
 
 export default function KeyEdit() {
   const { id } = useParams<{ id: string }>();
@@ -120,16 +120,7 @@ export default function KeyEdit() {
         dangerLabel={t("keys.delete")}
         onDanger={onDelete}
         onSubmit={async (v, meta) => {
-          await patchKey({
-            id: v.id,
-            name: v.name || undefined,
-            enabled: v.enabled,
-            rpm: v.rpm,
-            models: v.models,
-            daily_limit_usd: v.daily_limit_usd,
-            weekly_limit_usd: v.weekly_limit_usd,
-            allow_models_endpoint: v.allow_models_endpoint,
-          });
+          await patchKey(keyWriteRequestFromForm(v));
           // Stay when newly-added aliases still need pricing so the user can
           // follow the mapping link; otherwise return to the list as before.
           if (meta.newUnpricedCount > 0) {

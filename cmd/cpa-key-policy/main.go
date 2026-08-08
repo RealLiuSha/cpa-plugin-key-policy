@@ -39,6 +39,7 @@ extern void cliproxyPluginShutdown(void);
 import "C"
 
 import (
+	_ "time/tzdata"
 	"unsafe"
 
 	"cpa-key-policy/internal/plugin"

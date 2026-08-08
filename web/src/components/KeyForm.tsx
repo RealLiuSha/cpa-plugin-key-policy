@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useState, type ReactNode } from "react";
 import { Link, useNavigate } from "react-router-dom";
-import type { KeyPublic, ModelRule, AliasMapping } from "../types";
+import type { KeyPublic, ModelRule, AliasMapping, KeyAliasRef, KeyWriteRequest } from "../types";
 import ModelPicker from "./ModelPicker";
 import { fetchAliases } from "../api/mappings";
+import { extractApiError } from "../api/error";
 import { formatTierLabel } from "../api/models";
 import { useT } from "../i18n";
 
@@ -12,12 +13,21 @@ export interface KeyFormValues {
   enabled: boolean;
   rpm: number;
   models: ModelRule[];
+  aliases: KeyAliasRef[];
   daily_limit_usd: number;
   weekly_limit_usd: number;
+  monthly_limit_usd: number;
   // Per-key override for GET /v1/models. CPA cannot filter the model list per
   // downstream key, so the only plugin-enforceable choice is binary: 401 (hide
   // the list) or allow (client sees the full global list). Default false.
   allow_models_endpoint?: boolean;
+}
+
+export function keyWriteRequestFromForm(values: KeyFormValues): KeyWriteRequest {
+  return {
+    ...values,
+    name: values.name.trim() || undefined,
+  };
 }
 
 /** Meta passed to parent onSubmit so post-save UX (navigate / toast) can react. */
@@ -104,6 +114,27 @@ export function countNewUnpricedAliases(
   return n;
 }
 
+function aliasRefsForModels(
+  models: ModelRule[],
+  initialRefs: KeyAliasRef[] | undefined,
+  dailyLimits: Record<string, number>,
+): KeyAliasRef[] {
+  const previous = new Map((initialRefs ?? []).map((ref) => [ref.alias.toLowerCase(), ref]));
+  const seen = new Set<string>();
+  const refs: KeyAliasRef[] = [];
+  for (const model of models) {
+    const canonical = model.alias.toLowerCase();
+    if (seen.has(canonical)) continue;
+    seen.add(canonical);
+    refs.push({
+      ...previous.get(canonical),
+      alias: model.alias,
+      daily_limit_usd: dailyLimits[canonical] ?? previous.get(canonical)?.daily_limit_usd ?? 0,
+    });
+  }
+  return refs;
+}
+
 export default function KeyForm({
   initial,
   idReadOnly,
@@ -122,6 +153,10 @@ export default function KeyForm({
   const [rpm, setRpm] = useState(initial?.rpm ?? 0);
   const [dailyLimit, setDailyLimit] = useState(initial?.daily_limit_usd ?? 0);
   const [weeklyLimit, setWeeklyLimit] = useState(initial?.weekly_limit_usd ?? 0);
+  const [monthlyLimit, setMonthlyLimit] = useState(initial?.monthly_limit_usd ?? 0);
+  const [aliasDailyLimits, setAliasDailyLimits] = useState<Record<string, number>>(() =>
+    Object.fromEntries((initial?.aliases ?? []).map((ref) => [ref.alias.toLowerCase(), ref.daily_limit_usd ?? 0])),
+  );
   const [allowModels, setAllowModels] = useState<boolean>(initial?.allow_models_endpoint ?? false);
   const t = useT();
 
@@ -232,6 +267,22 @@ export default function KeyForm({
     const stripped = modelsWithoutPrices(models);
     const newUnpriced = countNewUnpricedAliases(stripped, initial?.models, globalAliases);
     const meta: KeyFormSubmitMeta = { newUnpricedCount: newUnpriced };
+    const immediatelyBlocked = initial ? [
+      { label: t("keyForm.dailyLimitLabel"), limit: dailyLimit, used: initial.usage.daily_usd },
+      { label: t("keyForm.weeklyLimitLabel"), limit: weeklyLimit, used: initial.usage.weekly_usd },
+      { label: t("keyForm.monthlyLimitLabel"), limit: monthlyLimit, used: initial.usage.monthly_usd ?? 0 },
+    ].filter(({ limit, used }) => limit > 0 && used > 0 && limit <= used) : [];
+    if (immediatelyBlocked.length > 0) {
+      const details = immediatelyBlocked
+        .map(({ label, used, limit }) => `${label}: $${used.toFixed(2)} → $${limit.toFixed(2)}`)
+        .join("\n");
+      if (!window.confirm(t("keyForm.limitBelowUsageConfirm", { details }))) return;
+    }
+    const aliases = aliasRefsForModels(stripped, initial?.aliases, aliasDailyLimits);
+    if (aliases.some((ref) => (ref.daily_limit_usd ?? 0) < 0)) {
+      setLocalErr(t("keyForm.aliasLimitInvalid"));
+      return;
+    }
     setBusy(true);
     try {
       await onSubmit({
@@ -240,15 +291,16 @@ export default function KeyForm({
         enabled,
         rpm,
         models: stripped,
+        aliases,
         daily_limit_usd: dailyLimit,
         weekly_limit_usd: weeklyLimit,
+        monthly_limit_usd: monthlyLimit,
         allow_models_endpoint: allowModels,
       }, meta);
       // After-save unpriced guidance is owned by KeyEdit/KeyNew via meta —
       // do not render a second banner here (avoids duplicate DOM notices).
     } catch (err) {
-      const e2 = err as { response?: { data?: { error?: { message?: string } } }; message?: string };
-      setLocalErr(e2.response?.data?.error?.message ?? e2.message ?? t("keyForm.submitFailed"));
+      setLocalErr(extractApiError(err, t("keyForm.submitFailed")));
     } finally {
       setBusy(false);
     }
@@ -290,6 +342,33 @@ export default function KeyForm({
           + {t("keyForm.addModel")}
         </button>
       )}
+    </div>
+  );
+
+  const renderAliasLimits = () => selectedAliasNames.length > 0 && (
+    <div className="kf-alias-limits">
+      <div className="muted kf-alias-limits-title">{t("keyForm.aliasDailyLimitsLabel")}</div>
+      {selectedAliasNames.map((alias) => {
+        const canonical = alias.toLowerCase();
+        return (
+          <label className="kf-alias-limit-row" key={canonical}>
+            <span>{t("keyForm.aliasDailyLimitLabel", { alias })}</span>
+            <input
+              className="input"
+              type="number"
+              min={0}
+              step="0.01"
+              data-alias-limit={canonical}
+              value={aliasDailyLimits[canonical] ?? 0}
+              onChange={(event) => setAliasDailyLimits((current) => ({
+                ...current,
+                [canonical]: parseNum(event.target.value),
+              }))}
+            />
+          </label>
+        );
+      })}
+      <p className="muted kf-hint">{t("keyForm.aliasDailyLimitHint")}</p>
     </div>
   );
 
@@ -348,6 +427,7 @@ export default function KeyForm({
           <>
             <div className="form-row">
               <label>{t("keyForm.dailyLimitLabel")}</label>
+              {initial && <span className="muted kf-current-usage">{t("keyForm.currentUsage", { amount: initial.usage.daily_usd.toFixed(2) })}</span>}
               <input
                 className="input"
                 type="number"
@@ -359,6 +439,7 @@ export default function KeyForm({
             </div>
             <div className="form-row">
               <label>{t("keyForm.weeklyLimitLabel")}</label>
+              {initial && <span className="muted kf-current-usage">{t("keyForm.currentUsage", { amount: initial.usage.weekly_usd.toFixed(2) })}</span>}
               <input
                 className="input"
                 type="number"
@@ -367,6 +448,11 @@ export default function KeyForm({
                 value={weeklyLimit}
                 onChange={(e) => setWeeklyLimit(parseNum(e.target.value))}
               />
+            </div>
+            <div className="form-row">
+              <label>{t("keyForm.monthlyLimitLabel")}</label>
+              {initial && <span className="muted kf-current-usage">{t("keyForm.currentUsage", { amount: (initial.usage.monthly_usd ?? 0).toFixed(2) })}</span>}
+              <input className="input" type="number" min={0} step="0.01" value={monthlyLimit} onChange={(e) => setMonthlyLimit(parseNum(e.target.value))} />
             </div>
           </>
         ))}
@@ -401,6 +487,7 @@ export default function KeyForm({
               <ModelPicker initial={initial?.models} onChange={handleModelsChange} />
             )}
           </div>
+          {renderAliasLimits()}
           {selectedAliasNames.some(isAliasUnpriced) && (
             <p className="muted kf-warn">⚠ {t("keyForm.unpricedHint")}</p>
           )}
@@ -458,6 +545,7 @@ export default function KeyForm({
         <div className="row2">
           <div className="form-row">
             <label>{t("keyForm.dailyLimitLabel")}</label>
+            {initial && <span className="muted kf-current-usage">{t("keyForm.currentUsage", { amount: initial.usage.daily_usd.toFixed(2) })}</span>}
             <input
               className="input"
               type="number"
@@ -469,6 +557,7 @@ export default function KeyForm({
           </div>
           <div className="form-row">
             <label>{t("keyForm.weeklyLimitLabel")}</label>
+            {initial && <span className="muted kf-current-usage">{t("keyForm.currentUsage", { amount: initial.usage.weekly_usd.toFixed(2) })}</span>}
             <input
               className="input"
               type="number"
@@ -478,6 +567,11 @@ export default function KeyForm({
               onChange={(e) => setWeeklyLimit(parseNum(e.target.value))}
             />
           </div>
+        </div>
+        <div className="form-row">
+          <label>{t("keyForm.monthlyLimitLabel")}</label>
+          {initial && <span className="muted kf-current-usage">{t("keyForm.currentUsage", { amount: (initial.usage.monthly_usd ?? 0).toFixed(2) })}</span>}
+          <input className="input" type="number" min={0} step="0.01" value={monthlyLimit} onChange={(e) => setMonthlyLimit(parseNum(e.target.value))} />
         </div>
 
         <div className="form-row">
@@ -526,6 +620,7 @@ export default function KeyForm({
             <p className="muted kf-warn" style={{ marginTop: 8 }}>⚠ {t("keyForm.unpricedHint")}</p>
           )}
         </div>
+        {renderAliasLimits()}
       </div>
 
       {(localErr || error) && <div className="error">{localErr || error}</div>}

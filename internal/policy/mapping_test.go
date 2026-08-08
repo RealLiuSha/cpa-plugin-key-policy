@@ -653,7 +653,7 @@ func TestSaveStateStripsDerivedModels(t *testing.T) {
 			{Alias: "test", Provider: "anthropic", TargetModel: "claude-3"},
 		},
 	}}
-	if err := SaveState(path, keys, nil, []AliasMapping{{
+	if err := SaveState(path, keys, []AliasMapping{{
 		Alias: "test", Targets: []AliasTarget{
 			{Provider: "openai", TargetModel: "gpt-4o"},
 			{Provider: "anthropic", TargetModel: "claude-3"},

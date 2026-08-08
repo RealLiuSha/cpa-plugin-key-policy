@@ -3,12 +3,15 @@ package policy
 import (
 	"errors"
 	"fmt"
-	"net/http"
+	"log"
 	"os"
 	"sort"
 	"strings"
 	"sync"
 	"time"
+
+	"cpa-key-policy/internal/policy/audit"
+	policyPersist "cpa-key-policy/internal/policy/persist"
 )
 
 type Store struct {
@@ -21,7 +24,8 @@ type Store struct {
 	keysByHash map[string]*KeyConfig
 	limiter    *RateLimiter
 	usage      *usageLedger
-	// flusher for periodically persisting the usage ledger to the state file.
+	auditLog   *audit.Log
+	// flusher periodically persists the ledger to the independent usage file.
 	flusher *usageFlusher
 	// aliases is the global alias mapping table from config.yaml. Used to
 	// resolve KeyAliasRef → ModelRule for routing and billing.
@@ -37,6 +41,9 @@ type Store struct {
 	// twice (auth + route) and the scheduler could filter by the wrong group.
 	// Keyed by lower(keyID)+"\0"+lower(alias); FIFO queue per key.
 	pendingPicks map[string][]pendingPick
+	// precharges pairs access-time image/video charges with later usage.handle
+	// notifications when a host starts reporting those endpoints.
+	precharges map[string][]time.Time
 	// onClassifyRulesChanged is called when classify rules change, so the
 	// plugin can clear its classify cache. Set by the plugin App.
 	onClassifyRulesChanged func()
@@ -88,6 +95,7 @@ func NewStore() *Store {
 		usage:        newUsageLedger(time.Now),
 		rrCounters:   make(map[string]int),
 		pendingPicks: make(map[string][]pendingPick),
+		precharges:   make(map[string][]time.Time),
 	}
 }
 
@@ -123,9 +131,26 @@ func (s *Store) Configure(cfg Config) error {
 	keys := cfg.Keys
 	var loadedUsage map[string]*UsageState
 	firstBoot := false
-	if state, errLoad := LoadState(statePath); errLoad == nil {
+	stateNeedsRewrite := false
+	clockNow := time.Now
+	s.mu.RLock()
+	if s.usage != nil {
+		clockNow = s.usage.now
+	}
+	s.mu.RUnlock()
+	usagePath := policyPersist.UsagePath(statePath)
+	if err := policyPersist.CleanupStaleTemps(usagePath, clockNow()); err != nil {
+		return fmt.Errorf("cleanup usage temp files: %w", err)
+	}
+	if state, errLoad := LoadStateAt(statePath, clockNow(), cfg.usageLocation); errLoad == nil {
 		keys = state.Keys
 		loadedUsage = state.Usage
+		stateNeedsRewrite = state.Version < usageFileVersion || state.usageMigrated
+		if persistedUsage, errUsage := LoadUsage(usagePath); errUsage == nil {
+			loadedUsage = persistedUsage
+		} else if !errors.Is(errUsage, os.ErrNotExist) {
+			return fmt.Errorf("load usage: %w", errUsage)
+		}
 		// If config.yaml has no global alias table, fall back to the one
 		// persisted in state (so state-only reloads resolve key alias refs).
 		stateAliases := cfg.Aliases
@@ -138,7 +163,7 @@ func (s *Store) Configure(cfg Config) error {
 		}
 		// Validate state keys against the global alias table. normalizeConfig
 		// also auto-migrates any state keys still using per-key Models.
-		merged := Config{Enabled: cfg.Enabled, StateFile: cfg.StateFile, Keys: keys, Aliases: stateAliases, ClassifyRules: stateRules}
+		merged := Config{Enabled: cfg.Enabled, StateFile: cfg.StateFile, UsageTimezone: cfg.UsageTimezone, Keys: keys, Aliases: stateAliases, ClassifyRules: stateRules}
 		if errNorm := normalizeConfig(&merged); errNorm != nil {
 			return fmt.Errorf("load state: %w", errNorm)
 		}
@@ -167,6 +192,9 @@ func (s *Store) Configure(cfg Config) error {
 		}
 		if item.UpdatedAt.IsZero() {
 			item.UpdatedAt = item.CreatedAt
+		}
+		if item.LimitsChangedAt.IsZero() && (item.DailyLimitUSD > 0 || item.WeeklyLimitUSD > 0 || item.MonthlyLimitUSD > 0 || hasAliasLimit(item.Aliases)) {
+			item.LimitsChangedAt = item.CreatedAt
 		}
 		// If the key has Aliases refs, populate Models from the global table
 		// so all downstream code (routing, billing, usage) works
@@ -197,38 +225,41 @@ func (s *Store) Configure(cfg Config) error {
 		s.aliases[strings.ToLower(cfg.Aliases[i].Alias)] = &cfg.Aliases[i]
 	}
 	s.classifyRules = cfg.ClassifyRules
+	s.auditLog = audit.New(policyPersist.AuditPath(statePath), audit.DefaultMaxBytes, audit.DefaultBackups)
 	s.keys = next
 	s.rebuildKeysByHashLocked()
 	s.rrCounters = make(map[string]int)
 	s.pendingPicks = make(map[string][]pendingPick)
+	s.precharges = make(map[string][]time.Time)
 	if s.limiter == nil {
 		s.limiter = NewRateLimiter()
 	}
 	// Re-load usage into the (clock-bound) ledger for restart recovery. The
 	// clock is preserved when set via SetClock; otherwise default time.Now.
-	clockNow := s.usage.now
-	s.usage = newUsageLedger(clockNow)
+	clockNow = s.usage.now
+	s.usage = newUsageLedgerWithLocation(clockNow, cfg.usageLocation, cfg.UsageTimezone)
 	s.usage.loadFromState(loadedUsage)
 
-	// First boot (no state file existed): persist a baseline state so that the
-	// periodic usage flush (SaveUsageOnly) has keys to preserve on disk. Without
-	// this, the first FlushUsage would LoadState, find nothing, and write a
-	// state containing only usage (no keys) — then the next Configure would
-	// load an empty key list. Keys come from next (cfg.Keys or disk), usage is
-	// freshly loaded (empty on first boot).
+	// First boot seeds the config file. Loading a v1 state writes the independent
+	// usage file before rewriting state, so a crash cannot discard legacy usage.
 	var baseKeys []KeyConfig
 	var baseUsage map[string]*UsageState
 	var baseAliases []AliasMapping
 	var baseRules []ClassifyRule
-	if firstBoot {
+	if firstBoot || stateNeedsRewrite {
 		baseKeys = s.keysSnapshotLocked()
 		baseUsage = s.usageSnapshotLocked()
 		baseAliases = s.aliasesSnapshotLocked()
 		baseRules = s.classifyRulesSnapshotLocked()
 	}
 	s.mu.Unlock()
-	if firstBoot {
-		if errSave := s.saveState(statePath, baseKeys, baseUsage, baseAliases, baseRules); errSave != nil {
+	if stateNeedsRewrite && len(baseUsage) > 0 {
+		if errSave := SaveUsage(policyPersist.UsagePath(statePath), baseUsage); errSave != nil {
+			return fmt.Errorf("migrate usage: %w", errSave)
+		}
+	}
+	if firstBoot || stateNeedsRewrite {
+		if errSave := s.saveState(statePath, baseKeys, baseAliases, baseRules); errSave != nil {
 			return fmt.Errorf("seed state: %w", errSave)
 		}
 	}
@@ -255,458 +286,26 @@ func (s *Store) StatePath() string {
 	return s.statePath
 }
 
-func (s *Store) Authenticate(method, path string, headers http.Header, query map[string][]string, body []byte) AuthDecision {
-	rawKey := ExtractAPIKey(headers, query)
-	key, enabled := s.findBySecretWhenEnabled(rawKey)
-	if !enabled {
-		return AuthDecision{Known: false, Reason: "plugin_disabled"}
-	}
-	if key == nil {
-		return AuthDecision{Known: false, Reason: "unknown_key"}
-	}
-	decision := AuthDecision{
-		Known:     true,
-		KeyID:     key.ID,
-		Principal: key.ID,
-		ModelList: IsModelsEndpoint(path),
-	}
-	if !key.Enabled {
-		decision.Reason = "key_disabled"
-		return decision
-	}
-	if decision.ModelList {
-		// Per-key override: a key with AllowModelsEndpoint=true may reach the
-		// global /v1/models list; otherwise it's 401. We still cannot filter the
-		// list contents per key (CPA limitation above), only hide/show it.
-		if key.AllowModelsEndpoint {
-			decision.Allowed = true
-			decision.Reason = "models_endpoint_allowed"
-			return decision
-		}
-		decision.Reason = "models_endpoint_disabled"
-		return decision
-	}
-	requested := ExtractRequestedModel(path, query, body)
-	decision.Requested = requested
-	if requested != "" {
-		// Must use the same multi-target selection as Route (priority /
-		// round-robin), not ModelForAlias which always returns the first
-		// match. Otherwise metadata["group"] can pin the wrong tier while
-		// model.route forwards a different target.
-		rule, ok := s.resolveRuleForAlias(key, requested)
-		if !ok {
-			decision.Reason = "model_not_allowed"
-			return decision
-		}
-		decision.Rule = rule
-	}
-	limiter, usageLedger := s.runtimeComponents()
-	if limiter != nil && !limiter.Allow(key.ID, key.RPM) {
-		decision.RateLimited = true
-		decision.Reason = "rpm_exceeded"
-		return decision
-	}
-	// Dollar usage limit check (daily / weekly). Only enforced when a limit is
-	// set (>0). This is a pre-request gate; the request that pushes usage over
-	// the limit is allowed through, and the next request is rejected — matching
-	// the RPM limiter's "off-by-one" semantics.
-	if usageLedger != nil {
-		if reason, _ := usageLedger.OverLimit(*key); reason != "" {
-			decision.CostLimited = true
-			decision.Reason = reason
-			return decision
-		}
-	}
-	decision.Allowed = true
-	decision.Reason = "allowed"
-
-	// Remember this request's selected target so Route reuses it (same group /
-	// provider / model). Only stash when the request is actually allowed — a
-	// rate/cost-limited request never reaches model.route.
-	if requested != "" {
-		s.rememberPick(key.ID, requested, decision.Rule)
-	}
-
-	// Per-call image/video pre-charge workaround. CPA's XAI executor does not
-	// emit usage records for /v1/images/* and /v1/videos/* (executeImages and
-	// executeVideos lack a UsageReporter), so usage.handle never fires and the
-	// plugin would never bill these. When the matched rule is per_call and the
-	// path is an image/video endpoint, charge now, at access time. This is
-	// unconditional (we cannot observe the upstream outcome here), so failed
-	// requests are also charged — a known trade-off surfaced in the UI.
-	if decision.Rule.BillingMode == "per_call" && IsImageVideoEndpoint(path) {
-		alias := decision.Rule.Alias
-		if alias == "" {
-			alias = decision.Requested
-		}
-		model := decision.Rule.TargetModel
-		if model == "" {
-			model = alias
-		}
-		// failed=false so the per_call branch charges PerCallUSD. This is the
-		// intended behavior for this workaround (no refund on upstream failure).
-		s.RecordUsage(key.ID, alias, model, false, UsageDetail{})
-		decision.PreCharged = true
-	}
-
-	return decision
-}
-
-func (s *Store) Route(headers http.Header, query map[string][]string, requested string) (ModelRule, string, bool) {
-	if !s.Enabled() {
-		return ModelRule{}, "", false
-	}
-	key := s.findBySecret(ExtractAPIKey(headers, query))
-	if key == nil || !key.Enabled {
-		return ModelRule{}, "", false
-	}
-	// Prefer the selection Authenticate already made for this request so the
-	// routed provider/model and the group stamped into scheduler metadata stay
-	// aligned (critical for multi-target aliases with different groups).
-	if rule, ok := s.takePick(key.ID, requested); ok {
-		return rule, key.ID, true
-	}
-	rule, ok := s.resolveRuleForAlias(key, requested)
-	if !ok {
-		return ModelRule{}, key.ID, false
-	}
-	return rule, key.ID, true
-}
-
-// resolveRuleForAlias selects the ModelRule for the requested alias, applying
-// the global alias's dispatch mode. For "round-robin" with multiple targets,
-// it rotates through the targets using a global counter (shared across all
-// keys). For "priority", it always returns the first target.
-func (s *Store) resolveRuleForAlias(key *KeyConfig, requested string) (ModelRule, bool) {
-	// Collect all ModelRules matching the alias (a multi-target alias expands
-	// to multiple rules with the same alias but different provider/model/group).
-	var matches []ModelRule
-	for _, rule := range key.Models {
-		if strings.EqualFold(rule.Alias, requested) {
-			matches = append(matches, rule)
-		}
-	}
-	if len(matches) == 0 {
-		return ModelRule{}, false
-	}
-	if len(matches) == 1 {
-		return matches[0], true
-	}
-	// Multiple targets: dispatch mode + RR counter need the store lock.
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	aliasName := strings.ToLower(strings.TrimSpace(requested))
-	alias := s.aliases[aliasName]
-	if alias != nil && strings.EqualFold(alias.Dispatch, "priority") {
-		return matches[0], true // static priority: always first
-	}
-	// Round-robin (default): rotate using a global counter.
-	idx := s.rrCounters[aliasName]
-	if idx >= len(matches) {
-		idx = 0
-	}
-	s.rrCounters[aliasName] = (idx + 1) % len(matches)
-	return matches[idx], true
-}
-
-func pendingPickKey(keyID, alias string) string {
-	return strings.ToLower(strings.TrimSpace(keyID)) + "\x00" + strings.ToLower(strings.TrimSpace(alias))
-}
-
-func (s *Store) clearPendingPicksForKeyLocked(keyID string) {
-	prefix := strings.ToLower(strings.TrimSpace(keyID)) + "\x00"
-	if prefix == "\x00" {
+func (s *Store) recordAudit(event audit.Event) {
+	s.mu.RLock()
+	logWriter := s.auditLog
+	s.mu.RUnlock()
+	if logWriter == nil {
 		return
 	}
-	for key := range s.pendingPicks {
-		if strings.HasPrefix(key, prefix) {
-			delete(s.pendingPicks, key)
-		}
+	if err := logWriter.Append(event); err != nil {
+		log.Printf("cpa-key-policy: audit write failed action=%q key_id=%q: %v", event.Action, event.KeyID, err)
 	}
 }
 
-// rememberPick stores Authenticate's selected rule for a later Route call.
-func (s *Store) rememberPick(keyID, alias string, rule ModelRule) {
-	if strings.TrimSpace(keyID) == "" || strings.TrimSpace(alias) == "" {
-		return
+func (s *Store) AuditEvents(keyID string, limit int) ([]audit.Event, error) {
+	s.mu.RLock()
+	logWriter := s.auditLog
+	s.mu.RUnlock()
+	if logWriter == nil {
+		return []audit.Event{}, nil
 	}
-	k := pendingPickKey(keyID, alias)
-	now := time.Now()
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.pendingPicks == nil {
-		s.pendingPicks = make(map[string][]pendingPick)
-	}
-	q := s.prunePendingLocked(s.pendingPicks[k], now)
-	q = append(q, pendingPick{rule: rule, at: now})
-	if len(q) > pendingPickMaxQueue {
-		q = q[len(q)-pendingPickMaxQueue:]
-	}
-	s.pendingPicks[k] = q
-}
-
-// takePick consumes the oldest non-expired selection for this key+alias.
-// Returns false when nothing is pending (Route-only callers / tests).
-func (s *Store) takePick(keyID, alias string) (ModelRule, bool) {
-	if strings.TrimSpace(keyID) == "" || strings.TrimSpace(alias) == "" {
-		return ModelRule{}, false
-	}
-	k := pendingPickKey(keyID, alias)
-	now := time.Now()
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	q := s.prunePendingLocked(s.pendingPicks[k], now)
-	if len(q) == 0 {
-		delete(s.pendingPicks, k)
-		return ModelRule{}, false
-	}
-	pick := q[0]
-	q = q[1:]
-	if len(q) == 0 {
-		delete(s.pendingPicks, k)
-	} else {
-		s.pendingPicks[k] = q
-	}
-	return pick.rule, true
-}
-
-// prunePendingLocked drops expired entries. Caller must hold s.mu.
-func (s *Store) prunePendingLocked(q []pendingPick, now time.Time) []pendingPick {
-	if len(q) == 0 {
-		return q
-	}
-	i := 0
-	for i < len(q) && now.Sub(q[i].at) > pendingPickTTL {
-		i++
-	}
-	if i == 0 {
-		return q
-	}
-	if i >= len(q) {
-		return nil
-	}
-	return q[i:]
-}
-
-func (s *Store) ResponseAlias(headers http.Header, query map[string][]string, requested string) (string, bool) {
-	rule, _, ok := s.Route(headers, query, requested)
-	if !ok {
-		return "", false
-	}
-	return rule.Alias, true
-}
-
-// RecordResponseCost bills a non-streaming response for the key that owns the
-// requested alias. It parses the usage tokens from the response body, looks up
-// the alias's configured per-million prices, records the dollar cost, and
-// returns it. Streaming responses or unparseable bodies cost nothing.
-// This is best-effort: parse failures are silently zero-cost (never panic a
-// response path).
-func (s *Store) RecordResponseCost(headers http.Header, query map[string][]string, requested string, body []byte) float64 {
-	if !s.Enabled() {
-		return 0
-	}
-	key := s.findBySecret(ExtractAPIKey(headers, query))
-	if key == nil || !key.Enabled {
-		return 0
-	}
-	_, usageLedger := s.runtimeComponents()
-	requestedAlias := strings.TrimSpace(requested)
-	if requestedAlias == "" {
-		return 0
-	}
-	// Resolve to the configured canonical alias spelling so pure case variants
-	// share one ByAlias bucket. Unknown aliases keep zero-cost semantics and
-	// must not create forged empty ledger rows.
-	rule, ok := key.ModelForAlias(requestedAlias)
-	if !ok {
-		return 0
-	}
-	alias := rule.Alias
-	usage := ParseTokenUsage(body)
-	if !usage.Found {
-		return 0
-	}
-	inputPerMillion, outputPerMillion, _, priced := key.PriceForAlias(alias)
-	cost := ComputeCost(inputPerMillion, outputPerMillion, priced, usage)
-	if priced && usage.Found && usageLedger != nil {
-		// Record even when cost == 0 (a priced-but-free alias: input/output/cache
-		// prices all configured as 0). Token / call counters must still advance so
-		// the UI can report usage volume and hit-rate; the USD just stays 0.
-		// Previously `cost > 0` dropped free-but-priced requests entirely.
-		// The response-body path sees only prompt/completion counts (no cache
-		// breakdown), so cache counters stay 0 here; cache-aware accounting
-		// happens in RecordUsage via ComputeCacheCostBreakdown. We still record
-		// input tokens for hit-rate denominator parity (treat all prompt tokens
-		// as non-cache input on this path, since we can't tell otherwise).
-		// callCount=1: this was a successful, token-billed request.
-		usageLedger.RecordCost(key.ID, alias, cost, 0, 0, int64(usage.PromptTokens), int64(usage.CompletionTokens), 1)
-	}
-	return cost
-}
-
-// RecordUsage bills a finalized usage record delivered by the host via the
-// usage.handle plugin call. CPA parses the token counts itself (including the
-// final usage frame of a streaming response) before invoking us, so we receive
-// ready-made Input/Output token counts rather than a body to parse. This is
-// the billing entry point that covers streaming responses — the host never
-// invokes response.intercept_after on the streaming path, so RecordResponseCost
-// alone cannot bill streams. Best-effort: unknown keys or aliases cost nothing.
-//
-// failed reports whether the upstream request failed (non-2xx). Per-call
-// billing only charges on success (failed=false); token billing is implicitly
-// zero on failure (no tokens reported). Failed requests never increment
-// CallCount.
-//
-// key resolution: the host's UsageRecord.APIKey is NOT the client's plaintext
-// secret — CPA stores our auth result's Principal (set to key.ID) into the
-// request context as "userApiKey" and forwards that. So we match by key.ID
-// first, then fall back to a plaintext-secret match for forward compatibility
-// (in case a future CPA build forwards the raw secret).
-//
-// alias resolution: prefer the client-requested Alias (what the caller put in
-// the request body's "model" field); fall back to the resolved upstream Model.
-func (s *Store) RecordUsage(apiKeyOrID, alias, model string, failed bool, detail UsageDetail) float64 {
-	if !s.Enabled() {
-		return 0
-	}
-	// Match by ID first (the documented wire value), then by plaintext secret.
-	key := s.findByID(apiKeyOrID)
-	if key == nil || !key.Enabled {
-		key = s.findBySecret(apiKeyOrID)
-	}
-	if key == nil || !key.Enabled {
-		return 0
-	}
-	_, usageLedger := s.runtimeComponents()
-	// Resolve the alias to price against. Prefer the client-requested alias
-	// (matches what the user configured prices for); fall back to the upstream
-	// model id, which equals the alias for this plugin (alias == target_model).
-	resolved := strings.TrimSpace(alias)
-	if resolved == "" {
-		resolved = strings.TrimSpace(model)
-	}
-	if resolved == "" {
-		return 0
-	}
-	// Canonicalize to the configured rule.Alias spelling so pure case variants
-	// share one ByAlias bucket. Unknown aliases keep existing zero-cost /
-	// reject-at-auth semantics and must not create forged empty ledger rows.
-	rule, ok := key.ModelForAlias(resolved)
-	if !ok {
-		return 0
-	}
-	resolved = rule.Alias
-
-	// Per-call billing: a fixed USD charge per SUCCESSFUL request, independent
-	// of token counts. Failed requests are not charged and don't count. A
-	// PerCallUSD of 0 is allowed (free calls); CallCount still increments so the
-	// UI can report call volume. The token-price fields on the rule are dormant
-	// under this mode.
-	if strings.EqualFold(rule.BillingMode, "per_call") {
-		if failed {
-			return 0
-		}
-		cost := rule.PerCallUSD
-		if cost < 0 {
-			cost = 0
-		}
-		if usageLedger != nil {
-			// callCount=1 regardless of cost (even free calls count toward volume).
-			usageLedger.RecordCost(key.ID, resolved, cost, 0, 0, 0, 0, 1)
-		}
-		return cost
-	}
-
-	usage := TokenUsage{
-		PromptTokens:     int(detail.InputTokens),
-		CompletionTokens: int(detail.OutputTokens),
-		Found:            detail.InputTokens > 0 || detail.OutputTokens > 0,
-	}
-	if !usage.Found {
-		return 0
-	}
-	// Cache-aware billing: the usage.handle detail carries cache-read / cached
-	// token counts. We price cache-hit input tokens at the alias's cache-read
-	// price (falling back to the input price when none is configured), with
-	// provider-specific semantics for whether cache hits sit inside or outside
-	// InputTokens. The owning rule's provider selects the semantics.
-	provider := rule.Provider
-	inputPerMillion, outputPerMillion, cacheReadPerMillion, priced := key.PriceForAlias(resolved)
-	cost, cacheCost, cacheReadTokens := ComputeCacheCostBreakdown(provider, inputPerMillion, outputPerMillion, cacheReadPerMillion, priced, detail)
-	// Non-cache input tokens billed at the input price — the denominator partner
-	// for hit-rate = cacheRead / (cacheRead + input). Must mirror the biller's
-	// internal split so the reported rate matches the actual pricing.
-	var nonCacheInput int64
-	if priced && (detail.InputTokens > 0 || detail.OutputTokens > 0) {
-		if isCacheAdditiveProvider(provider) {
-			nonCacheInput = detail.InputTokens + detail.CacheCreationTokens
-		} else {
-			cr := detail.CacheReadTokens
-			if cr == 0 {
-				cr = detail.CachedTokens
-			}
-			if cr > detail.InputTokens {
-				cr = detail.InputTokens
-			}
-			nonCacheInput = detail.InputTokens - cr
-		}
-	}
-	if priced && usage.Found && usageLedger != nil {
-		// Record even when cost == 0 (priced-but-free alias: all token prices 0).
-		// Token (input/output/cache) + call counters must advance so the UI
-		// reports usage volume and hit-rate; USD stays 0. Previously `cost > 0`
-		// dropped free-but-priced requests entirely, hiding their volume.
-		// callCount=1: this was a successful, token-billed request.
-		usageLedger.RecordCost(key.ID, resolved, cost, cacheCost, cacheReadTokens, nonCacheInput, int64(detail.OutputTokens), 1)
-	}
-	return cost
-}
-
-// UsageSummaryFor returns the current daily/weekly usage + limits for a key
-// (for the keys-list management API).
-func (s *Store) UsageSummaryFor(key KeyConfig) UsageSummary {
-	_, usage := s.runtimeComponents()
-	if usage == nil {
-		return UsageSummary{DailyLimitUSD: key.DailyLimitUSD, WeeklyLimitUSD: key.WeeklyLimitUSD}
-	}
-	return usage.Summary(key)
-}
-
-// ResetUsage clears in-memory usage for a key (manual quota unlock).
-func (s *Store) ResetUsage(id string) {
-	_, usage := s.runtimeComponents()
-	if usage != nil {
-		usage.resetUsage(id)
-	}
-}
-
-// AliasUsageFor returns a per-alias usage breakdown for the key with the given
-// id, for the key detail management API. Returns the key config, the alias
-// rows, and whether the key was found. Configured-but-unused aliases appear
-// with zero values; ledger residuals for aliases no longer in the key's config
-// appear with InConfig=false. Rows are sorted by alias.
-func (s *Store) AliasUsageFor(keyID string) (KeyConfig, []AliasUsageEntry, bool) {
-	key := s.findByID(keyID)
-	if key == nil {
-		return KeyConfig{}, nil, false
-	}
-	_, usage := s.runtimeComponents()
-	if usage == nil {
-		rows := make([]AliasUsageEntry, 0, len(key.Models))
-		for _, r := range key.Models {
-			rows = append(rows, AliasUsageEntry{
-				Alias:       r.Alias,
-				Provider:    r.Provider,
-				TargetModel: r.TargetModel,
-				BillingMode: r.BillingMode,
-				PerCallUSD:  r.PerCallUSD,
-				InConfig:    true,
-			})
-		}
-		return *key, rows, true
-	}
-	return *key, usage.AliasUsage(*key), true
+	return logWriter.Query(strings.TrimSpace(keyID), limit)
 }
 
 // FindByAPIKey resolves a downstream plain key to policy (copy). Returns nil when unknown.
@@ -843,11 +442,12 @@ func resolveAliasRefsToModels(refs []KeyAliasRef, aliases map[string]*AliasMappi
 		}
 		for _, t := range a.Targets {
 			rule := ModelRule{
-				Alias:       a.Alias,
-				Provider:    t.Provider,
-				TargetModel: t.TargetModel,
-				Group:       t.Group,
-				BillingMode: a.BillingMode,
+				Alias:              a.Alias,
+				Provider:           t.Provider,
+				TargetModel:        t.TargetModel,
+				Group:              t.Group,
+				BillingMode:        a.BillingMode,
+				AliasDailyLimitUSD: ref.DailyLimitUSD,
 			}
 			// Apply per-key price overrides (nil = use global default).
 			if ref.InputPricePerMillion != nil {
@@ -876,835 +476,9 @@ func resolveAliasRefsToModels(refs []KeyAliasRef, aliases map[string]*AliasMappi
 	return out
 }
 
-func (s *Store) Keys() []KeyConfig {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.keysSnapshotLocked()
-}
-
-func (s *Store) keysSnapshotLocked() []KeyConfig {
-	keys := make([]KeyConfig, 0, len(s.keys))
-	for _, key := range s.keys {
-		copy := *key
-		copy.Models = append([]ModelRule(nil), key.Models...)
-		copy.Aliases = append([]KeyAliasRef(nil), key.Aliases...)
-		keys = append(keys, copy)
-	}
-	// Bug 5 fix: stable order by ID so list APIs and frontend rendering are
-	// deterministic (Go map iteration is randomized). Doesn't affect which key
-	// a button targets (bound by id), but prevents rows from jumping around.
-	sort.Slice(keys, func(i, j int) bool { return keys[i].ID < keys[j].ID })
-	return keys
-}
-
-// aliasesSnapshotLocked returns a copy of the global alias table.
-// Caller must hold s.mu.
-func (s *Store) aliasesSnapshotLocked() []AliasMapping {
-	out := make([]AliasMapping, 0, len(s.aliases))
-	for _, a := range s.aliases {
-		copy := *a
-		copy.Targets = append([]AliasTarget(nil), a.Targets...)
-		out = append(out, copy)
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Alias < out[j].Alias })
-	return out
-}
-
-// AliasesSnapshot returns a copy of the global alias table (thread-safe).
-func (s *Store) AliasesSnapshot() []AliasMapping {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.aliasesSnapshotLocked()
-}
-
-// AliasWithRefs is an AliasMapping enriched with runtime key-reference stats.
-// RefCount / RefKeys are never persisted; they are computed from the live key
-// table for GET /aliases and import-prices responses.
-// AliasMapping is embedded so new alias fields surface in the JSON response
-// without a second hand-written copy (anonymous embed flattens in encoding/json).
-type AliasWithRefs struct {
-	AliasMapping
-	RefCount int      `json:"ref_count"`
-	RefKeys  []string `json:"ref_keys"`
-}
-
-// aliasRefIndexLocked builds lower(alias) → key IDs that reference it.
-// Caller must hold s.mu (read or write).
-func (s *Store) aliasRefIndexLocked() map[string][]string {
-	idx := make(map[string][]string)
-	for _, key := range s.keys {
-		if key == nil {
-			continue
-		}
-		seen := make(map[string]struct{})
-		for _, ref := range key.Aliases {
-			al := strings.ToLower(strings.TrimSpace(ref.Alias))
-			if al == "" {
-				continue
-			}
-			if _, dup := seen[al]; dup {
-				continue
-			}
-			seen[al] = struct{}{}
-			idx[al] = append(idx[al], key.ID)
-		}
-	}
-	return idx
-}
-
-// AliasesSnapshotWithRefs returns the global alias table with per-alias
-// reference counts derived from the live key table. ref_keys is always a
-// non-nil slice (empty when unreferenced).
-func (s *Store) AliasesSnapshotWithRefs() []AliasWithRefs {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	aliases := s.aliasesSnapshotLocked()
-	refs := s.aliasRefIndexLocked()
-	out := make([]AliasWithRefs, 0, len(aliases))
-	for _, a := range aliases {
-		keys := refs[strings.ToLower(a.Alias)]
-		if keys == nil {
-			keys = []string{}
-		}
-		out = append(out, AliasWithRefs{
-			AliasMapping: a,
-			RefCount:     len(keys),
-			RefKeys:      keys,
-		})
-	}
-	return out
-}
-
-// AliasRefKeys returns the key IDs that reference the named alias (case-
-// insensitive). The returned slice is never nil.
-func (s *Store) AliasRefKeys(aliasName string) []string {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	refs := s.aliasRefIndexLocked()
-	keys := refs[strings.ToLower(strings.TrimSpace(aliasName))]
-	if keys == nil {
-		return []string{}
-	}
-	return append([]string(nil), keys...)
-}
-
-// classifyRulesSnapshotLocked returns a copy of the classify rules.
-// Caller must hold s.mu.
-func (s *Store) classifyRulesSnapshotLocked() []ClassifyRule {
-	return append([]ClassifyRule(nil), s.classifyRules...)
-}
-
-// ClassifyRulesSnapshot returns a copy of the classify rules (thread-safe).
-func (s *Store) ClassifyRulesSnapshot() []ClassifyRule {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.classifyRulesSnapshotLocked()
-}
-
-// updateAliasesLocked replaces the store's global alias table.
-func (s *Store) updateAliasesLocked(aliases []AliasMapping) {
-	s.aliases = make(map[string]*AliasMapping, len(aliases))
-	for i := range aliases {
-		s.aliases[strings.ToLower(aliases[i].Alias)] = &aliases[i]
-	}
-}
-
-func (s *Store) UpsertKey(input KeyConfig, persist bool) error {
-	s.updateMu.Lock()
-	defer s.updateMu.Unlock()
-	// Build a config that includes the store's current global alias table
-	// and classify rules, so normalizeConfig can validate the key's alias
-	// references and migrate any per-key Models into existing or new aliases.
-	s.mu.RLock()
-	existingAliases := s.aliasesSnapshotLocked()
-	existingRules := s.classifyRulesSnapshotLocked()
-	s.mu.RUnlock()
-	cfg := Config{Enabled: true, StateFile: s.StatePath(), Keys: []KeyConfig{input}, Aliases: existingAliases, ClassifyRules: existingRules}
-	if err := normalizeConfig(&cfg); err != nil {
-		return err
-	}
-	key := cfg.Keys[0]
-	now := time.Now().UTC()
-	s.mu.Lock()
-	if old := s.keys[key.ID]; old != nil && !old.CreatedAt.IsZero() {
-		key.CreatedAt = old.CreatedAt
-	} else if key.CreatedAt.IsZero() {
-		key.CreatedAt = now
-	}
-	key.UpdatedAt = now
-	// Populate Models from the key's Alias refs + global table for downstream use.
-	if len(key.Aliases) > 0 {
-		aliasLookup := make(map[string]*AliasMapping, len(cfg.Aliases))
-		for i := range cfg.Aliases {
-			aliasLookup[strings.ToLower(cfg.Aliases[i].Alias)] = &cfg.Aliases[i]
-		}
-		key.Models = resolveAliasRefsToModels(key.Aliases, aliasLookup)
-	}
-	s.keys[key.ID] = &key
-	s.rebuildKeysByHashLocked()
-	s.clearPendingPicksForKeyLocked(key.ID)
-	// Update the store's global alias table if migration added new aliases.
-	s.updateAliasesLocked(cfg.Aliases)
-	keys := s.keysSnapshotLocked()
-	path := s.statePath
-	usage := s.usageSnapshotLocked()
-	aliases := s.aliasesSnapshotLocked()
-	rules := s.classifyRulesSnapshotLocked()
-	s.mu.Unlock()
-	if persist {
-		return s.saveState(path, keys, usage, aliases, rules)
-	}
-	return nil
-}
-
-func (s *Store) DeleteKey(id string) error {
-	s.updateMu.Lock()
-	defer s.updateMu.Unlock()
-	id = strings.TrimSpace(id)
-	if id == "" {
-		return errors.New("id is required")
-	}
-	s.mu.Lock()
-	if _, ok := s.keys[id]; !ok {
-		s.mu.Unlock()
-		return ErrUnknownKey
-	}
-	delete(s.keys, id)
-	s.rebuildKeysByHashLocked()
-	s.clearPendingPicksForKeyLocked(id)
-	keys := s.keysSnapshotLocked()
-	usage := s.usageSnapshotLocked()
-	path := s.statePath
-	limiter := s.limiter
-	usageLedger := s.usage
-	s.mu.Unlock()
-	if limiter != nil {
-		limiter.Reset(id)
-	}
-	if usageLedger != nil {
-		usageLedger.resetUsage(id)
-	}
-	return s.saveState(path, keys, usage, s.AliasesSnapshot(), s.ClassifyRulesSnapshot())
-}
-
-func (s *Store) RotateKey(id string) (string, KeyConfig, error) {
-	s.updateMu.Lock()
-	defer s.updateMu.Unlock()
-	id = strings.TrimSpace(id)
-	if id == "" {
-		return "", KeyConfig{}, errors.New("id is required")
-	}
-	plain, err := GenerateKey()
-	if err != nil {
-		return "", KeyConfig{}, err
-	}
-	hash, err := HashKey(plain)
-	if err != nil {
-		return "", KeyConfig{}, err
-	}
-	s.mu.Lock()
-	key := s.keys[id]
-	if key == nil {
-		s.mu.Unlock()
-		return "", KeyConfig{}, ErrUnknownKey
-	}
-	key.KeyHash = hash
-	key.KeyPreview = PreviewKey(plain)
-	key.UpdatedAt = time.Now().UTC()
-	copy := *key
-	copy.Models = append([]ModelRule(nil), key.Models...)
-	s.rebuildKeysByHashLocked()
-	s.clearPendingPicksForKeyLocked(id)
-	keys := s.keysSnapshotLocked()
-	usage := s.usageSnapshotLocked()
-	path := s.statePath
-	limiter := s.limiter
-	s.mu.Unlock()
-	if limiter != nil {
-		limiter.Reset(id)
-	}
-	if err := s.saveState(path, keys, usage, s.AliasesSnapshot(), s.ClassifyRulesSnapshot()); err != nil {
-		return "", KeyConfig{}, err
-	}
-	return plain, copy, nil
-}
-
-func (s *Store) ResetRPM(id string) error {
-	if strings.TrimSpace(id) == "" {
-		return errors.New("id is required")
-	}
-	limiter, _ := s.runtimeComponents()
-	if limiter != nil {
-		limiter.Reset(id)
-	}
-	return nil
-}
-
-// ResetUsageWindow clears one key's daily or weekly usage and persists the
-// change before returning. A weekly reset also clears the daily window.
-func (s *Store) ResetUsageWindow(id string, window UsageResetWindow) (UsageResetResult, error) {
-	s.updateMu.Lock()
-	defer s.updateMu.Unlock()
-
-	id = strings.TrimSpace(id)
-	if id == "" {
-		return UsageResetResult{}, errors.New("id is required")
-	}
-	if window != UsageResetDaily && window != UsageResetWeekly {
-		return UsageResetResult{}, fmt.Errorf("%w: %q", ErrInvalidUsageResetWindow, window)
-	}
-
-	s.mu.RLock()
-	_, exists := s.keys[id]
-	usage := s.usage
-	path := s.statePath
-	s.mu.RUnlock()
-	if !exists {
-		return UsageResetResult{}, ErrUnknownKey
-	}
-	if usage == nil {
-		return UsageResetResult{KeyID: id, Window: window}, nil
-	}
-
-	// The flusher takes persistMu before snapshotting the ledger, so take the
-	// same lock order here. This prevents a pre-reset flush snapshot from being
-	// written after the reset has already been persisted. Keep usage.mu through
-	// the atomic state-file write as well: this establishes a single reset cut
-	// and lets a failed write restore the exact pre-reset ledger without
-	// overwriting usage recorded concurrently. Resets are low-frequency admin
-	// operations, so the short accounting-path stall is an intentional tradeoff.
-	s.persistMu.Lock()
-	usage.mu.Lock()
-	previous, hadPrevious := usage.entries[id]
-	previous = cloneUsageState(previous)
-	result := usage.resetWindowLocked(id, window, usage.now())
-	snapshot := usage.snapshotLocked()
-	if err := SaveUsageOnly(path, snapshot); err != nil {
-		if hadPrevious {
-			usage.entries[id] = previous
-		} else {
-			delete(usage.entries, id)
-		}
-		usage.mu.Unlock()
-		s.persistMu.Unlock()
-		return UsageResetResult{}, fmt.Errorf("persist usage reset: %w", err)
-	}
-	usage.mu.Unlock()
-	s.persistMu.Unlock()
-	return result, nil
-}
-
-// --- Global alias mapping table management ---
-
-// UpsertAlias adds or replaces an alias in the global table. Validates the
-// alias (non-empty name, at least one target, valid dispatch/billing mode).
-// Persists the full state to disk.
-func (s *Store) UpsertAlias(alias AliasMapping) error {
-	s.updateMu.Lock()
-	defer s.updateMu.Unlock()
-	// Build a temp config to validate the single alias.
-	existing := s.AliasesSnapshot()
-	// Replace or append.
-	found := false
-	for i, a := range existing {
-		if strings.EqualFold(a.Alias, alias.Alias) {
-			existing[i] = alias
-			found = true
-			break
-		}
-	}
-	if !found {
-		existing = append(existing, alias)
-	}
-	tmp := Config{Enabled: true, StateFile: s.StatePath(), Aliases: existing}
-	if err := normalizeConfig(&tmp); err != nil {
-		return err
-	}
-	s.mu.Lock()
-	s.updateAliasesLocked(tmp.Aliases)
-	// Re-resolve all keys' Models from the updated alias table.
-	s.resolveAllModelsLocked()
-	keys := s.keysSnapshotLocked()
-	usage := s.usageSnapshotLocked()
-	path := s.statePath
-	s.mu.Unlock()
-	return s.saveState(path, keys, usage, s.AliasesSnapshot(), s.ClassifyRulesSnapshot())
-}
-
-// DeleteAlias removes an alias from the global table. Returns an error if any
-// key still references it (must remove references first).
-func (s *Store) DeleteAlias(aliasName string) error {
-	s.updateMu.Lock()
-	defer s.updateMu.Unlock()
-	aliasName = strings.TrimSpace(aliasName)
-	if aliasName == "" {
-		return errors.New("alias name is required")
-	}
-	// Check for key references.
-	s.mu.RLock()
-	refCount := 0
-	for _, key := range s.keys {
-		for _, ref := range key.Aliases {
-			if strings.EqualFold(ref.Alias, aliasName) {
-				refCount++
-			}
-		}
-	}
-	s.mu.RUnlock()
-	if refCount > 0 {
-		return errors.New("alias is referenced by " + itoa(refCount) + " key(s); remove references first")
-	}
-	existing := s.AliasesSnapshot()
-	filtered := existing[:0]
-	for _, a := range existing {
-		if !strings.EqualFold(a.Alias, aliasName) {
-			filtered = append(filtered, a)
-		}
-	}
-	s.mu.Lock()
-	s.updateAliasesLocked(filtered)
-	keys := s.keysSnapshotLocked()
-	usage := s.usageSnapshotLocked()
-	path := s.statePath
-	s.mu.Unlock()
-	return s.saveState(path, keys, usage, s.AliasesSnapshot(), s.ClassifyRulesSnapshot())
-}
-
-// --- Batch price import (Models.dev-style matches) ---
-
-// PriceImportMatch is one row from a Models.dev-style models.json export.
-// Units are already USD per million tokens (same as AliasMapping). cache_write
-// is accepted for wire compatibility but intentionally ignored.
-// Pointer price fields: nil means "field absent — keep existing value on apply".
-// A present 0 is a deliberate zero (unlike a missing key).
-type PriceImportMatch struct {
-	Model                string   `json:"model"`
-	PromptPricePer1M     *float64 `json:"prompt_price_per_1m"`
-	CompletionPricePer1M *float64 `json:"completion_price_per_1m"`
-	CacheReadPricePer1M  *float64 `json:"cache_read_price_per_1m"`
-	CacheWritePricePer1M *float64 `json:"cache_write_price_per_1m"`
-}
-
-// PriceImportApplied is one alias whose token prices were (or would be) updated.
-type PriceImportApplied struct {
-	Alias                    string  `json:"alias"`
-	OldInputPricePerMillion  float64 `json:"old_input_price_per_million"`
-	OldOutputPricePerMillion float64 `json:"old_output_price_per_million"`
-	OldCacheReadPerMillion   float64 `json:"old_cache_read_price_per_million"`
-	NewInputPricePerMillion  float64 `json:"new_input_price_per_million"`
-	NewOutputPricePerMillion float64 `json:"new_output_price_per_million"`
-	NewCacheReadPerMillion   float64 `json:"new_cache_read_price_per_million"`
-	// Note carries non-fatal context, e.g. per_call billing leaves token prices dormant.
-	Note string `json:"note,omitempty"`
-}
-
-// PriceImportUnchanged is an alias that matched but already had the same prices.
-type PriceImportUnchanged struct {
-	Alias string `json:"alias"`
-}
-
-// PriceImportSkipped is a match or alias that could not be applied.
-type PriceImportSkipped struct {
-	// Model is the import match model name when the skip is match-centric.
-	Model string `json:"model,omitempty"`
-	// Alias is set when a known alias was considered but rejected (e.g. conflict).
-	Alias  string `json:"alias,omitempty"`
-	Reason string `json:"reason"`
-}
-
-// PriceImportResult is the full response of ImportAliasPrices.
-type PriceImportResult struct {
-	Applied      []PriceImportApplied   `json:"applied"`
-	Unchanged    []PriceImportUnchanged `json:"unchanged"`
-	Skipped      []PriceImportSkipped   `json:"skipped"`
-	AffectedKeys []string               `json:"affected_keys"`
-}
-
-// importPricePatch is a sparse token-price update: nil field = leave unchanged.
-type importPricePatch struct {
-	in, out, cache *float64
-}
-
-func (p importPricePatch) empty() bool {
-	return p.in == nil && p.out == nil && p.cache == nil
-}
-
-func importPatchesEqual(a, b importPricePatch) bool {
-	return ptrFloatEqual(a.in, b.in) && ptrFloatEqual(a.out, b.out) && ptrFloatEqual(a.cache, b.cache)
-}
-
-func ptrFloatEqual(a, b *float64) bool {
-	if a == nil && b == nil {
-		return true
-	}
-	if a == nil || b == nil {
-		return false
-	}
-	return *a == *b
-}
-
-// importPriceTriple is the fully resolved three token prices after merge.
-type importPriceTriple struct {
-	in, out, cache float64
-}
-
-func importPricesEqual(a, b importPriceTriple) bool {
-	return a.in == b.in && a.out == b.out && a.cache == b.cache
-}
-
-func mergeImportPatch(old importPriceTriple, p importPricePatch) importPriceTriple {
-	r := old
-	if p.in != nil {
-		r.in = *p.in
-	}
-	if p.out != nil {
-		r.out = *p.out
-	}
-	if p.cache != nil {
-		r.cache = *p.cache
-	}
-	return r
-}
-
-func matchToPatch(m PriceImportMatch) importPricePatch {
-	// cache_write intentionally ignored.
-	return importPricePatch{
-		in:    m.PromptPricePer1M,
-		out:   m.CompletionPricePer1M,
-		cache: m.CacheReadPricePer1M,
-	}
-}
-
-// ImportAliasPrices batch-updates token prices on existing global aliases from
-// Models.dev-style matches. Matching: target_model exact (case-insensitive)
-// first; if no target hits, alias name fallback. Multi-target aliases that hit
-// different prices are skipped with target_price_conflict. cache_write is
-// ignored. Only existing aliases are updated — nothing is created.
-// Omitted price fields in a match keep the alias's current value (not zeroed).
-//
-// dry_run=true computes the same classification without mutating or persisting.
-// dry_run=false applies all updates under one lock, one resolveAllModelsLocked,
-// and one saveState (never loops UpsertAlias).
-func (s *Store) ImportAliasPrices(matches []PriceImportMatch, dryRun bool) (PriceImportResult, error) {
-	result := PriceImportResult{
-		Applied:      []PriceImportApplied{},
-		Unchanged:    []PriceImportUnchanged{},
-		Skipped:      []PriceImportSkipped{},
-		AffectedKeys: []string{},
-	}
-	// Index matches by lower(model). Last wins on duplicate model names.
-	byModel := make(map[string]importPricePatch, len(matches))
-	matchOrder := make([]string, 0, len(matches))
-	seenModel := make(map[string]struct{}, len(matches))
-	for _, m := range matches {
-		name := strings.TrimSpace(m.Model)
-		if name == "" {
-			continue
-		}
-		p := matchToPatch(m)
-		if p.empty() {
-			continue
-		}
-		lk := strings.ToLower(name)
-		byModel[lk] = p
-		if _, ok := seenModel[lk]; !ok {
-			seenModel[lk] = struct{}{}
-			matchOrder = append(matchOrder, lk)
-		}
-	}
-
-	s.updateMu.Lock()
-	defer s.updateMu.Unlock()
-
-	s.mu.Lock()
-	aliases := s.aliasesSnapshotLocked()
-	refIdx := s.aliasRefIndexLocked()
-
-	// Track which match models hit at least one alias (for no_match reporting).
-	matchedModels := make(map[string]struct{})
-	// pending updates: alias lower name → new prices + applied record
-	type pendingUpdate struct {
-		idx  int
-		newP importPriceTriple
-		rec  PriceImportApplied
-	}
-	var pending []pendingUpdate
-	affectedSet := make(map[string]struct{})
-
-	for i := range aliases {
-		a := &aliases[i]
-		// Collect patches hit via target_model.
-		var hitPatches []importPricePatch
-		var hitModels []string
-		for _, t := range a.Targets {
-			lk := strings.ToLower(strings.TrimSpace(t.TargetModel))
-			if p, ok := byModel[lk]; ok {
-				hitPatches = append(hitPatches, p)
-				hitModels = append(hitModels, lk)
-			}
-		}
-		var chosen *importPricePatch
-		if len(hitPatches) == 0 {
-			// Alias-name fallback.
-			if p, ok := byModel[strings.ToLower(a.Alias)]; ok {
-				cp := p
-				chosen = &cp
-				matchedModels[strings.ToLower(a.Alias)] = struct{}{}
-			}
-		} else {
-			// All hit targets must agree on one sparse patch.
-			first := hitPatches[0]
-			conflict := false
-			for _, p := range hitPatches[1:] {
-				if !importPatchesEqual(p, first) {
-					conflict = true
-					break
-				}
-			}
-			for _, m := range hitModels {
-				matchedModels[m] = struct{}{}
-			}
-			if conflict {
-				result.Skipped = append(result.Skipped, PriceImportSkipped{
-					Alias:  a.Alias,
-					Reason: "target_price_conflict",
-				})
-				continue
-			}
-			// If some targets missed while others hit, still apply the agreed
-			// price from the hits only when every target hit. Partial hit → skip.
-			if len(hitPatches) != len(a.Targets) {
-				result.Skipped = append(result.Skipped, PriceImportSkipped{
-					Alias:  a.Alias,
-					Reason: "partial_target_match",
-				})
-				continue
-			}
-			cp := first
-			chosen = &cp
-		}
-		if chosen == nil {
-			continue // alias not related to this import batch
-		}
-		old := importPriceTriple{a.InputPricePerMillion, a.OutputPricePerMillion, a.CacheReadPricePerMillion}
-		merged := mergeImportPatch(old, *chosen)
-		if importPricesEqual(old, merged) {
-			result.Unchanged = append(result.Unchanged, PriceImportUnchanged{Alias: a.Alias})
-			continue
-		}
-		rec := PriceImportApplied{
-			Alias:                    a.Alias,
-			OldInputPricePerMillion:  old.in,
-			OldOutputPricePerMillion: old.out,
-			OldCacheReadPerMillion:   old.cache,
-			NewInputPricePerMillion:  merged.in,
-			NewOutputPricePerMillion: merged.out,
-			NewCacheReadPerMillion:   merged.cache,
-		}
-		if strings.EqualFold(strings.TrimSpace(a.BillingMode), "per_call") {
-			rec.Note = "billing_mode is per_call; imported token prices are stored but not billed until mode switches to tokens"
-		}
-		pending = append(pending, pendingUpdate{idx: i, newP: merged, rec: rec})
-		for _, kid := range refIdx[strings.ToLower(a.Alias)] {
-			affectedSet[kid] = struct{}{}
-		}
-	}
-
-	// Matches that never hit any alias → no_match.
-	for _, m := range matchOrder {
-		if _, ok := matchedModels[m]; !ok {
-			result.Skipped = append(result.Skipped, PriceImportSkipped{
-				Model:  m,
-				Reason: "no_match",
-			})
-		}
-	}
-
-	for _, p := range pending {
-		result.Applied = append(result.Applied, p.rec)
-	}
-	for kid := range affectedSet {
-		result.AffectedKeys = append(result.AffectedKeys, kid)
-	}
-	sort.Strings(result.AffectedKeys)
-
-	if dryRun || len(pending) == 0 {
-		s.mu.Unlock()
-		return result, nil
-	}
-
-	// Apply all price updates in memory, re-resolve keys once, save once.
-	for _, p := range pending {
-		aliases[p.idx].InputPricePerMillion = p.newP.in
-		aliases[p.idx].OutputPricePerMillion = p.newP.out
-		aliases[p.idx].CacheReadPricePerMillion = p.newP.cache
-		// billing_mode intentionally untouched (including per_call).
-	}
-	s.updateAliasesLocked(aliases)
-	s.resolveAllModelsLocked()
-	keys := s.keysSnapshotLocked()
-	usage := s.usageSnapshotLocked()
-	path := s.statePath
-	rules := s.classifyRulesSnapshotLocked()
-	s.mu.Unlock()
-	if err := s.saveState(path, keys, usage, s.AliasesSnapshot(), rules); err != nil {
-		return result, err
-	}
-	return result, nil
-}
-
-// --- Classification rule management ---
-
-// UpsertClassifyRule adds or replaces a classification rule. Validates the
-// regex pattern. Persists the full state to disk.
-func (s *Store) UpsertClassifyRule(rule ClassifyRule) error {
-	s.updateMu.Lock()
-	defer s.updateMu.Unlock()
-	existing := s.ClassifyRulesSnapshot()
-	found := false
-	for i, r := range existing {
-		if strings.EqualFold(r.Name, rule.Name) {
-			existing[i] = rule
-			found = true
-			break
-		}
-	}
-	if !found {
-		existing = append(existing, rule)
-	}
-	tmp := Config{Enabled: true, StateFile: s.StatePath(), ClassifyRules: existing}
-	if err := normalizeConfig(&tmp); err != nil {
-		return err
-	}
-	s.mu.Lock()
-	s.classifyRules = tmp.ClassifyRules
-	onChanged := s.onClassifyRulesChanged
-	keys := s.keysSnapshotLocked()
-	usage := s.usageSnapshotLocked()
-	aliases := s.aliasesSnapshotLocked()
-	rules := s.classifyRulesSnapshotLocked()
-	path := s.statePath
-	s.mu.Unlock()
-	callClassifyRulesChanged(onChanged)
-	return s.saveState(path, keys, usage, aliases, rules)
-}
-
-// DeleteClassifyRule removes a classification rule by name.
-func (s *Store) DeleteClassifyRule(name string) error {
-	s.updateMu.Lock()
-	defer s.updateMu.Unlock()
-	name = strings.TrimSpace(name)
-	if name == "" {
-		return errors.New("rule name is required")
-	}
-	existing := s.ClassifyRulesSnapshot()
-	filtered := existing[:0]
-	for _, r := range existing {
-		if !strings.EqualFold(r.Name, name) {
-			filtered = append(filtered, r)
-		}
-	}
-	s.mu.Lock()
-	s.classifyRules = filtered
-	onChanged := s.onClassifyRulesChanged
-	keys := s.keysSnapshotLocked()
-	usage := s.usageSnapshotLocked()
-	aliases := s.aliasesSnapshotLocked()
-	rules := s.classifyRulesSnapshotLocked()
-	path := s.statePath
-	s.mu.Unlock()
-	callClassifyRulesChanged(onChanged)
-	return s.saveState(path, keys, usage, aliases, rules)
-}
-
-// ReorderClassifyRules reorders the classification rules to match the given
-// name order. Rules not in the list keep their relative order at the end.
-func (s *Store) ReorderClassifyRules(names []string) error {
-	s.updateMu.Lock()
-	defer s.updateMu.Unlock()
-	existing := s.ClassifyRulesSnapshot()
-	byName := make(map[string]ClassifyRule)
-	for _, r := range existing {
-		byName[strings.ToLower(r.Name)] = r
-	}
-	var reordered []ClassifyRule
-	used := make(map[string]bool)
-	for _, name := range names {
-		if r, ok := byName[strings.ToLower(name)]; ok {
-			reordered = append(reordered, r)
-			used[strings.ToLower(name)] = true
-		}
-	}
-	for _, r := range existing {
-		if !used[strings.ToLower(r.Name)] {
-			reordered = append(reordered, r)
-		}
-	}
-	s.mu.Lock()
-	s.classifyRules = reordered
-	onChanged := s.onClassifyRulesChanged
-	keys := s.keysSnapshotLocked()
-	usage := s.usageSnapshotLocked()
-	aliases := s.aliasesSnapshotLocked()
-	rules := s.classifyRulesSnapshotLocked()
-	path := s.statePath
-	s.mu.Unlock()
-	callClassifyRulesChanged(onChanged)
-	return s.saveState(path, keys, usage, aliases, rules)
-}
-
-// resolveAllModelsLocked re-populates every key's Models from its Aliases
-// refs + the global alias table. Caller must hold s.mu.
-func (s *Store) resolveAllModelsLocked() {
-	for _, key := range s.keys {
-		if len(key.Aliases) > 0 {
-			key.Models = resolveAliasRefsToModels(key.Aliases, s.aliases)
-		}
-	}
-}
-
-// itoa is a minimal int→string to avoid importing strconv in this file.
-func itoa(n int) string {
-	if n == 0 {
-		return "0"
-	}
-	neg := n < 0
-	if neg {
-		n = -n
-	}
-	var buf [20]byte
-	i := len(buf)
-	for n > 0 {
-		i--
-		buf[i] = byte('0' + n%10)
-		n /= 10
-	}
-	if neg {
-		i--
-		buf[i] = '-'
-	}
-	return string(buf[i:])
-}
-
-// SetOnClassifyRulesChanged registers a callback fired when classify rules
-// change, so the plugin can clear its classify cache.
-func (s *Store) SetOnClassifyRulesChanged(fn func()) {
-	s.mu.Lock()
-	s.onClassifyRulesChanged = fn
-	s.mu.Unlock()
-}
-
-// callClassifyRulesChanged invokes a callback captured while holding s.mu.
-// It must be called after releasing s.mu because callbacks may re-enter Store.
-func callClassifyRulesChanged(fn func()) {
-	if fn != nil {
-		fn()
-	}
-}
-
 // usageSnapshotLocked returns a deep copy of the usage ledger. Caller must
-// hold s.mu (write or read) — the ledger has its own mutex but we snapshot
-// keys + usage together under s.mu so SaveState writes a consistent pair.
+// hold s.mu (write or read) so Configure snapshots the selected state and its
+// migrated usage before publishing the rebuilt store.
 func (s *Store) usageSnapshotLocked() map[string]*UsageState {
 	if s.usage == nil {
 		return nil
@@ -1712,36 +486,38 @@ func (s *Store) usageSnapshotLocked() map[string]*UsageState {
 	return s.usage.snapshot()
 }
 
-// FlushUsage persists the current usage ledger to the state file alongside the
-// current key list. Called by the background flusher and at lifecycle points
-// (reconfigure / shutdown).
+// FlushUsage persists only a dirty usage snapshot. The revision handshake
+// prevents a record that arrives during the write from being marked clean.
 func (s *Store) FlushUsage() error {
 	s.persistMu.Lock()
 	defer s.persistMu.Unlock()
-	s.mu.Lock()
-	usage := s.usageSnapshotLocked()
+	s.mu.RLock()
+	ledger := s.usage
 	path := s.statePath
-	s.mu.Unlock()
-	if path == "" {
+	s.mu.RUnlock()
+	if path == "" || ledger == nil {
 		return nil
 	}
-	// Bug 3 fix: persist only the usage ledger, preserving the key list already
-	// on disk. Keys are mutated synchronously via SaveState in the management
-	// API (UpsertKey/DeleteKey/RotateKey), so the periodic flush must not
-	// overwrite them with an in-memory snapshot that could be stale or
-	// truncated.
-	return SaveUsageOnly(path, usage)
+	usage, revision, dirty := ledger.snapshotForFlush()
+	if !dirty {
+		return nil
+	}
+	if err := SaveUsage(policyPersist.UsagePath(path), usage); err != nil {
+		return err
+	}
+	ledger.markFlushed(revision)
+	return nil
 }
 
-func (s *Store) saveState(path string, keys []KeyConfig, usage map[string]*UsageState, aliases []AliasMapping, rules []ClassifyRule) error {
+func (s *Store) saveState(path string, keys []KeyConfig, aliases []AliasMapping, rules []ClassifyRule) error {
 	s.persistMu.Lock()
 	defer s.persistMu.Unlock()
-	return SaveState(path, keys, usage, aliases, rules)
+	return SaveState(path, keys, aliases, rules)
 }
 
 // StartUsageFlusher launches a goroutine that periodically persists the usage
-// ledger to the state file. Idempotent. Returns a stop function; the plugin
-// host should call it (or FlushUsage) at reconfigure/shutdown.
+// ledger to the independent usage file. Idempotent. Returns a stop function;
+// the plugin host should call it (or FlushUsage) at reconfigure/shutdown.
 func (s *Store) StartUsageFlusher() func() {
 	s.mu.Lock()
 	if s.flusher != nil {
@@ -1792,37 +568,4 @@ func (f *usageFlusher) loop() {
 			_ = f.store.FlushUsage()
 		}
 	}
-}
-
-func (s *Store) Status() map[string]any {
-	s.mu.RLock()
-	enabled := s.enabled
-	statePath := s.statePath
-	keys := s.keysSnapshotLocked()
-	limiter := s.limiter
-	usage := s.usage
-	s.mu.RUnlock()
-	rpmUsage := map[string]int{}
-	if limiter != nil {
-		rpmUsage = limiter.Snapshot()
-	}
-	out := map[string]any{
-		"enabled":    enabled,
-		"state_file": statePath,
-		"key_count":  len(keys),
-		"rpm_usage":  rpmUsage,
-		"usage":      usageSummaryForKeys(usage, keys),
-	}
-	return out
-}
-
-func usageSummaryForKeys(usage *usageLedger, keys []KeyConfig) map[string]UsageSummary {
-	if usage == nil {
-		return map[string]UsageSummary{}
-	}
-	out := make(map[string]UsageSummary, len(keys))
-	for _, key := range keys {
-		out[key.ID] = usage.Summary(key)
-	}
-	return out
 }

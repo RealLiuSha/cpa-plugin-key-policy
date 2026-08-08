@@ -17,7 +17,11 @@ vi.mock("../api/keys", () => ({
 }));
 
 const { translate } = vi.hoisted(() => ({
-  translate: (key: string) => key,
+  translate: (key: string, vars?: Record<string, string | number>) => {
+    if (key === "keys.lastUpdated") return `${key} ${vars?.time ?? "—"}`;
+    if (key === "usage.windowHelp") return `${key} ${vars?.timezone ?? ""}`;
+    return key;
+  },
 }));
 
 vi.mock("../i18n", () => ({
@@ -27,17 +31,23 @@ vi.mock("../i18n", () => ({
 import KeyList, {
   KEY_LIST_PAGE_SIZE,
   filterKeys,
+  formatResetCountdown,
   isAnyLimitHit,
   isLimitHit,
   paginateKeys,
+  sortKeys,
 } from "./KeyList";
 import { deleteKey, listKeys, resetRPM, resetUsage, rotateKey } from "../api/keys";
 
 const baseUsage = {
   daily_usd: 1,
   weekly_usd: 2,
+  monthly_usd: 3,
   daily_limit_usd: 10,
   weekly_limit_usd: 50,
+  monthly_limit_usd: 100,
+  daily_reset_at: "2099-08-09T00:00:00+08:00",
+  timezone: "Asia/Shanghai",
 };
 
 const key: KeyPublic = {
@@ -55,8 +65,12 @@ const key: KeyPublic = {
   usage: {
     daily_usd: 8,
     weekly_usd: 20,
+    monthly_usd: 30,
     daily_limit_usd: 10,
     weekly_limit_usd: 50,
+    monthly_limit_usd: 100,
+    daily_reset_at: "2099-08-09T00:00:00+08:00",
+    timezone: "Asia/Shanghai",
   },
 };
 
@@ -89,7 +103,7 @@ describe("isLimitHit / isAnyLimitHit", () => {
     expect(isLimitHit(9.99, 10)).toBe(false);
   });
 
-  it("any-hit is true when daily OR weekly is at limit", () => {
+  it("any-hit is true when daily, weekly, or monthly is at limit", () => {
     expect(isAnyLimitHit({
       daily_usd: 10, weekly_usd: 1, daily_limit_usd: 10, weekly_limit_usd: 50,
     })).toBe(true);
@@ -99,6 +113,23 @@ describe("isLimitHit / isAnyLimitHit", () => {
     expect(isAnyLimitHit({
       daily_usd: 1, weekly_usd: 2, daily_limit_usd: 10, weekly_limit_usd: 50,
     })).toBe(false);
+    expect(isAnyLimitHit({
+      daily_usd: 1, weekly_usd: 2, monthly_usd: 30,
+      daily_limit_usd: 10, weekly_limit_usd: 50, monthly_limit_usd: 30,
+    })).toBe(true);
+  });
+});
+
+describe("sortKeys / reset countdown", () => {
+  const a = makeKey("a", { updated_at: "2026-08-01T00:00:00Z", usage: { ...baseUsage, daily_usd: 2 } });
+  const b = makeKey("b", { updated_at: "2026-08-02T00:00:00Z", usage: { ...baseUsage, daily_usd: 8, daily_limit_usd: 10 } });
+  it("sorts after filtering by daily, ratio, and activity", () => {
+    expect(sortKeys([a, b], "daily").map((item) => item.id)).toEqual(["b", "a"]);
+    expect(sortKeys([a, b], "ratio").map((item) => item.id)).toEqual(["b", "a"]);
+    expect(sortKeys([a, b], "active").map((item) => item.id)).toEqual(["b", "a"]);
+  });
+  it("formats the next natural-day boundary countdown", () => {
+    expect(formatResetCountdown("2026-08-08T01:02:03Z", Date.parse("2026-08-08T00:00:00Z"))).toBe("01:02:03");
   });
 });
 
@@ -167,7 +198,7 @@ describe("KeyList table and more menu", () => {
       "keys.colStatus",
       "keys.colPreview",
       "keys.colRpm",
-      "keys.colUsage",
+      "keys.colUsage · Asia/Shanghai",
       "keys.colModels",
       "keys.colAliases",
       "keys.colActions",
@@ -182,6 +213,10 @@ describe("KeyList table and more menu", () => {
     expect(row!.textContent).toContain("60");
     expect(row!.textContent).toContain("gpt-4o");
     expect(row!.textContent).toContain("claude");
+    expect(row!.textContent).toContain("usage.last7Days");
+    expect(row!.textContent).toContain("usage.nextReset");
+    expect(table!.querySelectorAll("thead th")[4].getAttribute("title")).toBe("usage.windowHelp Asia/Shanghai");
+    expect(container.querySelector('[data-testid="last-updated-desktop"]')?.textContent).not.toContain("—");
   });
 
   it("marks daily and/or weekly usage red when either limit is hit", async () => {
@@ -234,6 +269,50 @@ describe("KeyList table and more menu", () => {
     expect(container.querySelector('[data-testid="keycard-ok-key"]')?.classList.contains("over")).toBe(false);
   });
 
+  it("visually distinguishes disabled, quota-blocked, and soft-warning states", async () => {
+    const disabled = makeKey("disabled", { enabled: false });
+    const limited = makeKey("limited", { usage: { ...baseUsage, daily_usd: 10, daily_limit_usd: 10 } });
+    const warning = makeKey("warning", { usage: { ...baseUsage, soft_limit_hit: true } });
+    (listKeys as ReturnType<typeof vi.fn>).mockResolvedValue([disabled, limited, warning]);
+    await renderList();
+    expect(container.querySelector('[data-testid="key-state-disabled-disabled"]')).not.toBeNull();
+    expect(container.querySelector('[data-testid="key-state-limited-limited"]')).not.toBeNull();
+    expect(container.querySelector('[data-testid="key-state-warning-warning"]')).not.toBeNull();
+    expect(container.querySelector('[data-testid="keycard-disabled"]')?.getAttribute("data-state")).toBe("disabled");
+    expect(container.querySelector('[data-testid="keycard-limited"]')?.getAttribute("data-state")).toBe("limited");
+    expect(container.querySelector('[data-testid="keycard-warning"]')?.getAttribute("data-state")).toBe("warning");
+    const { readFileSync } = await import("node:fs");
+    const { resolve } = await import("node:path");
+    const css = readFileSync(resolve(__dirname, "../styles.css"), "utf8");
+    expect(css).toMatch(/\.tag\.state-disabled\s*\{[^}]*color:\s*var\(--muted\)/s);
+    expect(css).toMatch(/\.tag\.state-limited\s*\{[^}]*color:\s*var\(--danger\)/s);
+    expect(css).toMatch(/\.tag\.state-warning,[\s\S]*?color:\s*#9a6700/s);
+    expect(css).toMatch(/\.keycard\.disabled \.kc-dot\s*\{[^}]*var\(--muted\)/s);
+    expect(css).toMatch(/\.keycard\.over \.kc-dot\s*\{[^}]*var\(--danger\)/s);
+  });
+
+  it("offers a mobile refresh and shows the successful refresh time", async () => {
+    await renderList();
+    const mobileRefresh = container.querySelector<HTMLButtonElement>(".key-list-mobile-refresh button");
+    expect(mobileRefresh).not.toBeNull();
+    expect(container.querySelector('[data-testid="last-updated-mobile"]')?.textContent).not.toContain("—");
+    await act(async () => {
+      mobileRefresh!.click();
+      await tick();
+    });
+    expect(listKeys).toHaveBeenCalledTimes(2);
+  });
+
+  it("shows rolling-window wording and countdown for an unlimited mobile key", async () => {
+    (listKeys as ReturnType<typeof vi.fn>).mockResolvedValue([makeKey("unlimited", {
+      usage: { ...baseUsage, daily_limit_usd: 0, weekly_limit_usd: 0, monthly_limit_usd: 0 },
+    })]);
+    await renderList();
+    const card = container.querySelector('[data-testid="keycard-unlimited"]');
+    expect(card?.textContent).toContain("usage.last7Days");
+    expect(card?.textContent).toContain("usage.nextReset");
+  });
+
   it("exposes edit and detail links with correct routes", async () => {
     await renderList();
 
@@ -262,6 +341,7 @@ describe("KeyList table and more menu", () => {
     expect(labels).toEqual([
       "keys.resetDaily",
       "keys.resetWeekly",
+      "keys.resetMonthly",
       "keys.resetRpm",
       "keys.resetKey",
       "keys.delete",
@@ -270,7 +350,7 @@ describe("KeyList table and more menu", () => {
     expect(deleteBtn?.classList.contains("danger")).toBe(true);
   });
 
-  it("dispatches daily, weekly, and RPM resets with correct confirm/API paths", async () => {
+  it("dispatches daily, weekly, monthly, and RPM resets with correct confirm/API paths", async () => {
     await renderList();
 
     await act(async () => {
@@ -288,12 +368,19 @@ describe("KeyList table and more menu", () => {
     expect(resetUsage).toHaveBeenCalledWith("team-a", "weekly");
 
     await act(async () => {
+      menuButton("keys.resetMonthly")?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      await tick();
+    });
+    expect(confirm).toHaveBeenCalledWith("keys.resetMonthlyConfirm");
+    expect(resetUsage).toHaveBeenCalledWith("team-a", "monthly");
+
+    await act(async () => {
       menuButton("keys.resetRpm")?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
       await tick();
     });
     expect(resetRPM).toHaveBeenCalledWith("team-a");
-    // RPM has no confirm; only daily + weekly confirmed above.
-    expect(confirm).toHaveBeenCalledTimes(2);
+    // RPM has no confirm; only usage-window resets confirmed above.
+    expect(confirm).toHaveBeenCalledTimes(3);
   });
 
   it("rotates with confirm, API call, and one-time plain key modal", async () => {

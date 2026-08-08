@@ -1,12 +1,9 @@
 package policy
 
 import (
-	"bytes"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
+	"log"
 	"regexp"
 	"strings"
 	"time"
@@ -15,9 +12,11 @@ import (
 )
 
 type Config struct {
-	Enabled   bool        `yaml:"enabled" json:"enabled"`
-	StateFile string      `yaml:"state_file" json:"state_file"`
-	Keys      []KeyConfig `yaml:"keys" json:"keys"`
+	Enabled       bool        `yaml:"enabled" json:"enabled"`
+	StateFile     string      `yaml:"state_file" json:"state_file"`
+	UsageTimezone string      `yaml:"usage_timezone,omitempty" json:"usage_timezone,omitempty"`
+	Keys          []KeyConfig `yaml:"keys" json:"keys"`
+	usageLocation *time.Location
 	// Aliases is the global alias mapping table. Each entry maps a downstream
 	// alias name to one or more (provider, model, group) targets with a shared
 	// pricing config. Keys reference aliases by name via KeyAliasRef.
@@ -52,9 +51,11 @@ type KeyConfig struct {
 	AllowModelsEndpoint bool    `yaml:"allow_models_endpoint,omitempty" json:"allow_models_endpoint,omitempty"`
 	DailyLimitUSD       float64 `yaml:"daily_limit_usd,omitempty" json:"daily_limit_usd,omitempty"`
 	// WeeklyLimitUSD caps the dollar usage over a rolling 7-day window. 0 = unlimited.
-	WeeklyLimitUSD float64   `yaml:"weekly_limit_usd,omitempty" json:"weekly_limit_usd,omitempty"`
-	CreatedAt      time.Time `yaml:"created_at,omitempty" json:"created_at,omitempty"`
-	UpdatedAt      time.Time `yaml:"updated_at,omitempty" json:"updated_at,omitempty"`
+	WeeklyLimitUSD  float64   `yaml:"weekly_limit_usd,omitempty" json:"weekly_limit_usd,omitempty"`
+	MonthlyLimitUSD float64   `yaml:"monthly_limit_usd,omitempty" json:"monthly_limit_usd,omitempty"`
+	LimitsChangedAt time.Time `yaml:"limits_changed_at,omitempty" json:"limits_changed_at,omitempty"`
+	CreatedAt       time.Time `yaml:"created_at,omitempty" json:"created_at,omitempty"`
+	UpdatedAt       time.Time `yaml:"updated_at,omitempty" json:"updated_at,omitempty"`
 }
 
 type ModelRule struct {
@@ -93,6 +94,9 @@ type ModelRule struct {
 	// increments for reporting). Negative is rejected by normalizeConfig. Only
 	// meaningful under "per_call"; ignored under "tokens".
 	PerCallUSD float64 `yaml:"per_call_usd,omitempty" json:"per_call_usd,omitempty"`
+	// AliasDailyLimitUSD is copied from the owning key's alias reference. All
+	// expanded targets for the same alias share this one accounting bucket.
+	AliasDailyLimitUSD float64 `yaml:"alias_daily_limit_usd,omitempty" json:"alias_daily_limit_usd,omitempty"`
 }
 
 // AliasMapping is one entry in the global alias mapping table. It maps a
@@ -156,6 +160,9 @@ func (r *ClassifyRule) Compiled() *regexp.Regexp {
 // page or import-prices). nil pointer fields mean "use the global default".
 type KeyAliasRef struct {
 	Alias string `yaml:"alias" json:"alias"`
+	// DailyLimitUSD caps this key's usage of the referenced alias for the
+	// current accounting day. Zero means unlimited.
+	DailyLimitUSD float64 `yaml:"daily_limit_usd,omitempty" json:"daily_limit_usd,omitempty"`
 	// Optional per-key price overrides (YAML-only; Web UI does not write these).
 	// nil = use global alias pricing.
 	InputPricePerMillion     *float64 `yaml:"input_price_per_million,omitempty" json:"input_price_per_million,omitempty"`
@@ -164,85 +171,28 @@ type KeyAliasRef struct {
 	PerCallUSD               *float64 `yaml:"per_call_usd,omitempty" json:"per_call_usd,omitempty"`
 }
 
-// UsageState holds per-key dollar usage accounting persisted in the state JSON.
-// It carries rolling daily/weekly windows plus a per-alias breakdown
-// (ByAlias). The per-alias breakdown tracks BOTH a daily and a weekly window
-// (see AliasUsageWindows) so the key detail page can show per-alias today /
-// rolling-week figures.
-//
-// Legacy state files stored ByAlias as map[string]UsageWindow (a single
-// window per alias). UsageState.UnmarshalJSON auto-migrates that shape into
-// the dual-window form (old value → Daily; Weekly zeroed).
+// UsageBucket is one accounting-day aggregate. Windows are read-side sums of
+// these buckets rather than persisted counters with independent reset times.
+type UsageBucket struct {
+	TotalUSD        float64 `json:"total_usd,omitempty"`
+	CallCount       int64   `json:"call_count,omitempty"`
+	CacheReadTokens int64   `json:"cache_read_tokens,omitempty"`
+	CacheCostUSD    float64 `json:"cache_cost_usd,omitempty"`
+	InputTokens     int64   `json:"input_tokens,omitempty"`
+	OutputTokens    int64   `json:"output_tokens,omitempty"`
+}
+
+// UsageState stores one key's accounting-day time series. Date keys use the
+// configured accounting location and the YYYY-MM-DD layout.
 type UsageState struct {
-	Daily   UsageWindow                  `json:"daily"`
-	Weekly  UsageWindow                  `json:"weekly"`
-	ByAlias map[string]AliasUsageWindows `json:"by_alias,omitempty"`
-}
-
-// AliasUsageWindows holds the daily and rolling-weekly usage windows for a
-// single alias under a key. Replaces the legacy single-window ByAlias map;
-// old state files are auto-migrated on load (see UsageState.UnmarshalJSON).
-type AliasUsageWindows struct {
-	Daily  UsageWindow `json:"daily"`
-	Weekly UsageWindow `json:"weekly"`
-}
-
-// UnmarshalJSON migrates the legacy ByAlias shape (map[string]UsageWindow,
-// a single window per alias) into the current dual-window form
-// (map[string]AliasUsageWindows). Detection is per-entry: an entry carrying a
-// "daily" or "weekly" key is read as the new form; otherwise it is read as a
-// bare UsageWindow and placed into Daily (Weekly zeroed). Unknown shapes are
-// skipped rather than failing the whole load.
-func (s *UsageState) UnmarshalJSON(raw []byte) error {
-	var p struct {
-		Daily   UsageWindow     `json:"daily"`
-		Weekly  UsageWindow     `json:"weekly"`
-		ByAlias json.RawMessage `json:"by_alias,omitempty"`
-	}
-	if err := json.Unmarshal(raw, &p); err != nil {
-		return err
-	}
-	s.Daily = p.Daily
-	s.Weekly = p.Weekly
-	s.ByAlias = make(map[string]AliasUsageWindows)
-	if len(p.ByAlias) == 0 || string(p.ByAlias) == "null" {
-		return nil
-	}
-	var entries map[string]json.RawMessage
-	if err := json.Unmarshal(p.ByAlias, &entries); err != nil {
-		return err
-	}
-	for alias, rawEntry := range entries {
-		if len(rawEntry) == 0 || string(rawEntry) == "null" {
-			continue
-		}
-		if hasJSONKey(rawEntry, "daily") || hasJSONKey(rawEntry, "weekly") {
-			var w AliasUsageWindows
-			if err := json.Unmarshal(rawEntry, &w); err == nil {
-				s.ByAlias[alias] = w
-			}
-			continue
-		}
-		// Legacy single-window format: migrate into Daily (weekly zeroed).
-		var w UsageWindow
-		if err := json.Unmarshal(rawEntry, &w); err == nil {
-			s.ByAlias[alias] = AliasUsageWindows{Daily: w}
-		}
-	}
-	return nil
-}
-
-// hasJSONKey reports whether a JSON object literal contains the given object
-// key. It is a cheap substring check on the quoted key form, sufficient for
-// migration-time shape detection (not a full parse).
-func hasJSONKey(raw json.RawMessage, key string) bool {
-	return bytes.Contains(raw, []byte(`"`+key+`"`))
+	Days    map[string]UsageBucket            `json:"days"`
+	ByAlias map[string]map[string]UsageBucket `json:"by_alias,omitempty"`
 }
 
 // UsageWindow tracks a dollar total bound to a window-start timestamp, plus
 // cache-specific counters for reporting (not used for limit enforcement).
 //
-// Cache fields are reported alongside the daily/weekly usage so the UI can show
+// Cache fields are reported alongside the aggregated usage so the UI can show
 // cache spend and hit-rate without re-deriving it. They accumulate only cache
 // HITS — cache-creation (write) tokens are intentionally excluded, since their
 // pricing and meaning differ across providers and they are not "reads".
@@ -277,20 +227,23 @@ type UsageWindow struct {
 type State struct {
 	Version   int                    `json:"version"`
 	Keys      []KeyConfig            `json:"keys"`
-	Usage     map[string]*UsageState `json:"usage,omitempty"`
+	Usage     map[string]*UsageState `json:"-"`
 	UpdatedAt time.Time              `json:"updated_at"`
 	// Aliases is the global alias mapping table, persisted so that key alias
 	// references survive restarts even when config.yaml is not re-read. On
 	// Configure, the config.yaml Aliases take precedence; state Aliases are a
 	// fallback for the state-only reload path (e.g. FlushUsage recovery).
-	Aliases       []AliasMapping `json:"aliases,omitempty"`
-	ClassifyRules []ClassifyRule `json:"classify_rules,omitempty"`
+	Aliases            []AliasMapping `json:"aliases,omitempty"`
+	ClassifyRules      []ClassifyRule `json:"classify_rules,omitempty"`
+	usageMigrated      bool
+	preMigrationTotals map[string]UsageMigrationTotals
 }
 
 func DefaultConfig() Config {
 	return Config{
-		Enabled:   true,
-		StateFile: "cpa-key-policy-state.json",
+		Enabled:       true,
+		StateFile:     "cpa-key-policy-state.json",
+		UsageTimezone: "Asia/Shanghai",
 	}
 }
 
@@ -429,6 +382,19 @@ func mergeAliasTarget(a *AliasMapping, target AliasTarget) {
 }
 
 func normalizeConfig(cfg *Config) error {
+	zone := strings.TrimSpace(cfg.UsageTimezone)
+	if zone == "" {
+		zone = DefaultConfig().UsageTimezone
+	}
+	location, err := time.LoadLocation(zone)
+	if err != nil {
+		log.Printf("cpa-key-policy: invalid usage_timezone %q; falling back to UTC: %v", zone, err)
+		zone = "UTC"
+		location = time.UTC
+	}
+	cfg.UsageTimezone = zone
+	cfg.usageLocation = location
+
 	// Auto-migrate: when a key has per-key Models but no Aliases, promote
 	// Models to the global alias table and convert the key to reference aliases.
 	// This runs on every normalizeConfig call (DecodeConfig, Configure, state
@@ -459,6 +425,9 @@ func normalizeConfig(cfg *Config) error {
 		}
 		if key.WeeklyLimitUSD < 0 {
 			return fmt.Errorf("key %q weekly_limit_usd cannot be negative", key.ID)
+		}
+		if key.MonthlyLimitUSD < 0 {
+			return fmt.Errorf("key %q monthly_limit_usd cannot be negative", key.ID)
 		}
 		for j := range key.Models {
 			model := &key.Models[j]
@@ -613,6 +582,9 @@ func normalizeConfig(cfg *Config) error {
 		key.Aliases = refs
 		for k := range key.Aliases {
 			ref := &key.Aliases[k]
+			if ref.DailyLimitUSD < 0 {
+				return fmt.Errorf("key %q alias %q daily_limit_usd cannot be negative", key.ID, ref.Alias)
+			}
 			if ref.InputPricePerMillion != nil && *ref.InputPricePerMillion < 0 {
 				return fmt.Errorf("key %q alias %q input_price override cannot be negative", key.ID, ref.Alias)
 			}
@@ -629,125 +601,4 @@ func normalizeConfig(cfg *Config) error {
 	}
 
 	return nil
-}
-
-func ResolveStatePath(path string) (string, error) {
-	path = strings.TrimSpace(path)
-	if path == "" {
-		path = DefaultConfig().StateFile
-	}
-	if filepath.IsAbs(path) {
-		return filepath.Clean(path), nil
-	}
-	abs, err := filepath.Abs(path)
-	if err != nil {
-		return "", err
-	}
-	return abs, nil
-}
-
-func LoadState(path string) (*State, error) {
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	var state State
-	if err := json.Unmarshal(raw, &state); err != nil {
-		return nil, err
-	}
-	if state.Version == 0 {
-		state.Version = 1
-	}
-	if state.Usage == nil {
-		state.Usage = make(map[string]*UsageState)
-	}
-	return &state, nil
-}
-
-// SaveState atomically writes the key list plus usage ledger to the state file.
-func SaveState(path string, keys []KeyConfig, usage map[string]*UsageState, aliases []AliasMapping, rules []ClassifyRule) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return err
-	}
-	// Models is a DERIVED field (resolved from Aliases × global table via
-	// resolveAliasRefsToModels); the canonical source is Aliases. Persisting
-	// it would (a) make the on-disk state drift from the live in-memory copy
-	// when the global alias table is edited, and (b) re-trigger validation
-	// errors on reload — multi-target aliases expand to multiple ModelRules
-	// sharing one alias name, which legacy validation could not tolerate.
-	// Strip Models before marshalling; Configure repopulates it on load.
-	cleanKeys := make([]KeyConfig, len(keys))
-	for i := range keys {
-		cleanKeys[i] = keys[i]
-		cleanKeys[i].Models = nil
-	}
-	state := State{Version: 1, Keys: cleanKeys, Usage: usage, UpdatedAt: time.Now().UTC(), Aliases: aliases, ClassifyRules: rules}
-	raw, err := json.MarshalIndent(state, "", "  ")
-	if err != nil {
-		return err
-	}
-	return atomicWriteStateFile(path, raw)
-}
-
-// SaveUsageOnly atomically writes only the usage ledger to the state file,
-// preserving the key list already on disk. The key list is authoritative on
-// disk (management API mutates keys + SaveState synchronously), so the
-// periodic usage flush must not overwrite it with a stale in-memory snapshot
-// (Bug 3: FlushUsage rewriting the whole key list could pin a truncated key
-// set to disk if memory was briefly wrong). It loads the current on-disk
-// state, replaces only Usage, and writes back atomically. If the state file
-// does not exist yet, keys defaults to empty (a subsequent key mutation will
-// create it properly via SaveState).
-func SaveUsageOnly(path string, usage map[string]*UsageState) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return err
-	}
-	var keys []KeyConfig
-	var aliases []AliasMapping
-	var rules []ClassifyRule
-	if cur, err := LoadState(path); err == nil {
-		keys = cur.Keys
-		aliases = cur.Aliases
-		rules = cur.ClassifyRules
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-	// Strip the derived Models field from every key (see SaveState for why).
-	// On-disk Models may contain pre-fix duplicates from multi-target aliases;
-	// repersisting them would re-trigger the bug on the next reload.
-	for i := range keys {
-		keys[i].Models = nil
-	}
-	state := State{Version: 1, Keys: keys, Usage: usage, UpdatedAt: time.Now().UTC(), Aliases: aliases, ClassifyRules: rules}
-	raw, err := json.MarshalIndent(state, "", "  ")
-	if err != nil {
-		return err
-	}
-	return atomicWriteStateFile(path, raw)
-}
-
-func atomicWriteStateFile(path string, raw []byte) error {
-	dir := filepath.Dir(path)
-	temp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
-	if err != nil {
-		return err
-	}
-	tempName := temp.Name()
-	defer func() { _ = os.Remove(tempName) }()
-	if err := temp.Chmod(0o600); err != nil {
-		_ = temp.Close()
-		return err
-	}
-	if _, err := temp.Write(raw); err != nil {
-		_ = temp.Close()
-		return err
-	}
-	if err := temp.Sync(); err != nil {
-		_ = temp.Close()
-		return err
-	}
-	if err := temp.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tempName, path)
 }

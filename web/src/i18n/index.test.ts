@@ -64,6 +64,27 @@ describe("translate", () => {
     expect(translate("keys.resetKey")).toBe("Сбросить ключ");
   });
 
+  it("provides usage-accounting and audit copy in all four locales", () => {
+    for (const locale of ["zh-CN", "zh-TW", "en", "ru"] as const) {
+      _resetLocale(locale);
+      for (const key of [
+        "usage.last7Days",
+        "usage.nextReset",
+        "usage.windowHelp",
+        "keyForm.monthlyLimitLabel",
+        "keyForm.limitBelowUsageConfirm",
+        "keyForm.aliasDailyLimitsLabel",
+        "keys.resetMonthlyConfirm",
+        "keyUsage.tabMonthly",
+        "keyUsage.historyTitle",
+        "audit.title",
+        "audit.actorHint",
+      ]) {
+        expect(translate(key)).not.toBe(key);
+      }
+    }
+  });
+
   it("falls back to zh-CN base for a key missing in the requested locale", () => {
     // Strip a key from en's bundle to simulate a not-yet-translated entry.
     // Translate key that exists in zh-CN base; we craft a guaranteed-present
