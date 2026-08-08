@@ -218,7 +218,7 @@
     "filterUnpriced": "Unpriced",
     "filterOrphan": "Unused",
     "filterEmpty": "No aliases match this filter",
-    "passThroughFold": "Pass-through entries ({{n}}) — collapsed by default",
+    "passThroughFold": "Pass-through entries ({{n}})",
     "importPrices": "Import prices",
     "importTitle": "Import prices",
     "importHint": "Paste a Models.dev-style models.json (with matches array) or pick a file. Preview first, then apply. Existing aliases only; cache_write is ignored.",

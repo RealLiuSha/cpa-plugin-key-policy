@@ -385,17 +385,10 @@ describe("Alias list badges / delete / pass-through fold / import UI", () => {
     expect(multiCard).not.toBeNull();
     expect(multiCard?.querySelector('[data-testid="delete-fast"]')?.hasAttribute("disabled")).toBe(true);
 
-    // pass-through section collapsed by default
+    // pass-through section expanded by default
     const toggle = container.querySelector('[data-testid="passthrough-toggle"]');
     expect(toggle).not.toBeNull();
-    expect(container.querySelector('[data-testid="alias-card-gpt-4o"]')).toBeNull();
-    expect(container.querySelector('[data-testid="alias-card-unused-model"]')).toBeNull();
-
-    await act(async () => {
-      (toggle as HTMLButtonElement).click();
-    });
-    await flush();
-
+    expect(toggle?.getAttribute("aria-expanded")).toBe("true");
     const priced = container.querySelector('[data-testid="alias-card-gpt-4o"]');
     const orphan = container.querySelector('[data-testid="alias-card-unused-model"]');
     expect(priced).not.toBeNull();
@@ -404,6 +397,14 @@ describe("Alias list badges / delete / pass-through fold / import UI", () => {
     expect(orphan?.querySelector('[data-testid="badge-orphan"]')).not.toBeNull();
     expect(orphan?.querySelector('[data-testid="delete-unused-model"]')?.hasAttribute("disabled")).toBe(false);
     expect(priced?.querySelector('[data-testid="delete-gpt-4o"]')?.hasAttribute("disabled")).toBe(true);
+
+    // Toggle collapses pass-through entries.
+    await act(async () => {
+      (toggle as HTMLButtonElement).click();
+    });
+    await flush();
+    expect(toggle?.getAttribute("aria-expanded")).toBe("false");
+    expect(container.querySelector('[data-testid="alias-card-gpt-4o"]')).toBeNull();
   });
 
   it("import flow calls dry_run then apply with matches body", async () => {

@@ -77,7 +77,8 @@ function AliasListTab() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [filter, setFilter] = useState<"all" | "unpriced" | "orphan">("all");
-  const [passThroughOpen, setPassThroughOpen] = useState(false);
+  // Pass-through 1:1 aliases default expanded so the list is immediately scannable.
+  const [passThroughOpen, setPassThroughOpen] = useState(true);
   const [importOpen, setImportOpen] = useState(false);
 
   const load = useCallback(async () => {
