@@ -46,7 +46,7 @@ func TestAppendFailureIsReturned(t *testing.T) {
 	if err := os.Mkdir(path, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := New(path, 1024, 1).Append(Event{Action: "create_key"}); err == nil {
+	if err := New(path, 1<<62, 1).Append(Event{Action: "create_key"}); err == nil {
 		t.Fatal("append to directory unexpectedly succeeded")
 	}
 }
