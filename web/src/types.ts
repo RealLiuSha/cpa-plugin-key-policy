@@ -152,6 +152,7 @@ export interface AliasTarget {
 }
 
 // AliasMapping is one entry in the global alias mapping table.
+// Global aliases are the single price / billing_mode authority for the Web UI.
 export interface AliasMapping {
   alias: string;
   targets: AliasTarget[];
@@ -161,6 +162,9 @@ export interface AliasMapping {
   output_price_per_million?: number;
   cache_read_price_per_million?: number;
   per_call_usd?: number;
+  // Runtime-only fields from GET /aliases (not persisted).
+  ref_count?: number;
+  ref_keys?: string[];
 }
 
 // ClassifyRule is a user-defined credential classification rule.
@@ -172,14 +176,65 @@ export interface ClassifyRule {
   enabled: boolean;
 }
 
-// KeyAliasRef is a key's reference to a global alias, with optional per-key
-// price overrides (null = use global default).
+// KeyAliasRef is a key's reference to a global alias.
+// Optional price override fields are YAML-only / hand-edit escape hatches:
+// resolve still honours them server-side, but the Web UI never writes them.
+// Prefer editing prices on the global alias (mapping page / import-prices).
+// null/undefined = use global default.
 export interface KeyAliasRef {
   alias: string;
+  /** YAML-only override; Web UI does not write. */
   input_price_per_million?: number | null;
+  /** YAML-only override; Web UI does not write. */
   output_price_per_million?: number | null;
+  /** YAML-only override; Web UI does not write. */
   cache_read_price_per_million?: number | null;
+  /** YAML-only override; Web UI does not write. */
   per_call_usd?: number | null;
+}
+
+// --- Price import (POST /aliases/import-prices) ---
+
+export interface PriceImportMatch {
+  model: string;
+  // Optional: omitted fields are not written (server keeps existing values).
+  prompt_price_per_1m?: number;
+  completion_price_per_1m?: number;
+  cache_read_price_per_1m?: number;
+  cache_write_price_per_1m?: number; // accepted/ignored by server
+}
+
+export interface PriceImportApplied {
+  alias: string;
+  old_input_price_per_million: number;
+  old_output_price_per_million: number;
+  old_cache_read_price_per_million: number;
+  new_input_price_per_million: number;
+  new_output_price_per_million: number;
+  new_cache_read_price_per_million: number;
+  note?: string;
+}
+
+export interface PriceImportUnchanged {
+  alias: string;
+}
+
+export interface PriceImportSkipped {
+  model?: string;
+  alias?: string;
+  reason: string;
+}
+
+export interface PriceImportResult {
+  applied: PriceImportApplied[];
+  unchanged: PriceImportUnchanged[];
+  skipped: PriceImportSkipped[];
+  affected_keys: string[];
+}
+
+export interface PriceImportRequest {
+  dry_run: boolean;
+  matches: PriceImportMatch[];
 }
 
 // CredentialDescriptor is a normalized credential description for classify preview.

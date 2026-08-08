@@ -492,6 +492,7 @@ func (a *App) managementRegistration() ManagementRegistrationResponse {
 			{Method: http.MethodGet, Path: base + "/aliases", Description: "List the global alias mapping table."},
 			{Method: http.MethodPost, Path: base + "/aliases", Description: "Create or update a global alias mapping."},
 			{Method: http.MethodDelete, Path: base + "/aliases", Description: "Delete a global alias mapping by name."},
+			{Method: http.MethodPost, Path: base + "/aliases/import-prices", Description: "Batch-import alias token prices (dry_run supported)."},
 			{Method: http.MethodGet, Path: base + "/classify-rules", Description: "List credential classification rules."},
 			{Method: http.MethodPost, Path: base + "/classify-rules", Description: "Create or update a classification rule."},
 			{Method: http.MethodDelete, Path: base + "/classify-rules", Description: "Delete a classification rule by name."},
@@ -542,11 +543,13 @@ func (a *App) handleManagement(raw []byte) ([]byte, error) {
 	case req.Method == http.MethodGet && path == base+"/status":
 		return OKEnvelope(jsonResponse(http.StatusOK, a.store.Status()))
 	case req.Method == http.MethodGet && path == base+"/aliases":
-		return OKEnvelope(jsonResponse(http.StatusOK, map[string]any{"aliases": a.store.AliasesSnapshot()}))
+		return OKEnvelope(jsonResponse(http.StatusOK, map[string]any{"aliases": a.store.AliasesSnapshotWithRefs()}))
 	case req.Method == http.MethodPost && path == base+"/aliases":
 		return OKEnvelope(a.upsertAlias(req.Body))
 	case req.Method == http.MethodDelete && path == base+"/aliases":
 		return OKEnvelope(a.deleteAlias(req.Body))
+	case req.Method == http.MethodPost && path == base+"/aliases/import-prices":
+		return OKEnvelope(a.importAliasPrices(req.Body))
 	case req.Method == http.MethodGet && path == base+"/classify-rules":
 		return OKEnvelope(jsonResponse(http.StatusOK, map[string]any{"rules": a.store.ClassifyRulesSnapshot()}))
 	case req.Method == http.MethodPost && path == base+"/classify-rules":

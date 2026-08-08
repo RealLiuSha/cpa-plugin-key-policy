@@ -147,11 +147,17 @@ func (r *ClassifyRule) Compiled() *regexp.Regexp {
 }
 
 // KeyAliasRef is a key's reference to a global alias. The key uses the alias's
-// targets and dispatch mode, but can optionally override pricing per-key.
-// nil pointer fields mean "use the global default".
+// targets, dispatch mode, and (by default) pricing from the global AliasMapping
+// table — the single price authority for the Web UI.
+//
+// The four *float64 override fields are YAML-only / hand-edit escape hatches:
+// resolveAliasRefsToModels still honours them when set, but the management Web
+// UI never writes them. Prefer editing prices on the global alias (mapping
+// page or import-prices). nil pointer fields mean "use the global default".
 type KeyAliasRef struct {
 	Alias string `yaml:"alias" json:"alias"`
-	// Optional per-key price overrides. nil = use global alias pricing.
+	// Optional per-key price overrides (YAML-only; Web UI does not write these).
+	// nil = use global alias pricing.
 	InputPricePerMillion     *float64 `yaml:"input_price_per_million,omitempty" json:"input_price_per_million,omitempty"`
 	OutputPricePerMillion    *float64 `yaml:"output_price_per_million,omitempty" json:"output_price_per_million,omitempty"`
 	CacheReadPricePerMillion *float64 `yaml:"cache_read_price_per_million,omitempty" json:"cache_read_price_per_million,omitempty"`

@@ -1,5 +1,12 @@
 import { apiClient, pluginPath } from "./client";
-import type { AliasMapping, ClassifyRule, CredentialDescriptor, ClassifyPreviewResponse } from "../types";
+import type {
+  AliasMapping,
+  ClassifyRule,
+  CredentialDescriptor,
+  ClassifyPreviewResponse,
+  PriceImportRequest,
+  PriceImportResult,
+} from "../types";
 import { readPlanType } from "./models";
 
 // --- Alias mapping CRUD ---
@@ -19,6 +26,14 @@ export async function upsertAlias(alias: AliasMapping): Promise<AliasMapping> {
 export async function deleteAlias(aliasName: string): Promise<void> {
   const c = apiClient();
   await c.delete(pluginPath("/aliases"), { data: { alias: aliasName } });
+}
+
+// Batch-import token prices onto existing aliases. dry_run previews without
+// persisting; false applies once for all matched aliases.
+export async function importAliasPrices(body: PriceImportRequest): Promise<PriceImportResult> {
+  const c = apiClient();
+  const { data } = await c.post<PriceImportResult>(pluginPath("/aliases/import-prices"), body);
+  return data;
 }
 
 // --- Classification rule CRUD ---

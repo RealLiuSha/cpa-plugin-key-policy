@@ -963,7 +963,28 @@ td.strong { font-weight: 600; color: var(--text); }
 }
 .map-tab:hover { color: var(--text); }
 .map-tab.active { color: var(--text); border-bottom-color: var(--accent); font-weight: 600; }
-.map-toolbar { display: flex; justify-content: flex-end; margin-bottom: 16px; }
+.map-toolbar { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 16px; flex-wrap: wrap; }
+.map-toolbar-left, .map-toolbar-right { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.map-filter-seg { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+.map-filter-btn { background: transparent; border: 0; padding: 6px 12px; cursor: pointer; color: var(--muted); font-size: 13px; }
+.map-filter-btn.active { background: var(--surface-2, rgba(127,127,127,0.12)); color: var(--text); font-weight: 600; }
+.alias-badges { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 6px; }
+.alias-badge { font-size: 11px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--border); }
+.alias-badge.unpriced { color: #b45309; border-color: #f59e0b; background: rgba(245, 158, 11, 0.12); }
+.alias-badge.orphan { color: var(--muted); }
+.alias-passthrough-section { margin-top: 16px; }
+.alias-passthrough-toggle { display: flex; align-items: center; gap: 8px; background: transparent; border: 0; color: var(--muted); cursor: pointer; font-size: 13px; padding: 8px 0; }
+.map-modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,0.45); display: flex; align-items: center; justify-content: center; z-index: 50; padding: 16px; }
+.map-modal { background: var(--card, var(--surface, #fff)); color: var(--text); border-radius: 12px; max-width: 720px; width: 100%; max-height: 90vh; overflow: auto; padding: 16px 18px; border: 1px solid var(--border); }
+.map-modal-head { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+.map-import-textarea { width: 100%; min-height: 140px; margin: 8px 0; padding: 8px; border-radius: 8px; border: 1px solid var(--border); background: var(--input-bg, transparent); color: var(--text); }
+.map-import-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 8px; }
+.map-import-table { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 8px; }
+.map-import-table th, .map-import-table td { border-bottom: 1px solid var(--border); padding: 6px 4px; text-align: left; }
+.map-import-skipped { margin: 8px 0 0; padding-left: 18px; font-size: 12px; color: var(--muted); }
+.model-chips-box .mc-chip-unpriced { border-color: #f59e0b; }
+.model-chips-box .mc-unpriced-link { margin-left: 6px; font-size: 11px; color: #b45309; text-decoration: underline; }
+.kf-unpriced-after-save { margin: 8px 0; padding: 8px 10px; border-radius: 8px; background: rgba(245, 158, 11, 0.12); border: 1px solid #f59e0b; font-size: 13px; }
 
 /* Alias cards grid */
 .alias-grid {

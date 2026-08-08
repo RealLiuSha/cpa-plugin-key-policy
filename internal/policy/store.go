@@ -917,6 +917,77 @@ func (s *Store) AliasesSnapshot() []AliasMapping {
 	return s.aliasesSnapshotLocked()
 }
 
+// AliasWithRefs is an AliasMapping enriched with runtime key-reference stats.
+// RefCount / RefKeys are never persisted; they are computed from the live key
+// table for GET /aliases and import-prices responses.
+// AliasMapping is embedded so new alias fields surface in the JSON response
+// without a second hand-written copy (anonymous embed flattens in encoding/json).
+type AliasWithRefs struct {
+	AliasMapping
+	RefCount int      `json:"ref_count"`
+	RefKeys  []string `json:"ref_keys"`
+}
+
+// aliasRefIndexLocked builds lower(alias) → key IDs that reference it.
+// Caller must hold s.mu (read or write).
+func (s *Store) aliasRefIndexLocked() map[string][]string {
+	idx := make(map[string][]string)
+	for _, key := range s.keys {
+		if key == nil {
+			continue
+		}
+		seen := make(map[string]struct{})
+		for _, ref := range key.Aliases {
+			al := strings.ToLower(strings.TrimSpace(ref.Alias))
+			if al == "" {
+				continue
+			}
+			if _, dup := seen[al]; dup {
+				continue
+			}
+			seen[al] = struct{}{}
+			idx[al] = append(idx[al], key.ID)
+		}
+	}
+	return idx
+}
+
+// AliasesSnapshotWithRefs returns the global alias table with per-alias
+// reference counts derived from the live key table. ref_keys is always a
+// non-nil slice (empty when unreferenced).
+func (s *Store) AliasesSnapshotWithRefs() []AliasWithRefs {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	aliases := s.aliasesSnapshotLocked()
+	refs := s.aliasRefIndexLocked()
+	out := make([]AliasWithRefs, 0, len(aliases))
+	for _, a := range aliases {
+		keys := refs[strings.ToLower(a.Alias)]
+		if keys == nil {
+			keys = []string{}
+		}
+		out = append(out, AliasWithRefs{
+			AliasMapping: a,
+			RefCount:     len(keys),
+			RefKeys:      keys,
+		})
+	}
+	return out
+}
+
+// AliasRefKeys returns the key IDs that reference the named alias (case-
+// insensitive). The returned slice is never nil.
+func (s *Store) AliasRefKeys(aliasName string) []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	refs := s.aliasRefIndexLocked()
+	keys := refs[strings.ToLower(strings.TrimSpace(aliasName))]
+	if keys == nil {
+		return []string{}
+	}
+	return append([]string(nil), keys...)
+}
+
 // classifyRulesSnapshotLocked returns a copy of the classify rules.
 // Caller must hold s.mu.
 func (s *Store) classifyRulesSnapshotLocked() []ClassifyRule {
@@ -1197,6 +1268,289 @@ func (s *Store) DeleteAlias(aliasName string) error {
 	path := s.statePath
 	s.mu.Unlock()
 	return s.saveState(path, keys, usage, s.AliasesSnapshot(), s.ClassifyRulesSnapshot())
+}
+
+// --- Batch price import (Models.dev-style matches) ---
+
+// PriceImportMatch is one row from a Models.dev-style models.json export.
+// Units are already USD per million tokens (same as AliasMapping). cache_write
+// is accepted for wire compatibility but intentionally ignored.
+// Pointer price fields: nil means "field absent — keep existing value on apply".
+// A present 0 is a deliberate zero (unlike a missing key).
+type PriceImportMatch struct {
+	Model                string   `json:"model"`
+	PromptPricePer1M     *float64 `json:"prompt_price_per_1m"`
+	CompletionPricePer1M *float64 `json:"completion_price_per_1m"`
+	CacheReadPricePer1M  *float64 `json:"cache_read_price_per_1m"`
+	CacheWritePricePer1M *float64 `json:"cache_write_price_per_1m"`
+}
+
+// PriceImportApplied is one alias whose token prices were (or would be) updated.
+type PriceImportApplied struct {
+	Alias                    string  `json:"alias"`
+	OldInputPricePerMillion  float64 `json:"old_input_price_per_million"`
+	OldOutputPricePerMillion float64 `json:"old_output_price_per_million"`
+	OldCacheReadPerMillion   float64 `json:"old_cache_read_price_per_million"`
+	NewInputPricePerMillion  float64 `json:"new_input_price_per_million"`
+	NewOutputPricePerMillion float64 `json:"new_output_price_per_million"`
+	NewCacheReadPerMillion   float64 `json:"new_cache_read_price_per_million"`
+	// Note carries non-fatal context, e.g. per_call billing leaves token prices dormant.
+	Note string `json:"note,omitempty"`
+}
+
+// PriceImportUnchanged is an alias that matched but already had the same prices.
+type PriceImportUnchanged struct {
+	Alias string `json:"alias"`
+}
+
+// PriceImportSkipped is a match or alias that could not be applied.
+type PriceImportSkipped struct {
+	// Model is the import match model name when the skip is match-centric.
+	Model string `json:"model,omitempty"`
+	// Alias is set when a known alias was considered but rejected (e.g. conflict).
+	Alias  string `json:"alias,omitempty"`
+	Reason string `json:"reason"`
+}
+
+// PriceImportResult is the full response of ImportAliasPrices.
+type PriceImportResult struct {
+	Applied      []PriceImportApplied   `json:"applied"`
+	Unchanged    []PriceImportUnchanged `json:"unchanged"`
+	Skipped      []PriceImportSkipped   `json:"skipped"`
+	AffectedKeys []string               `json:"affected_keys"`
+}
+
+// importPricePatch is a sparse token-price update: nil field = leave unchanged.
+type importPricePatch struct {
+	in, out, cache *float64
+}
+
+func (p importPricePatch) empty() bool {
+	return p.in == nil && p.out == nil && p.cache == nil
+}
+
+func importPatchesEqual(a, b importPricePatch) bool {
+	return ptrFloatEqual(a.in, b.in) && ptrFloatEqual(a.out, b.out) && ptrFloatEqual(a.cache, b.cache)
+}
+
+func ptrFloatEqual(a, b *float64) bool {
+	if a == nil && b == nil {
+		return true
+	}
+	if a == nil || b == nil {
+		return false
+	}
+	return *a == *b
+}
+
+// importPriceTriple is the fully resolved three token prices after merge.
+type importPriceTriple struct {
+	in, out, cache float64
+}
+
+func importPricesEqual(a, b importPriceTriple) bool {
+	return a.in == b.in && a.out == b.out && a.cache == b.cache
+}
+
+func mergeImportPatch(old importPriceTriple, p importPricePatch) importPriceTriple {
+	r := old
+	if p.in != nil {
+		r.in = *p.in
+	}
+	if p.out != nil {
+		r.out = *p.out
+	}
+	if p.cache != nil {
+		r.cache = *p.cache
+	}
+	return r
+}
+
+func matchToPatch(m PriceImportMatch) importPricePatch {
+	// cache_write intentionally ignored.
+	return importPricePatch{
+		in:    m.PromptPricePer1M,
+		out:   m.CompletionPricePer1M,
+		cache: m.CacheReadPricePer1M,
+	}
+}
+
+// ImportAliasPrices batch-updates token prices on existing global aliases from
+// Models.dev-style matches. Matching: target_model exact (case-insensitive)
+// first; if no target hits, alias name fallback. Multi-target aliases that hit
+// different prices are skipped with target_price_conflict. cache_write is
+// ignored. Only existing aliases are updated — nothing is created.
+// Omitted price fields in a match keep the alias's current value (not zeroed).
+//
+// dry_run=true computes the same classification without mutating or persisting.
+// dry_run=false applies all updates under one lock, one resolveAllModelsLocked,
+// and one saveState (never loops UpsertAlias).
+func (s *Store) ImportAliasPrices(matches []PriceImportMatch, dryRun bool) (PriceImportResult, error) {
+	result := PriceImportResult{
+		Applied:      []PriceImportApplied{},
+		Unchanged:    []PriceImportUnchanged{},
+		Skipped:      []PriceImportSkipped{},
+		AffectedKeys: []string{},
+	}
+	// Index matches by lower(model). Last wins on duplicate model names.
+	byModel := make(map[string]importPricePatch, len(matches))
+	matchOrder := make([]string, 0, len(matches))
+	seenModel := make(map[string]struct{}, len(matches))
+	for _, m := range matches {
+		name := strings.TrimSpace(m.Model)
+		if name == "" {
+			continue
+		}
+		p := matchToPatch(m)
+		if p.empty() {
+			continue
+		}
+		lk := strings.ToLower(name)
+		byModel[lk] = p
+		if _, ok := seenModel[lk]; !ok {
+			seenModel[lk] = struct{}{}
+			matchOrder = append(matchOrder, lk)
+		}
+	}
+
+	s.updateMu.Lock()
+	defer s.updateMu.Unlock()
+
+	s.mu.Lock()
+	aliases := s.aliasesSnapshotLocked()
+	refIdx := s.aliasRefIndexLocked()
+
+	// Track which match models hit at least one alias (for no_match reporting).
+	matchedModels := make(map[string]struct{})
+	// pending updates: alias lower name → new prices + applied record
+	type pendingUpdate struct {
+		idx  int
+		newP importPriceTriple
+		rec  PriceImportApplied
+	}
+	var pending []pendingUpdate
+	affectedSet := make(map[string]struct{})
+
+	for i := range aliases {
+		a := &aliases[i]
+		// Collect patches hit via target_model.
+		var hitPatches []importPricePatch
+		var hitModels []string
+		for _, t := range a.Targets {
+			lk := strings.ToLower(strings.TrimSpace(t.TargetModel))
+			if p, ok := byModel[lk]; ok {
+				hitPatches = append(hitPatches, p)
+				hitModels = append(hitModels, lk)
+			}
+		}
+		var chosen *importPricePatch
+		if len(hitPatches) == 0 {
+			// Alias-name fallback.
+			if p, ok := byModel[strings.ToLower(a.Alias)]; ok {
+				cp := p
+				chosen = &cp
+				matchedModels[strings.ToLower(a.Alias)] = struct{}{}
+			}
+		} else {
+			// All hit targets must agree on one sparse patch.
+			first := hitPatches[0]
+			conflict := false
+			for _, p := range hitPatches[1:] {
+				if !importPatchesEqual(p, first) {
+					conflict = true
+					break
+				}
+			}
+			for _, m := range hitModels {
+				matchedModels[m] = struct{}{}
+			}
+			if conflict {
+				result.Skipped = append(result.Skipped, PriceImportSkipped{
+					Alias:  a.Alias,
+					Reason: "target_price_conflict",
+				})
+				continue
+			}
+			// If some targets missed while others hit, still apply the agreed
+			// price from the hits only when every target hit. Partial hit → skip.
+			if len(hitPatches) != len(a.Targets) {
+				result.Skipped = append(result.Skipped, PriceImportSkipped{
+					Alias:  a.Alias,
+					Reason: "partial_target_match",
+				})
+				continue
+			}
+			cp := first
+			chosen = &cp
+		}
+		if chosen == nil {
+			continue // alias not related to this import batch
+		}
+		old := importPriceTriple{a.InputPricePerMillion, a.OutputPricePerMillion, a.CacheReadPricePerMillion}
+		merged := mergeImportPatch(old, *chosen)
+		if importPricesEqual(old, merged) {
+			result.Unchanged = append(result.Unchanged, PriceImportUnchanged{Alias: a.Alias})
+			continue
+		}
+		rec := PriceImportApplied{
+			Alias:                    a.Alias,
+			OldInputPricePerMillion:  old.in,
+			OldOutputPricePerMillion: old.out,
+			OldCacheReadPerMillion:   old.cache,
+			NewInputPricePerMillion:  merged.in,
+			NewOutputPricePerMillion: merged.out,
+			NewCacheReadPerMillion:   merged.cache,
+		}
+		if strings.EqualFold(strings.TrimSpace(a.BillingMode), "per_call") {
+			rec.Note = "billing_mode is per_call; imported token prices are stored but not billed until mode switches to tokens"
+		}
+		pending = append(pending, pendingUpdate{idx: i, newP: merged, rec: rec})
+		for _, kid := range refIdx[strings.ToLower(a.Alias)] {
+			affectedSet[kid] = struct{}{}
+		}
+	}
+
+	// Matches that never hit any alias → no_match.
+	for _, m := range matchOrder {
+		if _, ok := matchedModels[m]; !ok {
+			result.Skipped = append(result.Skipped, PriceImportSkipped{
+				Model:  m,
+				Reason: "no_match",
+			})
+		}
+	}
+
+	for _, p := range pending {
+		result.Applied = append(result.Applied, p.rec)
+	}
+	for kid := range affectedSet {
+		result.AffectedKeys = append(result.AffectedKeys, kid)
+	}
+	sort.Strings(result.AffectedKeys)
+
+	if dryRun || len(pending) == 0 {
+		s.mu.Unlock()
+		return result, nil
+	}
+
+	// Apply all price updates in memory, re-resolve keys once, save once.
+	for _, p := range pending {
+		aliases[p.idx].InputPricePerMillion = p.newP.in
+		aliases[p.idx].OutputPricePerMillion = p.newP.out
+		aliases[p.idx].CacheReadPricePerMillion = p.newP.cache
+		// billing_mode intentionally untouched (including per_call).
+	}
+	s.updateAliasesLocked(aliases)
+	s.resolveAllModelsLocked()
+	keys := s.keysSnapshotLocked()
+	usage := s.usageSnapshotLocked()
+	path := s.statePath
+	rules := s.classifyRulesSnapshotLocked()
+	s.mu.Unlock()
+	if err := s.saveState(path, keys, usage, s.AliasesSnapshot(), rules); err != nil {
+		return result, err
+	}
+	return result, nil
 }
 
 // --- Classification rule management ---
