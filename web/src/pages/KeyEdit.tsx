@@ -93,6 +93,7 @@ export default function KeyEdit() {
       <KeyForm
         initial={initial}
         idReadOnly
+        showCurrentUsage
         returnPath={`/keys/${encodeURIComponent(key.id)}/edit`}
         submitLabel={t("edit.save")}
         onCancel={() => navigate("/keys")}

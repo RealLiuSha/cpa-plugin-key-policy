@@ -80,15 +80,43 @@ export default function ModelPicker({ initial = [], onChange }: Props) {
     });
   };
 
+  const visibleKeys = useMemo(() => new Set(filtered.flatMap((group) =>
+    group.models.map((model) => targetKey(group.provider, group.group, model)),
+  )), [filtered]);
+  const canSelectVisible = [...visibleKeys].some((key) => !selected.has(key));
+  const canClearVisible = [...visibleKeys].some((key) => selected.has(key));
+
+  const selectVisible = () => {
+    setSelected((previous) => {
+      const next = new Set(previous);
+      for (const key of visibleKeys) next.add(key);
+      return next;
+    });
+  };
+
+  const clearVisible = () => {
+    setSelected((previous) => {
+      const next = new Set(previous);
+      for (const key of visibleKeys) next.delete(key);
+      return next;
+    });
+  };
+
   if (loading) return <div className="muted">{t("picker.loading")}</div>;
   if (error) return <div className="error">{error}</div>;
   if (groups.length === 0) return <div className="muted">{t("picker.empty")}</div>;
 
   return (
     <div>
-      <input className="input" placeholder={t("picker.searchPlaceholder")} value={query} onChange={(event) => setQuery(event.target.value)} />
-      <div className="muted">{t("picker.selectedTargets", { count: selected.size })}</div>
-      {filtered.map((group) => {
+      <input className="input" aria-label={t("picker.searchPlaceholder")} placeholder={t("picker.searchPlaceholder")} value={query} onChange={(event) => setQuery(event.target.value)} />
+      <div className="picker-toolbar">
+        <span className="muted">{t("picker.selectedTargets", { count: selected.size })}</span>
+        <div className="picker-actions">
+          <button type="button" className="btn sm" disabled={!canSelectVisible} onClick={selectVisible}>{t("picker.selectAll")}</button>
+          <button type="button" className="btn sm" disabled={!canClearVisible} onClick={clearVisible}>{t("picker.clearAll")}</button>
+        </div>
+      </div>
+      {filtered.length === 0 ? <div className="empty-state">{t("picker.noMatch")}</div> : filtered.map((group) => {
         const label = group.group ? formatTierLabel(t, group.group) : "";
         return (
           <div className="picker-group" key={`${group.provider}|${group.group ?? ""}`}>

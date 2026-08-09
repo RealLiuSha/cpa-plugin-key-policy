@@ -1,6 +1,7 @@
 import { act } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createRoot } from "react-dom/client";
+import { Simulate } from "react-dom/test-utils";
 import type { ModelTarget } from "../types";
 
 (globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -96,5 +97,36 @@ describe("ModelPicker v3 targets", () => {
       await tick();
     });
     expect(calls.at(-1)).toContainEqual(initial[0]);
+  });
+
+  it("shows an explicit no-match state and supports selecting visible targets", async () => {
+    vi.mocked(fetchCatalog).mockResolvedValue([
+      { provider: "codex", group: "team", model: "gpt-5" },
+      { provider: "xai", group: "plus", model: "grok" },
+    ]);
+    const initial: ModelTarget[] = [{ provider: "xai", group: "plus", target_model: "grok" }];
+    const calls: ModelTarget[][] = [];
+    await act(async () => {
+      root = createRoot(container);
+      root.render(<ModelPicker initial={initial} onChange={(targets) => calls.push(targets)} />);
+      await tick();
+      await tick();
+    });
+
+    const search = container.querySelector<HTMLInputElement>('input[placeholder="picker.searchPlaceholder"]')!;
+    await act(async () => Simulate.change(search, { target: { value: "codex" } } as never));
+    const selectAll = [...container.querySelectorAll<HTMLButtonElement>("button")].find((button) => button.textContent === "picker.selectAll")!;
+    await act(async () => { selectAll.click(); await tick(); });
+    expect(calls.at(-1)).toEqual([
+      { provider: "codex", group: "team", target_model: "gpt-5" },
+      { provider: "xai", group: "plus", target_model: "grok" },
+    ]);
+
+    const clearAll = [...container.querySelectorAll<HTMLButtonElement>("button")].find((button) => button.textContent === "picker.clearAll")!;
+    await act(async () => { clearAll.click(); await tick(); });
+    expect(calls.at(-1)).toEqual(initial);
+
+    await act(async () => Simulate.change(search, { target: { value: "missing" } } as never));
+    expect(container.textContent).toContain("picker.noMatch");
   });
 });
