@@ -46,7 +46,7 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
-describe("ModelPicker v3 targets", () => {
+describe("ModelPicker current targets", () => {
   it("does not clear preselected targets while the catalog is loading", async () => {
     let resolveCatalog: (value: { provider: string; model: string }[]) => void = () => {};
     vi.mocked(fetchCatalog).mockImplementation(() => new Promise((resolve) => { resolveCatalog = resolve; }));
@@ -88,7 +88,7 @@ describe("ModelPicker v3 targets", () => {
 
   it("preserves a selected target no longer returned by the catalog", async () => {
     vi.mocked(fetchCatalog).mockResolvedValue([{ provider: "codex", group: "team", model: "gpt-5" }]);
-    const initial: ModelTarget[] = [{ provider: "codex", target_model: "legacy-model" }];
+    const initial: ModelTarget[] = [{ provider: "codex", target_model: "unavailable-model" }];
     const calls: ModelTarget[][] = [];
     await act(async () => {
       root = createRoot(container);

@@ -21,8 +21,6 @@ const (
 	usageFileVersion = 3
 )
 
-var ErrMigrationRequired = errors.New("model schema migration required")
-
 type persistedState struct {
 	Version       int               `json:"version"`
 	DatasetID     string            `json:"dataset_id"`
@@ -81,11 +79,11 @@ func LoadState(path string) (*State, error) {
 	}
 	var disk persistedState
 	if err := decodeJSONStrict(raw, &disk); err != nil {
-		return nil, fmt.Errorf("decode state v3: %w", err)
+		return nil, fmt.Errorf("decode current state: %w", err)
 	}
 	cfg := Config{Enabled: true, Keys: disk.Keys, Models: disk.Models, ClassifyRules: disk.ClassifyRules}
 	if err := normalizeConfig(&cfg); err != nil {
-		return nil, fmt.Errorf("validate state v3: %w", err)
+		return nil, fmt.Errorf("validate current state: %w", err)
 	}
 	return &State{
 		Version:       disk.Version,
@@ -117,13 +115,13 @@ func LoadUsage(path string) (*UsageFile, error) {
 	}
 	var disk persistedUsage
 	if err := decodeJSONStrict(raw, &disk); err != nil {
-		return nil, fmt.Errorf("decode usage v3: %w", err)
+		return nil, fmt.Errorf("decode current usage: %w", err)
 	}
 	if disk.Usage == nil {
 		disk.Usage = make(map[string]*UsageState)
 	}
 	if err := ValidateUsageStates(disk.Usage); err != nil {
-		return nil, fmt.Errorf("validate usage v3: %w", err)
+		return nil, fmt.Errorf("validate current usage: %w", err)
 	}
 	return &UsageFile{
 		Version:   disk.Version,
@@ -134,10 +132,7 @@ func LoadUsage(path string) (*UsageFile, error) {
 }
 
 func schemaVersionError(kind string, version int) error {
-	if version <= 2 {
-		return fmt.Errorf("%w: %s version %d is not supported by v3; run migrate-model-schema first", ErrMigrationRequired, kind, version)
-	}
-	return fmt.Errorf("%s version %d is newer than supported version %d", kind, version, stateFileVersion)
+	return fmt.Errorf("unsupported %s version %d; require version %d", kind, version, stateFileVersion)
 }
 
 func decodeJSONStrict(raw []byte, target any) error {

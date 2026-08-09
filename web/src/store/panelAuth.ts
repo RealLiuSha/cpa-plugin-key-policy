@@ -83,12 +83,12 @@ export function obfuscateData(value: string): string {
 
 // Deobfuscation, identical to the panel's deobfuscateData().
 export function deobfuscateData(payload: string): string {
-  if (!payload || !payload.startsWith(ENC_PREFIX)) return payload;
+  if (!payload || !payload.startsWith(ENC_PREFIX)) throw new Error("unsupported auth storage encoding");
   try {
     const encrypted = fromBase64(payload.slice(ENC_PREFIX.length));
     return decodeText(xorBytes(encrypted, getKeyBytes()));
   } catch {
-    return payload;
+    throw new Error("invalid auth storage payload");
   }
 }
 
@@ -107,10 +107,8 @@ export function isEmbedded(): boolean {
 function extractAuth(parsed: unknown): PanelAuth | null {
   if (!parsed || typeof parsed !== "object") return null;
   const root = parsed as Record<string, unknown>;
-  // The persisted shape is { state, version }; fall back to the object itself
-  // in case the envelope is absent (older/different storage layouts).
-  const state =
-    (root.state as Record<string, unknown> | undefined) ?? (root as Record<string, unknown>);
+  if (root.version !== 0 || !root.state || typeof root.state !== "object") return null;
+  const state = root.state as Record<string, unknown>;
   const apiBase = typeof state.apiBase === "string" ? state.apiBase : "";
   const managementKey = typeof state.managementKey === "string" ? state.managementKey : "";
   if (!apiBase || !managementKey) return null;

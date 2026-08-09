@@ -91,4 +91,24 @@ describe("readPanelAuth", () => {
     localStorage.setItem(STORAGE_KEY, "not-valid-json-or-obfuscated");
     expect(readPanelAuth()).toBeNull();
   });
+
+  it("rejects plaintext and non-envelope storage shapes", () => {
+    setEmbedded(true);
+    const state = { apiBase: "http://h:1", managementKey: "secret-xyz" };
+
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ state, version: 0 }));
+    expect(readPanelAuth()).toBeNull();
+
+    localStorage.setItem(STORAGE_KEY, obfuscateData(JSON.stringify(state)));
+    expect(readPanelAuth()).toBeNull();
+  });
+
+  it("rejects an unsupported persist envelope version", () => {
+    setEmbedded(true);
+    localStorage.setItem(STORAGE_KEY, obfuscateData(JSON.stringify({
+      state: { apiBase: "http://h:1", managementKey: "secret-xyz" },
+      version: 1,
+    })));
+    expect(readPanelAuth()).toBeNull();
+  });
 });

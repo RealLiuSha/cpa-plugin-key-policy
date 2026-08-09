@@ -63,7 +63,7 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
-describe("KeyEdit v3 model return flow", () => {
+describe("KeyEdit current model return flow", () => {
   it("restores the key draft, auto-selects the created model and patches only references", async () => {
     const entry = {
       pathname: "/keys/team-a/edit",

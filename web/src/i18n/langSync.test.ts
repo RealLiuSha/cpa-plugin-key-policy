@@ -56,13 +56,16 @@ describe("parseStoredLanguage", () => {
     expect(_parseStoredLanguage(raw)).toBe("zh-TW");
   });
 
-  it("tolerates a legacy bare locale string", () => {
-    expect(_parseStoredLanguage("ru")).toBe("ru");
+  it("rejects non-envelope storage shapes", () => {
+    expect(_parseStoredLanguage("ru")).toBeNull();
+    expect(_parseStoredLanguage(JSON.stringify("ru"))).toBeNull();
+    expect(_parseStoredLanguage(JSON.stringify({ language: "ru", version: 0 }))).toBeNull();
   });
 
   it("returns null for unsupported codes", () => {
     expect(_parseStoredLanguage("ja")).toBeNull();
-    expect(_parseStoredLanguage(JSON.stringify({ state: { language: "fr" } }))).toBeNull();
+    expect(_parseStoredLanguage(JSON.stringify({ state: { language: "fr" }, version: 0 }))).toBeNull();
+    expect(_parseStoredLanguage(JSON.stringify({ state: { language: "en" }, version: 1 }))).toBeNull();
   });
 
   it("returns null for empty / garbage", () => {

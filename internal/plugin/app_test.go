@@ -67,7 +67,7 @@ keys:
     models:
       - name: fast
 `)
-	req, _ := json.Marshal(LifecycleRequest{ConfigYAML: yaml})
+	req, _ := json.Marshal(LifecycleRequest{ConfigYAML: yaml, SchemaVersion: SchemaVersion})
 	if _, err := app.HandleMethod(MethodPluginReconfigure, req); err != nil {
 		t.Fatalf("configure: %v", err)
 	}
@@ -198,7 +198,7 @@ func TestAppManagementCreateAndRotate(t *testing.T) {
 	rotateReq, _ := json.Marshal(ManagementRequest{
 		Method: http.MethodPost,
 		Path:   "/v0/management/plugins/cpa-key-policy/keys/rotate",
-		Query:  url.Values{"id": {"team-b"}},
+		Body:   []byte(`{"id":"team-b"}`),
 	})
 	raw, err = app.HandleMethod(MethodManagementHandle, rotateReq)
 	if err != nil {
@@ -501,7 +501,7 @@ keys:
     models:
       - name: fast
 `)
-	req, _ := json.Marshal(LifecycleRequest{ConfigYAML: yaml})
+	req, _ := json.Marshal(LifecycleRequest{ConfigYAML: yaml, SchemaVersion: SchemaVersion})
 	if _, err := app.HandleMethod(MethodPluginReconfigure, req); err != nil {
 		t.Fatalf("configure: %v", err)
 	}
@@ -542,9 +542,9 @@ func TestUsageHandleBills(t *testing.T) {
 	}
 }
 
-// TestUsageHandleAliasFallbackToModel verifies that when the host omits its
+// TestUsageHandleRequestedModelFallsBackToResolvedModel verifies that when the host omits its
 // fixed requested-model transport field, the resolved upstream Model is used.
-func TestUsageHandleAliasFallbackToModel(t *testing.T) {
+func TestUsageHandleRequestedModelFallsBackToResolvedModel(t *testing.T) {
 	app, plain := configurePricedApp(t)
 	hdr := http.Header{"Authorization": {"Bearer " + plain}}
 
@@ -623,7 +623,7 @@ keys:
     models:
       - name: sonnet
 `)
-	req, _ := json.Marshal(LifecycleRequest{ConfigYAML: yaml})
+	req, _ := json.Marshal(LifecycleRequest{ConfigYAML: yaml, SchemaVersion: SchemaVersion})
 	if _, err := app.HandleMethod(MethodPluginReconfigure, req); err != nil {
 		t.Fatalf("configure: %v", err)
 	}
@@ -679,7 +679,7 @@ keys:
     models:
       - name: fast
 `)
-	req, _ := json.Marshal(LifecycleRequest{ConfigYAML: yaml})
+	req, _ := json.Marshal(LifecycleRequest{ConfigYAML: yaml, SchemaVersion: SchemaVersion})
 	if _, err := app.HandleMethod(MethodPluginReconfigure, req); err != nil {
 		t.Fatalf("configure: %v", err)
 	}
@@ -928,7 +928,7 @@ keys:
     models:
       - name: mymulti
 `)
-	req, _ := json.Marshal(LifecycleRequest{ConfigYAML: yaml})
+	req, _ := json.Marshal(LifecycleRequest{ConfigYAML: yaml, SchemaVersion: SchemaVersion})
 	if _, err := app.HandleMethod(MethodPluginReconfigure, req); err != nil {
 		t.Fatalf("configure: %v", err)
 	}
@@ -1007,7 +1007,7 @@ func TestResolveProviderKey(t *testing.T) {
 }
 
 func TestUsageHandleTransportJSONSnapshot(t *testing.T) {
-	if ABIVersion != 1 || SchemaVersion != 1 {
+	if ABIVersion != 1 || SchemaVersion != 2 {
 		t.Fatalf("ABI/schema versions changed: %d/%d", ABIVersion, SchemaVersion)
 	}
 	raw, err := json.Marshal(UsageHandleRequest{
@@ -1031,6 +1031,16 @@ func TestUsageHandleTransportJSONSnapshot(t *testing.T) {
 	}
 	if len(payload) != 5 || string(payload[requestedModelField]) != `"public-model"` {
 		t.Fatalf("transport snapshot = %s", raw)
+	}
+}
+
+func TestRegistrationReportsCurrentReleaseMetadata(t *testing.T) {
+	registration := NewApp().registration()
+	if registration.SchemaVersion != 2 || registration.Metadata.Version != "0.5.0" {
+		t.Fatalf("registration version metadata = %+v", registration)
+	}
+	if registration.Metadata.GitHubRepository != "https://github.com/RealLiuSha/cpa-plugin-key-policy" {
+		t.Fatalf("registration repository = %q", registration.Metadata.GitHubRepository)
 	}
 }
 

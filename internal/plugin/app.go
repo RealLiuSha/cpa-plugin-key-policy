@@ -76,15 +76,18 @@ func safePluginCall(call func() ([]byte, error)) (response []byte, err error) {
 func (a *App) configure(raw []byte) error {
 	var req LifecycleRequest
 	if len(raw) > 0 {
-		if err := json.Unmarshal(raw, &req); err != nil {
+		if err := decodeStrictBody(raw, &req); err != nil {
 			return err
 		}
+	}
+	if req.SchemaVersion != SchemaVersion {
+		return fmt.Errorf("unsupported lifecycle schema_version %d; require %d", req.SchemaVersion, SchemaVersion)
 	}
 	configYAML, err := stripHostConfigMetadata(req.ConfigYAML)
 	if err != nil {
 		return err
 	}
-	cfg, err := policy.DecodeConfig(configYAML)
+	cfg, err := policy.ParseConfig(configYAML)
 	if err != nil {
 		return err
 	}
@@ -112,13 +115,14 @@ func (a *App) registration() Registration {
 			Name:             PluginName,
 			Version:          Version,
 			Author:           "cpa-key-policy",
-			GitHubRepository: "https://github.com/router-for-me/CLIProxyAPI",
+			GitHubRepository: "https://github.com/RealLiuSha/cpa-plugin-key-policy",
 			ConfigFields: []ConfigField{
 				{Name: "enabled", Type: "boolean", Description: "Enable or disable this plugin without unloading it."},
 				{Name: "state_file", Type: "string", Description: "JSON state file used for key policy changes made through the Management API."},
 				{Name: "usage_timezone", Type: "string", Description: "IANA timezone used for natural-day usage buckets. Defaults to Asia/Shanghai."},
-				{Name: "keys", Type: "array", Description: "Initial downstream key policy list. State file wins after it exists."},
-				{Name: "models", Type: "array", Description: "Public model definitions with upstream targets and global pricing."},
+				{Name: "keys", Type: "array", Description: "First-boot downstream key seeds. State is authoritative after initialization."},
+				{Name: "models", Type: "array", Description: "First-boot public model seeds with upstream targets and global pricing."},
+				{Name: "classify_rules", Type: "array", Description: "First-boot credential classification rule seeds."},
 			},
 		},
 		Capabilities: Capabilities{
@@ -154,7 +158,7 @@ func (a *App) authenticate(raw []byte) ([]byte, error) {
 		if decision.Route.Group != "" {
 			// Group lets our Scheduler (scheduler.pick) restrict auth-file
 			// selection to a tier/plan (codex plan_type, antigravity tier).
-			// Empty = legacy "any file for the provider" behavior.
+			// Empty keeps the provider's default credential selection.
 			meta["group"] = decision.Route.Group
 		}
 	}
@@ -247,7 +251,7 @@ func (a *App) interceptResponse(raw []byte) ([]byte, error) {
 // routed model target had a Group (codex plan_type / antigravity tier), restrict
 // candidate auths to those whose Attributes carry a matching identity. Any
 // Group "" or a group we can't recognize → defer to the host scheduler
-// (Handled=false), preserving legacy "any auth for the provider" behavior.
+// (Handled=false), preserving the provider's default credential selection.
 //
 // The plugin never sees the resolved route directly here; the group was
 // stamped into request metadata by authenticate(), and the host forwards it as
@@ -544,17 +548,25 @@ func (a *App) handleManagement(raw []byte) ([]byte, error) {
 	case req.Method == http.MethodPatch && path == base+"/keys":
 		return OKEnvelope(a.patchKey(req.Body))
 	case req.Method == http.MethodDelete && path == base+"/keys":
-		return OKEnvelope(a.deleteKey(idFromRequest(req.Query, req.Body)))
+		return OKEnvelope(a.deleteKey(strings.TrimSpace(req.Query.Get("id"))))
 	case req.Method == http.MethodPost && path == base+"/keys/rotate":
-		return OKEnvelope(a.rotateKey(idFromRequest(req.Query, req.Body)))
+		id, err := idFromBody(req.Body)
+		if err != nil {
+			return OKEnvelope(jsonError(http.StatusBadRequest, "invalid_json", err.Error()))
+		}
+		return OKEnvelope(a.rotateKey(id))
 	case req.Method == http.MethodPost && path == base+"/keys/reset-rpm":
-		return OKEnvelope(a.resetRPM(idFromRequest(req.Query, req.Body)))
+		id, err := idFromBody(req.Body)
+		if err != nil {
+			return OKEnvelope(jsonError(http.StatusBadRequest, "invalid_json", err.Error()))
+		}
+		return OKEnvelope(a.resetRPM(id))
 	case req.Method == http.MethodPost && path == base+"/keys/reset-usage":
 		return OKEnvelope(a.resetUsage(req.Body))
 	case req.Method == http.MethodGet && path == base+"/keys/usage":
-		return OKEnvelope(a.keyUsage(idFromRequest(req.Query, req.Body)))
+		return OKEnvelope(a.keyUsage(strings.TrimSpace(req.Query.Get("id"))))
 	case req.Method == http.MethodGet && path == base+"/keys/history":
-		return OKEnvelope(a.keyHistory(idFromRequest(req.Query, req.Body), intQuery(req.Query, "days", 30)))
+		return OKEnvelope(a.keyHistory(strings.TrimSpace(req.Query.Get("id")), intQuery(req.Query, "days", 30)))
 	case req.Method == http.MethodGet && path == base+"/audit":
 		return OKEnvelope(a.auditEvents(strings.TrimSpace(req.Query.Get("key_id")), intQuery(req.Query, "limit", 100)))
 	case req.Method == http.MethodGet && path == base+"/status":
@@ -800,9 +812,7 @@ func (a *App) resetUsage(body []byte) ManagementResponse {
 	return jsonResponse(http.StatusOK, result)
 }
 
-// keyUsage returns the per-model usage breakdown for one downstream key (the
-// key detail subpage data source). id is taken from the query string (or body),
-// matching the rotate/reset-rpm/delete convention.
+// keyUsage returns the per-model usage breakdown for one downstream key.
 func (a *App) keyUsage(id string) ManagementResponse {
 	id = strings.TrimSpace(id)
 	if id == "" {
@@ -871,25 +881,14 @@ func storeError(err error) ManagementResponse {
 	return jsonError(http.StatusBadRequest, "invalid_request", err.Error())
 }
 
-func idFromRequest(query map[string][]string, body []byte) string {
-	if query != nil {
-		for _, name := range []string{"id", "key_id"} {
-			if values := query[name]; len(values) > 0 && strings.TrimSpace(values[0]) != "" {
-				return strings.TrimSpace(values[0])
-			}
-		}
-	}
+func idFromBody(body []byte) (string, error) {
 	var payload struct {
-		ID    string `json:"id"`
-		KeyID string `json:"key_id"`
+		ID string `json:"id"`
 	}
-	if len(body) > 0 && json.Unmarshal(body, &payload) == nil {
-		if strings.TrimSpace(payload.ID) != "" {
-			return strings.TrimSpace(payload.ID)
-		}
-		return strings.TrimSpace(payload.KeyID)
+	if err := decodeStrictBody(body, &payload); err != nil {
+		return "", err
 	}
-	return ""
+	return strings.TrimSpace(payload.ID), nil
 }
 
 func (a *App) publicKeys(keys []policy.KeyConfig) []publicKey {

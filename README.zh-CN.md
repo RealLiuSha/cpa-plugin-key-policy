@@ -1,6 +1,6 @@
 # cpa-key-policy
 
-`cpa-key-policy` 是 CLIProxyAPI 插件，用于签发下游 Key、把公开模型名路由到 CPA 实际能力，并执行 RPM 与美元限额。0.5 版本切换为纯 v3 模型领域，故意不兼容旧版状态文件。
+`cpa-key-policy` 是 CLIProxyAPI 插件，用于签发下游 Key、把公开模型名路由到 CPA 实际能力，并执行 RPM 与美元限额。0.5 只提供一套当前模型领域和一套严格持久化契约。
 
 ## 模型领域
 
@@ -15,7 +15,7 @@
 
 ## 配置
 
-完整示例见 [`config.example.yaml`](config.example.yaml)。v3 核心结构：
+完整示例见 [`config.example.yaml`](config.example.yaml)。当前核心结构：
 
 ```yaml
 enabled: true
@@ -44,7 +44,7 @@ keys:
     monthly_limit_usd: 150
 ```
 
-首次启动会创建带相同 `dataset_id` 的 state/usage 文件对。后续启动会拒绝缺失配对、dataset 不一致、v1/v2 以及未来版本。已有 state 对 Key 保持权威；重新配置时，非空的模型或凭证规则配置可显式覆盖对应定义。
+首次启动会用 YAML 初始化 Key、模型和凭证规则，并创建带相同 `dataset_id` 的 state/usage 文件对。之后这三个管理领域全部以 state 为唯一真相源；YAML 只控制 `enabled`、`state_file` 和 `usage_timezone`。启动时会严格拒绝不受支持的文件版本、缺失配对或 dataset 不一致。
 
 ## 用量与限额
 
@@ -92,25 +92,24 @@ cd web
 npm ci
 npm test -- --run
 npm run typecheck
+npm audit --audit-level=moderate
 VITE_HOSTED=1 npm run build
 
 cd ..
 cp web/dist/index.html internal/plugin/web/dist/index.html
 go test ./...
+go test -race ./...
 go vet ./...
+make check-version
+make check-model-domain
 make build-linux-amd64
-make check-migrator-linux-amd64
 ```
 
-插件产物为 `dist/cpa-key-policy_linux_amd64.so`；离线迁移产物为 `dist/migrate-model-schema_linux_amd64` 及其 `.sha256` 文件。
-
-## 从 v2 升级
-
-运行时不会自动迁移旧文件。CPA 停止写入后，按 [`docs/migrate-v2-to-v3.md`](docs/migrate-v2-to-v3.md) 逐实例执行，并在验证完成后继续保留回滚包。
+Linux 产物为 `dist/cpa-key-policy_linux_amd64.so`。
 
 ## 安全与运行说明
 
 - 配置和 state 只保存 Key 哈希；生成的明文 Key 仅返回一次。
-- state、usage 和回滚包都可能包含敏感运行信息，必须限制为所有者可读。
+- state 和 usage 可能包含敏感运行信息，必须限制为所有者可读。
 - 管理审计记录语义化变更；审计追加失败会记录日志，但不会回滚已成功的状态变更。
 - 非流式响应会把上游模型 ID 改回调用方请求的公开模型；provider 接入、调度选择和计费公式保持 CPA 原有语义。

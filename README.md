@@ -1,6 +1,6 @@
 # cpa-key-policy
 
-`cpa-key-policy` is a CLIProxyAPI plugin for issuing downstream keys, routing public model names to CPA capabilities, and enforcing RPM and USD limits. Version 0.5 uses a pure v3 model domain and is intentionally incompatible with older state files.
+`cpa-key-policy` is a CLIProxyAPI plugin for issuing downstream keys, routing public model names to CPA capabilities, and enforcing RPM and USD limits. Version 0.5 exposes one current model domain and one strict persistence contract.
 
 ## Model domain
 
@@ -15,7 +15,7 @@ For example, an administrator can expose `asd` as one stable public model while 
 
 ## Configuration
 
-See [`config.example.yaml`](config.example.yaml). The v3 shape is:
+See [`config.example.yaml`](config.example.yaml). The current shape is:
 
 ```yaml
 enabled: true
@@ -44,7 +44,7 @@ keys:
     monthly_limit_usd: 150
 ```
 
-The first boot creates paired state and usage files with the same `dataset_id`. Later startups reject missing pairs, mismatched datasets, v1/v2 files, and future versions. Existing state remains authoritative for keys; non-empty model or credential-rule configuration can intentionally override those definitions during reconfigure.
+The first boot seeds keys, models, and credential rules from YAML and creates paired state and usage files with the same `dataset_id`. After that, the state file is authoritative for all three managed domains; YAML only controls `enabled`, `state_file`, and `usage_timezone`. Startup strictly rejects an unsupported file version, a missing pair, or a mismatched dataset.
 
 ## Accounting
 
@@ -94,25 +94,24 @@ cd web
 npm ci
 npm test -- --run
 npm run typecheck
+npm audit --audit-level=moderate
 VITE_HOSTED=1 npm run build
 
 cd ..
 cp web/dist/index.html internal/plugin/web/dist/index.html
 go test ./...
+go test -race ./...
 go vet ./...
+make check-version
+make check-model-domain
 make build-linux-amd64
-make check-migrator-linux-amd64
 ```
 
-The plugin artifact is `dist/cpa-key-policy_linux_amd64.so`; the offline migration artifacts are `dist/migrate-model-schema_linux_amd64` and its `.sha256` file.
-
-## Upgrade from v2
-
-The runtime does not migrate old files automatically. Follow [`docs/migrate-v2-to-v3.md`](docs/migrate-v2-to-v3.md) while CPA is stopped, migrate one instance at a time, and retain the rollback package after validation.
+The Linux artifact is `dist/cpa-key-policy_linux_amd64.so`.
 
 ## Security and operational notes
 
 - Store only hashes in configuration or state; generated plaintext keys are returned once.
-- State, usage, and rollback files may contain operationally sensitive metadata and must remain owner-readable only.
+- State and usage files may contain operationally sensitive metadata and must remain owner-readable only.
 - Management audit events record semantic mutations. A failed audit append is logged but does not roll back a successful state mutation.
 - The response interceptor rewrites non-stream response model IDs to the requested public model. Provider routing, scheduler selection, and billing formulas otherwise retain CPA behavior.

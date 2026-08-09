@@ -95,6 +95,20 @@ func DefaultConfig() Config {
 }
 
 func DecodeConfig(raw []byte) (Config, error) {
+	cfg, err := ParseConfig(raw)
+	if err != nil {
+		return Config{}, err
+	}
+	if err := normalizeConfig(&cfg); err != nil {
+		return Config{}, err
+	}
+	return cfg, nil
+}
+
+// ParseConfig strictly decodes the YAML shape without validating managed
+// domain data. Store.Configure selects either first-boot seeds or persisted
+// state before validating that effective domain.
+func ParseConfig(raw []byte) (Config, error) {
 	cfg := DefaultConfig()
 	if len(bytes.TrimSpace(raw)) == 0 {
 		return cfg, nil
@@ -113,9 +127,6 @@ func DecodeConfig(raw []byte) (Config, error) {
 	}
 	if strings.TrimSpace(cfg.StateFile) == "" {
 		cfg.StateFile = DefaultConfig().StateFile
-	}
-	if err := normalizeConfig(&cfg); err != nil {
-		return Config{}, err
 	}
 	return cfg, nil
 }

@@ -34,25 +34,19 @@ function isEmbedded(): boolean {
   }
 }
 
-// Parse the panel's `cli-proxy-language` localStorage value. Riesen zustand
-// persist envelope shape: `{"state":{"language":"en"},"version":0}`. Legacy raw
-// code string (`"en"`) is tolerated too. Returns the supported locale or null.
+// Parse the panel's current zustand persist envelope:
+// `{"state":{"language":"en"},"version":0}`.
 function parseStoredLanguage(raw: string): Locale | null {
   if (!raw) return null;
-  // Try JSON envelope first.
   try {
-    const parsed = JSON.parse(raw) as { state?: { language?: unknown }; language?: unknown } | unknown;
-    const fromState = (parsed as { state?: { language?: unknown } })?.state?.language;
-    const fromTop = (parsed as { language?: unknown })?.language;
-    const candidate =
-      typeof fromState === "string" ? fromState
-        : typeof fromTop === "string" ? fromTop
-          : typeof parsed === "string" ? (parsed as string)
-            : null;
-    if (candidate && isSupportedLocale(candidate)) return candidate;
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== "object") return null;
+    const envelope = parsed as { state?: unknown; version?: unknown };
+    if (envelope.version !== 0 || !envelope.state || typeof envelope.state !== "object") return null;
+    const candidate = (envelope.state as { language?: unknown }).language;
+    if (typeof candidate === "string" && isSupportedLocale(candidate)) return candidate;
   } catch {
-    // Not JSON — maybe a raw legacy locale code.
-    if (isSupportedLocale(raw)) return raw as Locale;
+    return null;
   }
   return null;
 }

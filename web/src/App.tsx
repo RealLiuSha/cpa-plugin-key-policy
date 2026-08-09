@@ -21,7 +21,7 @@ function useAuthTick() {
 }
 
 // Desktop top horizontal nav. Mirrors the Stitch "Quiet Paper" design: left =
-// app title + base url, right = nav links + logout. Mobile keeps the legacy
+// app title + base url, right = nav links + logout. Mobile keeps the compact
 // .header (hidden on desktop via CSS) and bottom tab bar instead.
 function TopNav() {
   const t = useT();

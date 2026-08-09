@@ -161,7 +161,7 @@ classify_rules:
     enabled: true
 keys: []
 `)
-	reqCfg, _ := json.Marshal(LifecycleRequest{ConfigYAML: yaml})
+	reqCfg, _ := json.Marshal(LifecycleRequest{ConfigYAML: yaml, SchemaVersion: SchemaVersion})
 	if _, err := app.HandleMethod(MethodPluginReconfigure, reqCfg); err != nil {
 		t.Fatal(err)
 	}
