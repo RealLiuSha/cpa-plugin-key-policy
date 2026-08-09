@@ -22,7 +22,7 @@ Before stopping CPA, record:
 - Key count, alias/model count, reference count, date-bucket count, and current daily/7-day/30-day totals;
 - every zero-active-price model that is intentionally free.
 
-Do not infer free status from zero prices. Each intentional free model must be explicitly passed with a repeated `-free-model` flag. Create one parent rollback directory per instance and copy the currently installed plugin plus its SHA into a `plugin/` subdirectory. Reserve an absent or empty `data/` subdirectory for the migration tool.
+Do not infer free status from zero prices. Each intentional free model must be explicitly passed with a repeated `-free-model` flag. The flag is valid only when every v2 price field is zero; the tool rejects attempts to erase an existing price by marking the model free. Create one parent rollback directory per instance and copy the currently installed plugin plus its SHA into a `plugin/` subdirectory. Reserve an absent or empty `data/` subdirectory for the migration tool.
 
 ## 3. Stop writes and dry-run
 
@@ -49,6 +49,8 @@ Dry-run does not create the backup directory and does not modify input files. Ru
 - aggregate `summary.before` and `summary.after` totals.
 
 All before/after values must be equal, and every Key must satisfy daily ≤ 7-day ≤ 30-day.
+
+If dry-run reports that a Key day bucket differs from the sum of its model buckets, stop. The migrator deliberately does not guess whether the aggregate or model dates are authoritative. Produce a separate, reviewed v2 reconciliation plan that identifies the exact Key/date/bucket movements, proves whole-ledger and active-window totals remain unchanged, backs up the original v2 usage file, and validates the v2 invariant before repeating dry-run.
 
 ## 4. Apply
 
