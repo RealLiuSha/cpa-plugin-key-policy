@@ -424,7 +424,13 @@ func validateWindowTotals(before, after map[string]policy.UsageMigrationTotals) 
 func sumUsageTotals(totals map[string]policy.UsageMigrationTotals) policy.UsageMigrationTotals {
 	monthly := 0.0
 	result := policy.UsageMigrationTotals{MonthlyUSD: &monthly}
-	for _, total := range totals {
+	keyIDs := make([]string, 0, len(totals))
+	for keyID := range totals {
+		keyIDs = append(keyIDs, keyID)
+	}
+	sort.Strings(keyIDs)
+	for _, keyID := range keyIDs {
+		total := totals[keyID]
 		result.DailyUSD += total.DailyUSD
 		result.WeeklyUSD += total.WeeklyUSD
 		if total.MonthlyUSD != nil {

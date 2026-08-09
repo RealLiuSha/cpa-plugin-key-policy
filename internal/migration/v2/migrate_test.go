@@ -87,6 +87,21 @@ func TestDryRunIsDeterministicAndHasNoFileSideEffects(t *testing.T) {
 	assertFileBytes(t, usagePath, usageBefore)
 }
 
+func TestUsageReportSummaryUsesDeterministicKeyOrder(t *testing.T) {
+	monthlyA, monthlyB, monthlyC := 175.208475, 0.00000000000003, 937.739043
+	totals := map[string]policy.UsageMigrationTotals{
+		"z": {DailyUSD: 175.208475, WeeklyUSD: 937.739043, MonthlyUSD: &monthlyA},
+		"a": {DailyUSD: 0.00000000000003, WeeklyUSD: 0.00000000000003, MonthlyUSD: &monthlyB},
+		"m": {DailyUSD: 937.739043, WeeklyUSD: 937.739043, MonthlyUSD: &monthlyC},
+	}
+	want := sumUsageTotals(totals)
+	for index := 0; index < 100; index++ {
+		if got := sumUsageTotals(totals); !usageTotalsEqual(got, want) {
+			t.Fatalf("iteration %d summary changed: got=%+v want=%+v", index, got, want)
+		}
+	}
+}
+
 func usageTotalsEqual(left, right policy.UsageMigrationTotals) bool {
 	return left.DailyUSD == right.DailyUSD && left.WeeklyUSD == right.WeeklyUSD &&
 		left.MonthlyUSD != nil && right.MonthlyUSD != nil && *left.MonthlyUSD == *right.MonthlyUSD
