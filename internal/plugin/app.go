@@ -80,7 +80,11 @@ func (a *App) configure(raw []byte) error {
 			return err
 		}
 	}
-	cfg, err := policy.DecodeConfig(req.ConfigYAML)
+	configYAML, err := stripHostConfigMetadata(req.ConfigYAML)
+	if err != nil {
+		return err
+	}
+	cfg, err := policy.DecodeConfig(configYAML)
 	if err != nil {
 		return err
 	}
