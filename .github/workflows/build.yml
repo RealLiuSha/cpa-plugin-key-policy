@@ -37,8 +37,24 @@ jobs:
       - name: Web build (embed UI)
         run: make web-build
 
+      - name: Frontend test and typecheck
+        working-directory: web
+        run: |
+          npm test
+          npm run typecheck
+          npm audit --audit-level=moderate
+
+      - name: Contract and version gates
+        run: |
+          make check-version
+          make check-model-domain
+          git diff --exit-code -- internal/plugin/web/dist/index.html
+
       - name: Test
         run: go test ./...
+
+      - name: Race test
+        run: go test -race ./...
 
       - name: Vet
         run: go vet ./...

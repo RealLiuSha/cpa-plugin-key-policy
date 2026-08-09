@@ -56,9 +56,7 @@ export async function resetUsage(id: string, window: UsageResetWindow): Promise<
   await c.post(pluginPath("/keys/reset-usage"), { id, window });
 }
 
-// fetchKeyUsage returns the per-model usage breakdown for one key (the key
-// detail subpage data source). id goes through the query string, matching the
-// rotate/reset-rpm/delete convention.
+// fetchKeyUsage returns the per-model usage breakdown for one key.
 export async function fetchKeyUsage(id: string): Promise<KeyUsageResponse> {
   const c = apiClient();
   const { data } = await c.get<KeyUsageResponse>(pluginPath("/keys/usage"), {

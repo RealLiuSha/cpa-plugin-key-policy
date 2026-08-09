@@ -4,11 +4,10 @@ import (
 	"encoding/json"
 	"net/http"
 	"path/filepath"
-	"strings"
 	"testing"
 )
 
-func TestV3ManagementRejectsRemovedRoutesAndKeyShapes(t *testing.T) {
+func TestManagementRejectsNonReferenceKeyModelFields(t *testing.T) {
 	app := NewApp()
 	statePath := filepath.ToSlash(filepath.Join(t.TempDir(), "state.json"))
 	config := []byte(`
@@ -20,28 +19,16 @@ models:
     targets:
       - {provider: codex, target_model: gpt}
 `)
-	lifecycle, _ := json.Marshal(LifecycleRequest{ConfigYAML: config})
+	lifecycle, _ := json.Marshal(LifecycleRequest{ConfigYAML: config, SchemaVersion: SchemaVersion})
 	if _, err := app.HandleMethod(MethodPluginReconfigure, lifecycle); err != nil {
 		t.Fatal(err)
 	}
 
-	removedCollection := strings.Join([]string{"ali", "ases"}, "")
-	request, _ := json.Marshal(ManagementRequest{
-		Method: http.MethodGet,
-		Path:   "/v0/management/plugins/cpa-key-policy/" + removedCollection,
-	})
-	response := managementResponseFromEnvelope(t, mustHandle(t, app, MethodManagementHandle, request))
-	if response.StatusCode != http.StatusNotFound {
-		t.Fatalf("removed route status = %d, want 404", response.StatusCode)
-	}
-
-	removedReferenceField := []byte(`{"id":"old-ref","` + removedCollection + `":[{"name":"fast"}]}`)
 	directRoute := []byte(`{"id":"direct-route","models":[{"name":"fast","provider":"codex","target_model":"gpt"}]}`)
 	priceOverride := []byte(`{"id":"price-override","models":[{"name":"fast","input_price_per_million":1}]}`)
 	for name, body := range map[string][]byte{
-		"removed reference field": removedReferenceField,
-		"direct route fields":     directRoute,
-		"key price override":      priceOverride,
+		"direct route fields": directRoute,
+		"key price override":  priceOverride,
 	} {
 		t.Run(name, func(t *testing.T) {
 			request, _ := json.Marshal(ManagementRequest{
@@ -57,10 +44,64 @@ models:
 	}
 }
 
-func TestV3ModelManagementLifecycle(t *testing.T) {
+func TestManagementRejectsRemovedKeyIDRequestField(t *testing.T) {
 	app := NewApp()
 	statePath := filepath.ToSlash(filepath.Join(t.TempDir(), "state.json"))
-	lifecycle, _ := json.Marshal(LifecycleRequest{ConfigYAML: []byte("enabled: true\nstate_file: \"" + statePath + "\"\n")})
+	lifecycle, _ := json.Marshal(LifecycleRequest{ConfigYAML: []byte(`
+enabled: true
+state_file: "` + statePath + `"
+models:
+  - name: fast
+    free: true
+    targets: [{provider: codex, target_model: gpt}]
+`), SchemaVersion: SchemaVersion})
+	if _, err := app.HandleMethod(MethodPluginReconfigure, lifecycle); err != nil {
+		t.Fatal(err)
+	}
+	created := managementCall(t, app, http.MethodPost, "/v0/management/plugins/cpa-key-policy/keys", []byte(`{
+  "id": "current-key",
+  "key": "cpa_current_key",
+  "models": [{"name":"fast"}]
+}`))
+	if created.StatusCode != http.StatusCreated {
+		t.Fatalf("create key status=%d body=%s", created.StatusCode, created.Body)
+	}
+
+	raw, _ := json.Marshal(ManagementRequest{
+		Method: http.MethodDelete,
+		Path:   "/v0/management/plugins/cpa-key-policy/keys",
+		Query:  map[string][]string{"key_id": {"current-key"}},
+	})
+	response := managementResponseFromEnvelope(t, mustHandle(t, app, MethodManagementHandle, raw))
+	if response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("removed key_id request field status=%d body=%s", response.StatusCode, response.Body)
+	}
+}
+
+func TestLifecycleRejectsNonCurrentSchema(t *testing.T) {
+	app := NewApp()
+	statePath := filepath.ToSlash(filepath.Join(t.TempDir(), "state.json"))
+	raw, _ := json.Marshal(map[string]any{
+		"schema_version": 1,
+		"config_yaml":    []byte("enabled: true\nstate_file: \"" + statePath + "\"\n"),
+	})
+	if _, err := app.HandleMethod(MethodPluginRegister, raw); err == nil {
+		t.Fatal("schema version 1 was accepted")
+	}
+	unknown, _ := json.Marshal(map[string]any{
+		"schema_version": SchemaVersion,
+		"config_yaml":    []byte("enabled: true\nstate_file: \"" + statePath + "\"\n"),
+		"unexpected":     true,
+	})
+	if _, err := app.HandleMethod(MethodPluginRegister, unknown); err == nil {
+		t.Fatal("unknown lifecycle field was accepted")
+	}
+}
+
+func TestModelManagementLifecycle(t *testing.T) {
+	app := NewApp()
+	statePath := filepath.ToSlash(filepath.Join(t.TempDir(), "state.json"))
+	lifecycle, _ := json.Marshal(LifecycleRequest{ConfigYAML: []byte("enabled: true\nstate_file: \"" + statePath + "\"\n"), SchemaVersion: SchemaVersion})
 	if _, err := app.HandleMethod(MethodPluginReconfigure, lifecycle); err != nil {
 		t.Fatal(err)
 	}
@@ -104,7 +145,12 @@ func TestV3ModelManagementLifecycle(t *testing.T) {
 	if blocked.StatusCode != http.StatusBadRequest {
 		t.Fatalf("referenced model delete status=%d body=%s", blocked.StatusCode, blocked.Body)
 	}
-	deletedKey := managementCall(t, app, http.MethodDelete, "/v0/management/plugins/cpa-key-policy/keys", []byte(`{"id":"team-a"}`))
+	deleteKeyRequest, _ := json.Marshal(ManagementRequest{
+		Method: http.MethodDelete,
+		Path:   "/v0/management/plugins/cpa-key-policy/keys",
+		Query:  map[string][]string{"id": {"team-a"}},
+	})
+	deletedKey := managementResponseFromEnvelope(t, mustHandle(t, app, MethodManagementHandle, deleteKeyRequest))
 	if deletedKey.StatusCode != http.StatusOK {
 		t.Fatalf("delete key status=%d body=%s", deletedKey.StatusCode, deletedKey.Body)
 	}
@@ -114,7 +160,7 @@ func TestV3ModelManagementLifecycle(t *testing.T) {
 	}
 }
 
-func TestV3PriceImportRejectsInvalidDryRunAsClientError(t *testing.T) {
+func TestPriceImportRejectsInvalidDryRunAsClientError(t *testing.T) {
 	app := NewApp()
 	statePath := filepath.ToSlash(filepath.Join(t.TempDir(), "state.json"))
 	lifecycle, _ := json.Marshal(LifecycleRequest{ConfigYAML: []byte(`
@@ -124,7 +170,7 @@ models:
   - name: fast
     targets: [{provider: codex, target_model: gpt}]
     input_price_per_million: 1
-`)})
+`), SchemaVersion: SchemaVersion})
 	if _, err := app.HandleMethod(MethodPluginReconfigure, lifecycle); err != nil {
 		t.Fatal(err)
 	}

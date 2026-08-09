@@ -1,7 +1,6 @@
 package policy
 
 import (
-	"math"
 	"sort"
 	"strings"
 	"sync"
@@ -167,8 +166,7 @@ func sumBuckets(days map[string]UsageBucket, fromKey, toKey string) UsageBucket 
 			dates = append(dates, date)
 		}
 	}
-	// Stable date order makes floating-point totals deterministic. The migration
-	// CLI relies on byte-identical reports when the same snapshot is run twice.
+	// Stable date order keeps floating-point totals deterministic across reads.
 	sort.Strings(dates)
 	for _, date := range dates {
 		total = addUsageBucket(total, days[date])
@@ -548,30 +546,6 @@ type UsageHistoryDay struct {
 	Date string `json:"date"`
 	UsageBucket
 	ByModel map[string]UsageBucket `json:"by_model,omitempty"`
-}
-
-type UsageMigrationTotals struct {
-	DailyUSD   float64  `json:"daily_usd"`
-	WeeklyUSD  float64  `json:"weekly_usd"`
-	MonthlyUSD *float64 `json:"monthly_usd"`
-}
-
-// SummarizeUsageStates computes deterministic window totals for an offline
-// migration report without mutating the supplied states.
-func SummarizeUsageStates(states map[string]*UsageState, now time.Time, location *time.Location, timezone string) map[string]UsageMigrationTotals {
-	ledger := newUsageLedgerWithLocation(func() time.Time { return now }, location, timezone)
-	ledger.loadFromState(states)
-	result := make(map[string]UsageMigrationTotals, len(states))
-	for id := range states {
-		summary := ledger.Summary(id, quotaLimits{})
-		monthly := roundedUSD(summary.MonthlyUSD)
-		result[id] = UsageMigrationTotals{DailyUSD: roundedUSD(summary.DailyUSD), WeeklyUSD: roundedUSD(summary.WeeklyUSD), MonthlyUSD: &monthly}
-	}
-	return result
-}
-
-func roundedUSD(value float64) float64 {
-	return math.Round(value*1_000_000) / 1_000_000
 }
 
 func (l *usageLedger) History(keyID string, count int) []UsageHistoryDay {

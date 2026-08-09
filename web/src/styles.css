@@ -136,7 +136,7 @@ a { color: var(--accent); text-decoration: none; }
 a:hover { color: var(--accent-2); text-decoration: underline; }
 
 /* Desktop shell: top horizontal nav + centered 1200px content.
- * Mobile keeps the old .header (stacked) via the max-width block. */
+ * Mobile uses the compact .header (stacked) via the max-width block. */
 .app { max-width: 1200px; margin: 0 auto; padding: 24px 24px 80px; }
 
 /* Top horizontal nav (desktop). Mirrors the Stitch 'Quiet Paper' design:
@@ -165,7 +165,7 @@ a:hover { color: var(--accent-2); text-decoration: underline; }
 .topnav-actions .tn-link.active { color: var(--accent); border-bottom-color: var(--accent); }
 .topnav-actions .tn-link.danger:hover { color: var(--danger); }
 
-/* Legacy .header kept for mobile (max-width:640px) stacked layout. */
+/* Compact mobile header (max-width:640px) uses a stacked layout. */
 .header {
   display: flex; align-items: center; justify-content: space-between;
   padding: 16px 0; margin-bottom: 24px; border-bottom: 1px solid var(--border);
@@ -926,7 +926,7 @@ td.strong { font-weight: 600; color: var(--text); }
   .usage-hero-d { display: block; }
 }
 
-/* Login centered card (desktop). Mobile keeps the old .app + .header. */
+/* Login centered card (desktop). Mobile uses the compact .app + .header. */
 .login-page {
   min-height: 100vh; display: flex; flex-direction: column;
   align-items: center; justify-content: center; gap: 16px;
@@ -1011,7 +1011,7 @@ td.strong { font-weight: 600; color: var(--text); }
   .tabbar, .fab, .bar-rank,
   .detail-card, .mmodels, .section-label, .sechead, .seg,
   .mobile-only, .mobile-form-header { display: none !important; }
-  /* Desktop shows the top nav; mobile keeps the legacy .header. */
+  /* Desktop shows the top nav; mobile uses the compact .header. */
   .topnav { display: block; }
   /* KeyUsage header keeps its window switch on desktop. */
   .keyusage-header .seg { display: inline-flex !important; }
@@ -1100,7 +1100,7 @@ td.strong { font-weight: 600; color: var(--text); }
   display: none;
 }
 
-/* ===== v3 model and credential-group management ===== */
+/* ===== model and credential-group management ===== */
 .page { display: flex; flex-direction: column; gap: 16px; }
 .page-head-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .page-head,

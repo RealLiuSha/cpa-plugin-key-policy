@@ -14,7 +14,7 @@ vi.mock("./client", () => ({
 
 import { createKey, fetchKeyHistory, fetchKeyUsage, patchKey } from "./keys";
 
-describe("v3 key API client", () => {
+describe("current key API client", () => {
   beforeEach(() => vi.clearAllMocks());
 
   it("sends only public-model references in create and patch requests", async () => {
@@ -35,7 +35,7 @@ describe("v3 key API client", () => {
     expect(JSON.stringify(request)).not.toContain("price_per_million");
   });
 
-  it("reads model usage and by-model history from v3 endpoints", async () => {
+  it("reads model usage and by-model history from current endpoints", async () => {
     client.get
       .mockResolvedValueOnce({ data: { key_id: "team-a", models: [{ name: "fast" }] } })
       .mockResolvedValueOnce({ data: { key_id: "team-a", days: [{ date: "2026-08-09", by_model: { fast: { total_usd: 1 } } }] } });

@@ -8,7 +8,7 @@ import (
 
 const (
 	ABIVersion    uint32 = 1
-	SchemaVersion uint32 = 1
+	SchemaVersion uint32 = 2
 
 	MethodPluginRegister    = "plugin.register"
 	MethodPluginReconfigure = "plugin.reconfigure"
@@ -60,7 +60,8 @@ type EnvelopeError struct {
 }
 
 type LifecycleRequest struct {
-	ConfigYAML []byte `json:"config_yaml"`
+	ConfigYAML    []byte `json:"config_yaml"`
+	SchemaVersion uint32 `json:"schema_version"`
 }
 
 type Registration struct {
@@ -191,8 +192,8 @@ type ResponseInterceptRequest struct {
 type UsageHandleRequest struct {
 	// Model is the resolved upstream model id.
 	Model string `json:"Model"`
-	// Alias is fixed by the host ABI. The plugin converts it to requestedModel
-	// at the usage.handle boundary and does not expose it to the policy domain.
+	// This host field carries the requested public model. Its name is fixed by
+	// the current CPA transport and is not exposed to the policy domain.
 	Alias string `json:"Alias"`
 	// APIKey is the client's downstream key (the cpa_... value), when available.
 	// We hash it to find the owning key config — same lookup path as auth.

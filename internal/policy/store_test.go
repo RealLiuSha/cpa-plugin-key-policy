@@ -302,6 +302,42 @@ func TestConfigureDoesNotResurrectKeysMissingFromState(t *testing.T) {
 	}
 }
 
+func TestConfigureUsesPersistedModelsAndClassifyRulesAfterFirstBoot(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+	persistedModel := freeTestModel("persisted", "codex", "gpt-persisted")
+	persistedRule := ClassifyRule{
+		Name: "persisted-rule", Field: "provider", Pattern: "^codex$", Group: "team", Enabled: true,
+	}
+
+	store := NewStore()
+	if err := store.Configure(Config{
+		Enabled: true, StateFile: path,
+		Models: []ModelDefinition{persistedModel}, ClassifyRules: []ClassifyRule{persistedRule},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := store.Configure(Config{
+		Enabled: true, StateFile: path,
+		Models: []ModelDefinition{{Name: "stale-yaml"}},
+		ClassifyRules: []ClassifyRule{{
+			Name: "stale-rule", Field: "provider", Pattern: "[", Group: "free", Enabled: true,
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	models := store.ModelsSnapshot()
+	if len(models) != 1 || models[0].Name != "persisted" || models[0].Targets[0].TargetModel != "gpt-persisted" {
+		t.Fatalf("models after reconfigure = %+v, want persisted state", models)
+	}
+	rules := store.ClassifyRulesSnapshot()
+	if len(rules) != 1 || rules[0].Name != "persisted-rule" || rules[0].Group != "team" {
+		t.Fatalf("classify rules after reconfigure = %+v, want persisted state", rules)
+	}
+}
+
 // TestConfigureFlushesBeforeReload (Bug 2): a reconfigure must flush any
 // un-persisted in-memory usage to the OLD state path before loading, so a
 // pending usage change is not lost when the disk snapshot is stale. We verify

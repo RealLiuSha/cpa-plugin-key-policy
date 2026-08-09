@@ -86,9 +86,6 @@ func (s *Store) SetClock(now func() time.Time) {
 func (s *Store) Configure(cfg Config) error {
 	s.updateMu.Lock()
 	defer s.updateMu.Unlock()
-	if err := normalizeConfig(&cfg); err != nil {
-		return err
-	}
 	statePath, err := ResolveStatePath(cfg.StateFile)
 	if err != nil {
 		return err
@@ -126,20 +123,8 @@ func (s *Store) Configure(cfg Config) error {
 			return fmt.Errorf("state/usage dataset_id mismatch: state=%q usage=%q", state.DatasetID, usageFile.DatasetID)
 		}
 		keys = state.Keys
-		if len(models) == 0 {
-			models = state.Models
-		}
-		if len(rules) == 0 {
-			rules = state.ClassifyRules
-		}
-		merged := Config{
-			Enabled: cfg.Enabled, StateFile: cfg.StateFile, UsageTimezone: cfg.UsageTimezone,
-			Keys: keys, Models: models, ClassifyRules: rules,
-		}
-		if err := normalizeConfig(&merged); err != nil {
-			return fmt.Errorf("load state: %w", err)
-		}
-		keys, models, rules = merged.Keys, merged.Models, merged.ClassifyRules
+		models = state.Models
+		rules = state.ClassifyRules
 		usage = usageFile.Usage
 		datasetID = state.DatasetID
 	case errors.Is(stateErr, os.ErrNotExist):
@@ -156,6 +141,19 @@ func (s *Store) Configure(cfg Config) error {
 	default:
 		return fmt.Errorf("load state: %w", stateErr)
 	}
+
+	effective := Config{
+		Enabled: cfg.Enabled, StateFile: cfg.StateFile, UsageTimezone: cfg.UsageTimezone,
+		Keys: keys, Models: models, ClassifyRules: rules,
+	}
+	if err := normalizeConfig(&effective); err != nil {
+		if firstBoot {
+			return fmt.Errorf("validate initial configuration: %w", err)
+		}
+		return fmt.Errorf("validate state: %w", err)
+	}
+	cfg = effective
+	keys, models, rules = cfg.Keys, cfg.Models, cfg.ClassifyRules
 
 	now := time.Now().UTC()
 	nextKeys := make(map[string]*KeyConfig, len(keys))

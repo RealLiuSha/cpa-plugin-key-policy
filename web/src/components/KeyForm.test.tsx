@@ -97,7 +97,7 @@ function scanColumnRuleConflicts(css: string): { columnRuleCount: number; confli
   return { columnRuleCount: columnRules.length, conflictingSelectors };
 }
 
-describe("KeyForm v3 model references", () => {
+describe("KeyForm current model references", () => {
   it("keeps the shared card layout and field hints wired", async () => {
     await act(async () => {
       root = createRoot(container);

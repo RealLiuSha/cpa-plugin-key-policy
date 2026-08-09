@@ -1,6 +1,6 @@
 import { apiClient, pluginPath } from "./client";
 import type { ClassifyPreviewResponse, ClassifyRule, CredentialDescriptor } from "../types";
-import { readPlanType } from "./models";
+import { fromAuthFiles } from "./models";
 
 export async function fetchClassifyRules(): Promise<ClassifyRule[]> {
   const { data } = await apiClient().get<{ rules: ClassifyRule[] }>(pluginPath("/classify-rules"));
@@ -34,22 +34,9 @@ export async function classifyPreview(
 // plan-type reader keeps catalog grouping and credential grouping consistent.
 export async function fetchCredentialDescriptors(): Promise<CredentialDescriptor[]> {
   const { data } = await apiClient().get<unknown>("/v0/management/auth-files");
-  const root = data as Record<string, unknown> | null;
-  const list = root?.["files"] ?? root?.["auth-files"];
-  if (!Array.isArray(list)) return [];
-
-  const descriptors: CredentialDescriptor[] = [];
-  for (const item of list) {
-    const value = (item ?? {}) as Record<string, unknown>;
-    const id = ((value["id"] as string) ?? (value["name"] as string) ?? "").trim();
-    if (!id) continue;
-    const provider = ((value["provider"] as string) ?? (value["type"] as string) ?? "").trim().toLowerCase();
+  return fromAuthFiles(data).map(({ name, provider, planType }) => {
     const attributes: Record<string, string> = {};
-    const planType = readPlanType(value);
     if (planType) attributes["plan_type"] = planType;
-    const tier = value["tier"];
-    if (typeof tier === "string" && tier.trim()) attributes["tier"] = tier.trim().toLowerCase();
-    descriptors.push({ id, provider, attributes });
-  }
-  return descriptors;
+    return { id: name, provider, attributes };
+  });
 }

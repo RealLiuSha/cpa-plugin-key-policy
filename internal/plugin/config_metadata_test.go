@@ -20,7 +20,7 @@ store:
   install:
     type: local
 priority: 10
-`)})
+`), SchemaVersion: SchemaVersion})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -38,14 +38,14 @@ func TestRegisterStillRejectsUnknownPolicyFields(t *testing.T) {
 store:
   id: cpa-key-policy
 priority: 10
-legacy_routes: []
-`)})
+unexpected_routes: []
+`), SchemaVersion: SchemaVersion})
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	_, err = app.HandleMethod(MethodPluginRegister, request)
-	if err == nil || !strings.Contains(err.Error(), "legacy_routes") {
+	if err == nil || !strings.Contains(err.Error(), "unexpected_routes") {
 		t.Fatalf("unknown policy field error = %v", err)
 	}
 }

@@ -47,7 +47,7 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
-describe("KeyNew v3 model return flow", () => {
+describe("KeyNew current model return flow", () => {
   it("restores the draft, auto-selects the created model and creates only model references", async () => {
     const entry = {
       pathname: "/keys/new",

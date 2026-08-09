@@ -32,14 +32,19 @@ func TestManagementSchemaV3FixtureMatchesRuntimeResponses(t *testing.T) {
 
 	app := NewApp()
 	app.Store().SetClock(func() time.Time { return time.Date(2026, 8, 8, 12, 0, 0, 0, time.UTC) })
-	lifecycle, _ := json.Marshal(LifecycleRequest{ConfigYAML: []byte("enabled: true\nstate_file: \"" + filepath.ToSlash(statePath) + "\"\nusage_timezone: Asia/Shanghai\n")})
+	lifecycle, _ := json.Marshal(LifecycleRequest{ConfigYAML: []byte("enabled: true\nstate_file: \"" + filepath.ToSlash(statePath) + "\"\nusage_timezone: Asia/Shanghai\n"), SchemaVersion: SchemaVersion})
 	if _, err := app.HandleMethod(MethodPluginReconfigure, lifecycle); err != nil {
 		t.Fatal(err)
 	}
 
 	keysResponse := managementCall(t, app, "GET", "/v0/management/plugins/cpa-key-policy/keys", nil)
 	modelsResponse := managementCall(t, app, "GET", "/v0/management/plugins/cpa-key-policy/models", nil)
-	usageResponse := managementCall(t, app, "GET", "/v0/management/plugins/cpa-key-policy/keys/usage", []byte(`{"id":"team-a"}`))
+	usageRequest, _ := json.Marshal(ManagementRequest{
+		Method: "GET",
+		Path:   "/v0/management/plugins/cpa-key-policy/keys/usage",
+		Query:  map[string][]string{"id": {"team-a"}},
+	})
+	usageResponse := managementResponseFromEnvelope(t, mustHandle(t, app, MethodManagementHandle, usageRequest))
 	if keysResponse.StatusCode != 200 || modelsResponse.StatusCode != 200 || usageResponse.StatusCode != 200 {
 		t.Fatalf("schema responses status: keys=%d models=%d usage=%d", keysResponse.StatusCode, modelsResponse.StatusCode, usageResponse.StatusCode)
 	}

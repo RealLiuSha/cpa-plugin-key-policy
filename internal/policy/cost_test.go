@@ -138,7 +138,7 @@ func TestComputeCacheCostBreakdownAdditive(t *testing.T) {
 
 // the policy layer: RecordUsage bills from already-parsed token counts (as
 // delivered by usage.handle), with no response body to parse. Previously only
-// the legacy response-body biller required a parseable body — unreachable
+// response-body billing required a parseable body — unreachable
 // for streams. 1M input × $1/M = $1.00 == daily limit → next auth blocked.
 func TestRecordUsageBillsFromParsedTokens(t *testing.T) {
 	now := time.Date(2026, 6, 29, 10, 0, 0, 0, time.UTC)

@@ -7,6 +7,10 @@ import {
   isClassifyGroup,
   formatTierLabel,
   CLASSIFY_GROUP_PREFIX,
+  fromAuthFileModels,
+  fromAuthFiles,
+  fromModelDefinitions,
+  fromOpenAICompat,
 } from "./models";
 
 describe("normalizeCatalog", () => {
@@ -28,34 +32,6 @@ describe("normalizeCatalog", () => {
     expect(out).toEqual([{ provider: "codex", model: "GPT-5" }]);
   });
 
-  it("handles array-of-objects with model/id/name fields", () => {
-    const out = normalizeCatalog([
-      {
-        provider: "claude",
-        models: [
-          { model: "claude-sonnet-4" },
-          { id: "claude-opus-4" },
-          { name: "claude-haiku" },
-        ],
-      },
-    ]);
-    expect(out.map((o) => o.model)).toEqual([
-      "claude-haiku",
-      "claude-opus-4",
-      "claude-sonnet-4",
-    ]);
-  });
-
-  it("handles object-map models", () => {
-    const out = normalizeCatalog([
-      { provider: "gemini", models: { "gemini-2.5": {}, "gemini-pro": {} } },
-    ]);
-    expect(out.map((o) => o.model).sort()).toEqual([
-      "gemini-2.5",
-      "gemini-pro",
-    ]);
-  });
-
   it("skips empty providers and models", () => {
     const out = normalizeCatalog([
       { provider: "", models: ["x"] },
@@ -63,11 +39,6 @@ describe("normalizeCatalog", () => {
       { provider: "p", models: ["ok"] },
     ]);
     expect(out).toEqual([{ provider: "p", model: "ok" }]);
-  });
-
-  it("skips entries without models", () => {
-    const out = normalizeCatalog([{ provider: "p" }, { provider: "p", models: null }]);
-    expect(out).toEqual([]);
   });
 
   it("sorts by provider, then group, then model", () => {
@@ -162,9 +133,9 @@ describe("readPlanType", () => {
     expect(readPlanType(entry)).toBe("team");
   });
 
-  it("tolerates a nested id_token.claims.plan_type shape", () => {
+  it("rejects the removed nested claims shape", () => {
     const entry = { id_token: { claims: { plan_type: "free" } } };
-    expect(readPlanType(entry)).toBe("free");
+    expect(readPlanType(entry)).toBe("");
   });
 
   it("returns empty when no plan_type is present (→ supported bucket)", () => {
@@ -177,31 +148,56 @@ describe("readPlanType", () => {
   });
 });
 
-describe("fromAuthFileModels provider source", () => {
+describe("current CPA response adapters", () => {
   // Regression: the live /auth-files/models response has NO top-level
   // channel/provider field, and its model objects carry a per-model "type"
   // ("openai" for codex-backed models). The provider must come from the LIST
   // endpoint (carried into fromAuthFileModels), NOT the file name and NOT the
   // per-model type — otherwise each codex file becomes its own "provider"
   // group named after the file and no tier union happens.
-  it("uses the list-endpoint provider, not the file name or per-model type", () => {
-    // Import the internal adapter via the public normalizeCatalog path: build a
-    // RawEntry the way fromAuthFileModels now does and feed normalizeCatalog.
+  it("uses the auth-files provider with current per-file model ids", () => {
     const liveModelsPayload = {
       models: [
         { display_name: "GPT 5.4", id: "gpt-5.4", owned_by: "openai", type: "openai" },
         { display_name: "GPT 5.5", id: "gpt-5.5", owned_by: "openai", type: "openai" },
       ],
     };
-    // Simulate fromAuthFileModels(provider="codex", payload): provider is codex.
-    const entry = {
-      provider: "codex",
-      group: "team",
-      models: liveModelsPayload.models.map((m) => m.id),
-    };
-    const out = normalizeCatalog([entry]);
+    const entry = fromAuthFileModels("codex", liveModelsPayload);
+    const out = normalizeCatalog([{ ...entry, group: "team" }]);
     expect(out.every((o) => o.provider === "codex")).toBe(true);
     expect(out.map((o) => o.model).sort()).toEqual(["gpt-5.4", "gpt-5.5"]);
+  });
+
+  it("reads canonical auth-file metadata only", () => {
+    expect(fromAuthFiles({ files: [{
+      name: "codex-team.json",
+      provider: "codex",
+      id_token: { plan_type: "team" },
+    }] })).toEqual([{ name: "codex-team.json", provider: "codex", planType: "team" }]);
+
+    expect(() => fromAuthFiles({ "auth-files": [{ id: "old", type: "codex" }] })).toThrow();
+  });
+
+  it("reads canonical openai compatibility model names only", () => {
+    expect(fromOpenAICompat({
+      "openai-compatibility": [{ name: "opencode", models: [{ name: "gpt-5" }] }],
+    })).toEqual([{ provider: "opencode", models: ["gpt-5"] }]);
+
+    expect(() => fromOpenAICompat({
+      "openai-compatibility": [{ provider: "missing-name", models: ["gpt-5"] }],
+    })).toThrow();
+  });
+
+  it("reads canonical static model definition ids and validates the channel", () => {
+    expect(fromModelDefinitions("claude", {
+      channel: "claude",
+      models: [{ id: "claude-sonnet-4", display_name: "Sonnet" }],
+    })).toEqual({ provider: "claude", models: ["claude-sonnet-4"] });
+
+    expect(() => fromModelDefinitions("claude", {
+      channel: "gemini",
+      definitions: [{ name: "unexpected-shape" }],
+    })).toThrow();
   });
 });
 
@@ -362,4 +358,3 @@ describe("classify group labels", () => {
     expect(groups.map((g) => g.group).sort()).toEqual(["classify:free", "free"]);
   });
 });
-

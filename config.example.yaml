@@ -8,9 +8,8 @@ plugins:
     cpa-key-policy:
       enabled: true
       priority: 10
-      # State and usage are a paired v3 dataset. Existing state keeps keys;
-      # non-empty models/classify_rules here may intentionally override those
-      # definitions during reconfigure.
+      # State and usage are a paired dataset. The lists below seed first boot;
+      # after state exists, managed keys/models/rules come only from state.
       state_file: "cpa-key-policy-state.json"
       usage_timezone: "Asia/Shanghai"
 

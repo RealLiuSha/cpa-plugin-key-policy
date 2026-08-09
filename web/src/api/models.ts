@@ -1,3 +1,4 @@
+import axios from "axios";
 import { apiClient, pluginPath } from "./client";
 import type { CatalogModel } from "../types";
 
@@ -26,9 +27,8 @@ export function formatTierLabel(
   return translated === key ? group : translated;
 }
 
-// CPA has no single "list providers+models" endpoint. We compose from several
-// management routes. The raw shapes are loose, so each adapter pulls strings out
-// defensively and feeds them into normalizeCatalog, which is the unit-tested core.
+// CPA has no single "list providers+models" endpoint. We compose its current
+// management DTOs and send auth-file credentials through the plugin catalog.
 
 const STATIC_CHANNELS = [
   "claude",
@@ -48,12 +48,10 @@ const STATIC_CHANNELS = [
 const TIERED_PROVIDERS = new Set(["codex", "antigravity"]);
 
 // "supported" is the synthetic group for a tiered-provider auth file whose
-// identity claim we couldn't read (e.g. an old codex file with no id_token).
+// identity claim is absent.
 // It must NOT be confused with a real tier: a key pinned to "team" never lands
 // on a "supported" file, and vice versa. The plugin Scheduler treats
 // "supported"/"unknown" as the untiered bucket.
-const SUPPORTED_GROUP = "supported";
-
 // Map the per-channel API-key management endpoints to the provider identity
 // used in the catalog. The endpoint returns its key list under a top-level
 // key named like the channel (e.g. { "gemini-api-key": [...] }); the provider
@@ -66,11 +64,9 @@ const API_KEY_CHANNELS: Record<string, string> = {
   "vertex-api-key": "vertex",
 };
 
-interface RawEntry {
-  provider?: string;
-  models?: unknown;
-  // group is only meaningful when populated from an auth-file source; static
-  // channels and openai-compat entries have no tier concept and leave it empty.
+export interface RawEntry {
+  provider: string;
+  models: string[];
   group?: string;
 }
 
@@ -83,10 +79,10 @@ export function normalizeCatalog(entries: RawEntry[]): CatalogModel[] {
   const seen = new Set<string>();
   const out: CatalogModel[] = [];
   for (const e of entries) {
-    const provider = (e.provider ?? "").toString().trim().toLowerCase();
+    const provider = e.provider.trim().toLowerCase();
     if (!provider) continue;
-    const group = (e.group ?? "").toString().trim().toLowerCase();
-    for (const m of toStrings(e.models)) {
+    const group = (e.group ?? "").trim().toLowerCase();
+    for (const m of e.models) {
       const model = m.trim();
       if (!model) continue;
       const key = provider + "" + group + "" + model.toLowerCase();
@@ -109,57 +105,43 @@ export function normalizeCatalog(entries: RawEntry[]): CatalogModel[] {
   return out;
 }
 
-function toStrings(v: unknown): string[] {
-  if (v == null) return [];
-  if (typeof v === "string") return [v];
-  if (Array.isArray(v)) {
-    return v
-      .map((x) => {
-        if (typeof x === "string") return x;
-        if (x && typeof x === "object") {
-          const mo = (x as Record<string, unknown>).model;
-          if (typeof mo === "string") return mo;
-          const id = (x as Record<string, unknown>).id;
-          if (typeof id === "string") return id;
-          const name = (x as Record<string, unknown>).name;
-          if (typeof name === "string") return name;
-        }
-        return "";
-      })
-      .filter((s) => s !== "");
+function objectValue(value: unknown, source: string): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`${source} must be an object`);
   }
-  if (typeof v === "object") {
-    // object map like { "model-a": {...}, "model-b": {...} }
-    return Object.keys(v as Record<string, unknown>);
-  }
-  return [];
+  return value as Record<string, unknown>;
 }
 
-// --- CPA response adapters (best-effort, defensive) ---
+function arrayValue(value: unknown, source: string): unknown[] {
+  if (value === null) return [];
+  if (!Array.isArray(value)) throw new Error(`${source} must be an array`);
+  return value;
+}
 
-function fromOpenAICompat(payload: unknown): RawEntry[] {
-  const root = payload as Record<string, unknown> | null;
-  const list = root?.["openai-compatibility"];
-  if (!Array.isArray(list)) return [];
-  return list.map((item) => {
-    const o = item as Record<string, unknown> | null;
-    // Prefer `name` (e.g. "opencode") as the provider identity on CPA's
-    // openai-compatibility entries, then fall back to provider/id.
-    const provider =
-      (o?.["name"] as string) ??
-      (o?.["provider"] as string) ??
-      (o?.["id"] as string) ??
-      "openai-compat";
-    return { provider, models: o?.["models"] };
+function stringValue(value: unknown, source: string): string {
+  if (typeof value !== "string" || value.trim() === "") {
+    throw new Error(`${source} must be a non-empty string`);
+  }
+  return value.trim();
+}
+
+export function fromOpenAICompat(payload: unknown): RawEntry[] {
+  const root = objectValue(payload, "openai-compatibility response");
+  return arrayValue(root["openai-compatibility"], "openai-compatibility").map((item, index) => {
+    const entry = objectValue(item, `openai-compatibility[${index}]`);
+    const provider = stringValue(entry.name, `openai-compatibility[${index}].name`);
+    const models = arrayValue(entry.models, `openai-compatibility[${index}].models`).map((model, modelIndex) => {
+      const definition = objectValue(model, `openai-compatibility[${index}].models[${modelIndex}]`);
+      return stringValue(definition.name, `openai-compatibility[${index}].models[${modelIndex}].name`);
+    });
+    return { provider, models };
   });
 }
 
 // One auth-file row from /v0/management/auth-files. We only need the file name
-// (to join against per-file models) and the tier identity claim (codex
-// id_token plan_type, antigravity tier). The ListAuthFiles response exposes
-// plan_type under id_token.claims.plan_type; the flat "account_type" sibling is
-// a fallback. Everything else is ignored.
-interface AuthFileMeta {
+// (to join against per-file models), the provider, and Codex's flat
+// id_token.plan_type claim. Everything else is ignored.
+export interface AuthFileMeta {
   name: string;
   // provider as reported by the auth-files LIST endpoint (e.g. "codex",
   // "antigravity", "claude"). The per-file /auth-files/models endpoint does NOT
@@ -171,54 +153,32 @@ interface AuthFileMeta {
   planType: string;
 }
 
-function fromAuthFiles(payload: unknown): AuthFileMeta[] {
-  const root = payload as Record<string, unknown> | null;
-  const list = root?.["auth-files"] ?? root?.["files"];
-  if (!Array.isArray(list)) return [];
-  const out: AuthFileMeta[] = [];
-  for (const item of list) {
-    const o = (item ?? {}) as Record<string, unknown>;
-    const name = ((o["name"] as string) ?? (o["id"] as string) ?? "").trim();
-    if (!name) continue;
-    const provider = ((o["provider"] as string) ?? (o["type"] as string) ?? "").trim().toLowerCase();
-    const planType = readPlanType(o);
-    out.push({ name, provider, planType });
-  }
-  return out;
+export function fromAuthFiles(payload: unknown): AuthFileMeta[] {
+  const root = objectValue(payload, "auth-files response");
+  return arrayValue(root.files, "auth-files.files").map((item, index) => {
+    const entry = objectValue(item, `auth-files.files[${index}]`);
+    return {
+      name: stringValue(entry.name, `auth-files.files[${index}].name`),
+      provider: stringValue(entry.provider, `auth-files.files[${index}].provider`).toLowerCase(),
+      planType: readPlanType(entry),
+    };
+  });
 }
 
 // Extract the tier/plan identity from an auth-files list entry. codex's
-// ListAuthFiles response flattens the id_token claims directly onto the
-// id_token object (id_token.plan_type), NOT under a nested "claims" key —
-// verified against a live CPA build. We still tolerate the nested shape
-// (id_token.claims.plan_type) defensively in case a future build restructures.
-// antigravity's tier identity isn't exposed on the list entry on current
-// builds; its files fall through to the "supported" bucket (the Scheduler
-// side reads Attributes["tier"] for antigravity, which is a separate path).
+// ListAuthFiles flattens Codex claims directly onto id_token. Antigravity tier
+// identity is not exposed by the current list DTO and therefore falls into the
+// plugin's supported bucket.
 // Returns "" when no recognizable claim is present (→ "supported" bucket).
 // Exported for unit testing against real ListAuthFiles payloads.
 export function readPlanType(entry: Record<string, unknown>): string {
   const idToken = entry["id_token"];
   if (idToken && typeof idToken === "object") {
     const tok = idToken as Record<string, unknown>;
-    // Primary path (verified live): plan_type flattened directly on id_token.
     const plan = tok["plan_type"];
     if (typeof plan === "string" && plan.trim() !== "") {
       return plan.trim().toLowerCase();
     }
-    // Defensive fallback: nested under a "claims" sub-object.
-    const claims = tok["claims"];
-    if (claims && typeof claims === "object") {
-      const nested = (claims as Record<string, unknown>)["plan_type"];
-      if (typeof nested === "string" && nested.trim() !== "") {
-        return nested.trim().toLowerCase();
-      }
-    }
-  }
-  // antigravity tier identity, when present, sits at the top level.
-  const tier = entry["tier"];
-  if (typeof tier === "string" && tier.trim() !== "") {
-    return tier.trim().toLowerCase();
   }
   return "";
 }
@@ -228,16 +188,41 @@ export function readPlanType(entry: Record<string, unknown>): string {
 // payload — the models objects report a per-model "type" ("openai" for codex
 // backed models) which is the upstream format, not the auth provider, and the
 // response itself has no top-level channel/provider field.
-function fromAuthFileModels(provider: string, payload: unknown): RawEntry[] {
-  const root = payload as Record<string, unknown> | null;
-  const models = root?.["models"] ?? root?.["available_models"];
-  return [{ provider, models }];
+export function fromAuthFileModels(provider: string, payload: unknown): RawEntry {
+  const root = objectValue(payload, "auth-file models response");
+  const models = arrayValue(root.models, "auth-file models.models").map((model, index) => {
+    const entry = objectValue(model, `auth-file models.models[${index}]`);
+    return stringValue(entry.id, `auth-file models.models[${index}].id`);
+  });
+  return { provider, models };
 }
 
-function fromModelDefinitions(channel: string, payload: unknown): RawEntry[] {
-  const root = payload as Record<string, unknown> | null;
-  const models = root?.["models"] ?? root?.["definitions"];
-  return [{ provider: channel, models }];
+export function fromModelDefinitions(channel: string, payload: unknown): RawEntry {
+  const root = objectValue(payload, "model-definitions response");
+  const responseChannel = stringValue(root.channel, "model-definitions.channel").toLowerCase();
+  if (responseChannel !== channel.toLowerCase()) {
+    throw new Error(`model-definitions channel mismatch: got ${responseChannel}, want ${channel}`);
+  }
+  const models = arrayValue(root.models, "model-definitions.models").map((model, index) => {
+    const entry = objectValue(model, `model-definitions.models[${index}]`);
+    return stringValue(entry.id, `model-definitions.models[${index}].id`);
+  });
+  return { provider: responseChannel, models };
+}
+
+function fromPluginCatalog(payload: unknown): RawEntry[] {
+  const root = objectValue(payload, "plugin catalog response");
+  return arrayValue(root.entries, "plugin catalog.entries").map((item, index) => {
+    const entry = objectValue(item, `plugin catalog.entries[${index}]`);
+    const provider = stringValue(entry.provider, `plugin catalog.entries[${index}].provider`);
+    const models = arrayValue(entry.models, `plugin catalog.entries[${index}].models`).map((model, modelIndex) =>
+      stringValue(model, `plugin catalog.entries[${index}].models[${modelIndex}]`),
+    );
+    const group = entry.group === undefined
+      ? undefined
+      : stringValue(entry.group, `plugin catalog.entries[${index}].group`);
+    return group ? { provider, group, models } : { provider, models };
+  });
 }
 
 // Is the *-api-key list at `endpoint` non-empty? CPA's Get<Key> handlers return
@@ -248,10 +233,8 @@ function fromModelDefinitions(channel: string, payload: unknown): RawEntry[] {
 function apiKeyProviderIfConfigured(endpoint: string, payload: unknown): string {
   const provider = API_KEY_CHANNELS[endpoint];
   if (!provider) return "";
-  const root = payload as Record<string, unknown> | null;
-  if (!root) return "";
-  const list = root[endpoint];
-  return Array.isArray(list) && list.length > 0 ? provider : "";
+  const root = objectValue(payload, `${endpoint} response`);
+  return arrayValue(root[endpoint], `${endpoint} response.${endpoint}`).length > 0 ? provider : "";
 }
 
 // Filter the collected raw entries down to those that should be visible in the
@@ -294,11 +277,6 @@ export function filterByConfigured(
   return out;
 }
 
-// Fetch the composed catalog. Failures of individual sources are swallowed so
-// that one unavailable endpoint doesn't blank the whole picker. A 401/403 here
-// is real (bad key) and surfaces through the shared client as a forced
-// re-login — that's intended; we don't mask auth failures.
-//
 // `selectedProviders` is the set of providers (lowercased) the caller already
 // has model rules for (edit-mode prefill). Providers in this set stay visible
 // even when unconfigured, so the user can see and uncheck their rows. New-key
@@ -320,30 +298,12 @@ export async function fetchCatalog(
   const selected = new Set<string>();
   for (const p of selectedProviders ?? []) selected.add(p.toLowerCase());
 
-  const safe = async <T>(p: Promise<{ data: T }>, apply: (d: T) => void) => {
-    try {
-      const { data } = await p;
-      apply(data);
-    } catch {
-      /* skip unavailable source */
-    }
-  };
-
-  await safe(
-    c.get("/v0/management/openai-compatibility"),
-    (d) => {
-      const compatEntries = fromOpenAICompat(d);
-      // Every provider listed under openai-compatibility is, by construction,
-      // one the user configured a credential for (the list only contains
-      // configured compat entries). Record that so filterByConfigured doesn't
-      // drop their bare entries as "unconfigured".
-      for (const e of compatEntries) {
-        const p = (e.provider ?? "").toLowerCase();
-        if (p) configuredProviders.add(p);
-      }
-      entries.push(...compatEntries);
-    },
-  );
+  const compatResponse = await c.get("/v0/management/openai-compatibility");
+  const compatEntries = fromOpenAICompat(compatResponse.data);
+  for (const entry of compatEntries) {
+    configuredProviders.add(entry.provider.toLowerCase());
+  }
+  entries.push(...compatEntries);
 
   // Per-channel API-key endpoints. These responses carry their key list under a
   // top-level "<channel>-api-key" array (NOT under "models"/"keys"), so
@@ -351,89 +311,59 @@ export async function fetchCatalog(
   // the user has configured an API-key credential, marking the mapped provider
   // as configured when the list is non-empty.
   for (const ch of Object.keys(API_KEY_CHANNELS)) {
-    await safe(c.get("/v0/management/" + ch), (d) => {
-      const provider = apiKeyProviderIfConfigured(ch, d);
-      if (provider) configuredProviders.add(provider);
-    });
+    const response = await c.get("/v0/management/" + ch);
+    const provider = apiKeyProviderIfConfigured(ch, response.data);
+    if (provider) configuredProviders.add(provider);
   }
 
   // auth-files: fetch file list + per-file models, then POST to the plugin
   // /catalog so classify rules + built-in tiers are applied server-side
   // (custom groups come back as classify:<name>). Compat/API-key channels
   // stay flat and are merged separately above/below.
-  await safe(c.get("/v0/management/auth-files"), async (d) => {
-    const metas = fromAuthFiles(d);
-    for (const m of metas) {
-      if (m.provider) configuredProviders.add(m.provider);
-    }
-    const perFile = await Promise.all(
-      metas.map((m) =>
-        c
-          .get("/v0/management/auth-files/models", { params: { name: m.name } })
-          .then((r) => ({ meta: m, data: r.data }))
-          .catch(() => null),
-      ),
-    );
+  const authFilesResponse = await c.get("/v0/management/auth-files");
+  const metas = fromAuthFiles(authFilesResponse.data);
+  for (const meta of metas) configuredProviders.add(meta.provider);
 
-    const credentials: {
-      id: string;
-      provider: string;
-      attributes?: Record<string, string>;
-      models: string[];
-    }[] = [];
+  const perFile = await Promise.all(
+    metas.map(async (meta) => {
+      const response = await c.get("/v0/management/auth-files/models", { params: { name: meta.name } });
+      return { meta, entry: fromAuthFileModels(meta.provider, response.data) };
+    }),
+  );
+  const credentials = perFile
+    .filter(({ entry }) => entry.models.length > 0)
+    .map(({ meta, entry }) => ({
+      id: meta.name,
+      provider: meta.provider,
+      attributes: meta.planType ? { plan_type: meta.planType } : undefined,
+      models: entry.models,
+    }));
 
-    for (const res of perFile) {
-      if (!res) continue;
-      const fileEntries = fromAuthFileModels(res.meta.provider, res.data);
-      const models = toStrings(fileEntries[0]?.models);
-      if (!res.meta.provider || models.length === 0) continue;
-      const attributes: Record<string, string> = {};
-      if (res.meta.planType) attributes.plan_type = res.meta.planType;
-      credentials.push({
-        id: res.meta.name,
-        provider: res.meta.provider,
-        attributes: Object.keys(attributes).length ? attributes : undefined,
-        models,
-      });
-    }
-
-    if (credentials.length === 0) return;
-
-    // Prefer plugin /catalog (classify + builtin). Fall back to the legacy
-    // client-side tier split if the plugin route is unavailable.
-    try {
-      const { data } = await c.post<{ entries?: RawEntry[] }>(pluginPath("/catalog"), {
-        credentials,
-      });
-      for (const e of data.entries ?? []) {
-        const provider = (e.provider ?? "").toLowerCase();
-        if (!provider) continue;
-        entries.push(e);
-        // Any grouped auth-file provider suppresses bare static definitions
-        // for that provider (same as the old tiered-from-auth path).
-        if (e.group) authFileTieredProviders.add(provider);
-        // Tiered providers always suppress bare static even if some files
-        // came back flat (empty group) — mirrors prior TIERED_PROVIDERS logic.
-        if (TIERED_PROVIDERS.has(provider)) authFileTieredProviders.add(provider);
-      }
-    } catch {
-      for (const cred of credentials) {
-        const provider = cred.provider.toLowerCase();
-        const e: RawEntry = { provider, models: cred.models };
-        if (TIERED_PROVIDERS.has(provider)) {
-          e.group = cred.attributes?.plan_type || SUPPORTED_GROUP;
-          authFileTieredProviders.add(provider);
-        }
-        entries.push(e);
+  if (credentials.length > 0) {
+    const catalogResponse = await c.post(pluginPath("/catalog"), { credentials });
+    for (const entry of fromPluginCatalog(catalogResponse.data)) {
+      const provider = entry.provider.toLowerCase();
+      entries.push(entry);
+      if (entry.group || TIERED_PROVIDERS.has(provider)) {
+        authFileTieredProviders.add(provider);
       }
     }
-  });
+  }
 
   for (const ch of STATIC_CHANNELS) {
-    await safe(
-      c.get("/v0/management/model-definitions/" + ch),
-      (d) => entries.push(...fromModelDefinitions(ch, d)),
-    );
+    try {
+      const response = await c.get("/v0/management/model-definitions/" + ch);
+      entries.push(fromModelDefinitions(ch, response.data));
+    } catch (error) {
+      if (
+        axios.isAxiosError(error) &&
+        error.response?.status === 400 &&
+        objectValue(error.response.data, "model-definitions error").error === "unknown channel"
+      ) {
+        continue;
+      }
+      throw error;
+    }
   }
 
   const filtered = filterByConfigured(
@@ -446,10 +376,9 @@ export async function fetchCatalog(
 }
 
 // A picker group: a provider, optionally split by tier (codex free / team /
-// supported…). When group is undefined the picker renders the provider as a
-// flat group (legacy behavior). When group is set, the provider's models are
-// shown under a tier-labeled subgroup so the user can authorize a model under
-// a specific tier — the plugin Scheduler honors the chosen tier at runtime.
+// supported…). When group is undefined the picker renders a flat provider
+// group. When group is set, the provider's models are shown under a tier label;
+// the plugin Scheduler honors the chosen tier at runtime.
 export interface CatalogGroup {
   provider: string;
   group?: string;

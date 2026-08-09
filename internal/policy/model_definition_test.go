@@ -9,17 +9,9 @@ import (
 	"time"
 )
 
-func TestV3ConfigRejectsRemovedRouteFields(t *testing.T) {
-	for name, raw := range map[string]string{
-		"top-level route table": `model_routes: []`,
-		"key embedded route":    "models:\n  - name: fast\n    free: true\n    targets:\n      - provider: codex\n        target_model: gpt\nkeys:\n  - id: k\n    routes:\n      - name: fast",
-		"direct model rule":     "models:\n  - name: fast\n    free: true\n    targets:\n      - provider: codex\n        target_model: gpt\nkeys:\n  - id: k\n    models:\n      - name: fast\n        provider: codex",
-	} {
-		t.Run(name, func(t *testing.T) {
-			if _, err := DecodeConfig([]byte(raw)); err == nil {
-				t.Fatal("expected legacy field to be rejected")
-			}
-		})
+func TestConfigRejectsUnknownField(t *testing.T) {
+	if _, err := DecodeConfig([]byte("unexpected_routes: []")); err == nil {
+		t.Fatal("expected unknown field to be rejected")
 	}
 }
 
