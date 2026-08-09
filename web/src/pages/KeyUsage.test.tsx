@@ -29,8 +29,8 @@ describe("KeyUsage history and window controls", () => {
       daily_limit_usd: 5,
       weekly_limit_usd: 20,
       monthly_limit_usd: 50,
-      aliases: [{
-        alias: "fast", in_config: true,
+      models: [{
+        name: "fast", free: false, in_config: true,
         daily: { total_usd: 1 },
         weekly: { total_usd: 4 },
         monthly: { total_usd: 9 },
@@ -68,5 +68,7 @@ describe("KeyUsage history and window controls", () => {
     const monthly = Array.from(container.querySelectorAll<HTMLButtonElement>('[role="tab"]')).find((button) => button.textContent === "keyUsage.tabMonthly");
     await act(async () => { monthly!.click(); });
     expect(container.textContent).toContain("$9.00");
+    expect(container.textContent).toContain("keyUsage.colModel");
+    expect(container.textContent).not.toContain("keyUsage.colProvider");
   });
 });

@@ -88,7 +88,7 @@ func IsModelsEndpoint(path string) bool {
 // or video generation endpoints. CPA's XAI executor does not emit usage records
 // for these (executeImages/executeVideos lack a UsageReporter), so the plugin
 // cannot bill them via the normal usage.handle path. We pre-charge per_call
-// aliases on these paths at access time as a workaround.
+// public models on these paths at access time as a workaround.
 func IsImageVideoEndpoint(path string) bool {
 	path = strings.TrimRight(strings.TrimSpace(path), "/")
 	if path == "" {

@@ -30,6 +30,7 @@ vi.mock("../i18n", () => ({
 
 import KeyList, {
   KEY_LIST_PAGE_SIZE,
+  accountingBoundaryKind,
   filterKeys,
   formatResetCountdown,
   isAnyLimitHit,
@@ -46,7 +47,7 @@ const baseUsage = {
   daily_limit_usd: 10,
   weekly_limit_usd: 50,
   monthly_limit_usd: 100,
-  daily_reset_at: "2099-08-09T00:00:00+08:00",
+  next_accounting_boundary_at: "2099-08-09T00:00:00+08:00",
   timezone: "Asia/Shanghai",
 };
 
@@ -57,8 +58,8 @@ const key: KeyPublic = {
   key_preview: "cpa_te...am-a",
   rpm: 60,
   models: [
-    { alias: "gpt-4o", provider: "openai", target_model: "gpt-4o" },
-    { alias: "claude", provider: "anthropic", target_model: "claude-3" },
+    { name: "gpt-4o", daily_limit_usd: 0 },
+    { name: "claude", daily_limit_usd: 0 },
   ],
   daily_limit_usd: 10,
   weekly_limit_usd: 50,
@@ -69,7 +70,7 @@ const key: KeyPublic = {
     daily_limit_usd: 10,
     weekly_limit_usd: 50,
     monthly_limit_usd: 100,
-    daily_reset_at: "2099-08-09T00:00:00+08:00",
+    next_accounting_boundary_at: "2099-08-09T00:00:00+08:00",
     timezone: "Asia/Shanghai",
   },
 };
@@ -120,16 +121,23 @@ describe("isLimitHit / isAnyLimitHit", () => {
   });
 });
 
-describe("sortKeys / reset countdown", () => {
+describe("sortKeys / accounting boundary", () => {
   const a = makeKey("a", { updated_at: "2026-08-01T00:00:00Z", usage: { ...baseUsage, daily_usd: 2 } });
   const b = makeKey("b", { updated_at: "2026-08-02T00:00:00Z", usage: { ...baseUsage, daily_usd: 8, daily_limit_usd: 10 } });
-  it("sorts after filtering by daily, ratio, and activity", () => {
+  it("sorts after filtering by daily, ratio, and configuration update time", () => {
     expect(sortKeys([a, b], "daily").map((item) => item.id)).toEqual(["b", "a"]);
     expect(sortKeys([a, b], "ratio").map((item) => item.id)).toEqual(["b", "a"]);
     expect(sortKeys([a, b], "active").map((item) => item.id)).toEqual(["b", "a"]);
   });
   it("formats the next natural-day boundary countdown", () => {
     expect(formatResetCountdown("2026-08-08T01:02:03Z", Date.parse("2026-08-08T00:00:00Z"))).toBe("01:02:03");
+  });
+  it("selects daily, weekly, monthly, and unlimited consequences", () => {
+    expect(accountingBoundaryKind(makeKey("key-day", { usage: { ...baseUsage, daily_limit_usd: 1, weekly_limit_usd: 0, monthly_limit_usd: 0 } }))).toBe("daily");
+    expect(accountingBoundaryKind(makeKey("model-day", { models: [{ name: "fast", daily_limit_usd: 1 }], usage: { ...baseUsage, daily_limit_usd: 0, weekly_limit_usd: 50, monthly_limit_usd: 100 } }))).toBe("daily");
+    expect(accountingBoundaryKind(makeKey("week", { usage: { ...baseUsage, daily_limit_usd: 0, weekly_limit_usd: 50, monthly_limit_usd: 100 } }))).toBe("weekly");
+    expect(accountingBoundaryKind(makeKey("month", { usage: { ...baseUsage, daily_limit_usd: 0, weekly_limit_usd: 0, monthly_limit_usd: 100 } }))).toBe("monthly");
+    expect(accountingBoundaryKind(makeKey("none", { usage: { ...baseUsage, daily_limit_usd: 0, weekly_limit_usd: 0, monthly_limit_usd: 0 } }))).toBe("unlimited");
   });
 });
 
@@ -199,8 +207,7 @@ describe("KeyList table and more menu", () => {
       "keys.colPreview",
       "keys.colRpm",
       "keys.colUsage · Asia/Shanghai",
-      "keys.colModels",
-      "keys.colAliases",
+      "keys.colAvailableModels",
       "keys.colActions",
     ]);
 
@@ -214,7 +221,7 @@ describe("KeyList table and more menu", () => {
     expect(row!.textContent).toContain("gpt-4o");
     expect(row!.textContent).toContain("claude");
     expect(row!.textContent).toContain("usage.last7Days");
-    expect(row!.textContent).toContain("usage.nextReset");
+    expect(row!.textContent).toContain("usage.boundaryDaily");
     expect(table!.querySelectorAll("thead th")[4].getAttribute("title")).toBe("usage.windowHelp Asia/Shanghai");
     expect(container.querySelector('[data-testid="last-updated-desktop"]')?.textContent).not.toContain("—");
   });
@@ -303,14 +310,15 @@ describe("KeyList table and more menu", () => {
     expect(listKeys).toHaveBeenCalledTimes(2);
   });
 
-  it("shows rolling-window wording and countdown for an unlimited mobile key", async () => {
+  it("shows unlimited wording without a misleading reset countdown", async () => {
     (listKeys as ReturnType<typeof vi.fn>).mockResolvedValue([makeKey("unlimited", {
       usage: { ...baseUsage, daily_limit_usd: 0, weekly_limit_usd: 0, monthly_limit_usd: 0 },
     })]);
     await renderList();
     const card = container.querySelector('[data-testid="keycard-unlimited"]');
     expect(card?.textContent).toContain("usage.last7Days");
-    expect(card?.textContent).toContain("usage.nextReset");
+    expect(card?.textContent).toContain("usage.boundaryUnlimited");
+    expect(card?.textContent).not.toContain("2099");
   });
 
   it("exposes edit and detail links with correct routes", async () => {
@@ -541,7 +549,7 @@ describe("KeyList table and more menu", () => {
     const many = Array.from({ length: 12 }, (_, i) =>
       makeKey(`key-${String(i + 1).padStart(2, "0")}`, {
         name: i === 0 ? "Alpha Team" : `Key ${i + 1}`,
-        models: i === 1 ? [{ alias: "special-model", provider: "p", target_model: "m" }] : [],
+        models: i === 1 ? [{ name: "special-model" }] : [],
       }),
     );
     (listKeys as ReturnType<typeof vi.fn>).mockResolvedValue(many);
@@ -600,12 +608,12 @@ describe("KeyList table and more menu", () => {
 
 describe("filterKeys and paginateKeys", () => {
   const sample = [
-    makeKey("alpha", { name: "Alpha", models: [{ alias: "gpt-4o", provider: "o", target_model: "g" }] }),
+    makeKey("alpha", { name: "Alpha", models: [{ name: "gpt-4o" }] }),
     makeKey("beta", { name: "Beta", key_preview: "cpa_be...ta" }),
     makeKey("gamma", { name: "Other" }),
   ];
 
-  it("matches id, name, preview, and model alias", () => {
+  it("matches id, name, preview, and public model name", () => {
     expect(filterKeys(sample, "ALP").map((k) => k.id)).toEqual(["alpha"]);
     expect(filterKeys(sample, "beta").map((k) => k.id)).toEqual(["beta"]);
     expect(filterKeys(sample, "cpa_be").map((k) => k.id)).toEqual(["beta"]);

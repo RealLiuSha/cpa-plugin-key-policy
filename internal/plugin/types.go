@@ -22,7 +22,7 @@ const (
 
 	// MethodSchedulerPick is the host->plugin call that asks this plugin to
 	// choose an auth candidate among those available for a routed provider,
-	// before the host's built-in scheduler runs. We use it to honor a ModelRule's
+	// before the host's built-in scheduler runs. We use it to honor a model target's
 	// Group: when a downstream key pinned a tier (e.g. codex "team"), we filter
 	// candidates by their plan_type attribute so the request only ever lands on
 	// an auth file of that tier. Returning Handled=false falls back to the host
@@ -43,7 +43,7 @@ const (
 const (
 	PluginID   = "cpa-key-policy"
 	PluginName = "cpa-key-policy"
-	Version    = "0.4.4"
+	Version    = "0.5.0"
 )
 
 type Envelope struct {
@@ -191,9 +191,8 @@ type ResponseInterceptRequest struct {
 type UsageHandleRequest struct {
 	// Model is the resolved upstream model id.
 	Model string `json:"Model"`
-	// Alias is the client-requested model name (what the caller passed in the
-	// request body's "model" field), when one was used. This is what we match
-	// against our ModelRule aliases to price the request.
+	// Alias is fixed by the host ABI. The plugin converts it to requestedModel
+	// at the usage.handle boundary and does not expose it to the policy domain.
 	Alias string `json:"Alias"`
 	// APIKey is the client's downstream key (the cpa_... value), when available.
 	// We hash it to find the owning key config — same lookup path as auth.

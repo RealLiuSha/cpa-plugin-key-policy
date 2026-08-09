@@ -6,7 +6,7 @@ import (
 )
 
 // ClassifyGroupPrefix is applied to user-defined classify rule group names when
-// they are written into ModelRule.Group / alias targets / catalog entries, so
+// they are written into model targets and catalog entries, so
 // they never collide with built-in plan_type/tier values like "free" or "team".
 //
 // Rule storage keeps the bare name (e.g. "vip"); runtime matching and the

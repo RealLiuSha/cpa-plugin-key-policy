@@ -1,7 +1,7 @@
 import { apiClient, pluginPath } from "./client";
 import type { CatalogModel } from "../types";
 
-/** Prefix applied to custom classify groups in catalog entries / ModelRule.group. */
+/** Prefix applied to custom credential groups in catalog entries / ModelTarget.group. */
 export const CLASSIFY_GROUP_PREFIX = "classify:";
 
 /** True when group is a custom classify group (classify:name). */
@@ -10,7 +10,7 @@ export function isClassifyGroup(group: string | undefined | null): boolean {
 }
 
 /**
- * Human label for a catalog/ModelRule group. Custom classify groups render as
+ * Human label for a catalog/model-target group. Custom classify groups render as
  * "自定义 · name" (via picker.tier.classify); built-in tiers use picker.tier.*.
  */
 export function formatTierLabel(

@@ -1,0 +1,102 @@
+{
+  "key_usage": {
+    "daily_limit_usd": 10,
+    "key_id": "team-a",
+    "key_name": "Team A",
+    "models": [
+      {
+        "billing_mode": "tokens",
+        "daily": {
+          "call_count": 2,
+          "input_tokens": 1000,
+          "output_tokens": 200,
+          "total_usd": 1.5,
+          "window_start": "2026-08-08T00:00:00+08:00"
+        },
+        "free": false,
+        "in_config": true,
+        "monthly": {
+          "call_count": 2,
+          "input_tokens": 1000,
+          "output_tokens": 200,
+          "total_usd": 1.5,
+          "window_start": "2026-07-10T00:00:00+08:00"
+        },
+        "name": "Chat",
+        "weekly": {
+          "call_count": 2,
+          "input_tokens": 1000,
+          "output_tokens": 200,
+          "total_usd": 1.5,
+          "window_start": "2026-08-02T00:00:00+08:00"
+        }
+      }
+    ],
+    "monthly_limit_usd": 100,
+    "weekly_limit_usd": 50
+  },
+  "keys": [
+    {
+      "created_at": "2026-08-01T00:00:00Z",
+      "daily_limit_usd": 10,
+      "enabled": true,
+      "id": "team-a",
+      "key_preview": "cpa_aaa...aaaaa",
+      "models": [
+        {
+          "daily_limit_usd": 5,
+          "name": "Chat"
+        }
+      ],
+      "monthly_limit_usd": 100,
+      "name": "Team A",
+      "rpm": 60,
+      "updated_at": "2026-08-08T00:00:00Z",
+      "usage": {
+        "daily_call_count": 2,
+        "daily_input_tokens": 1000,
+        "daily_limit_usd": 10,
+        "daily_usd": 1.5,
+        "limits_changed_at": "2026-08-01T00:00:00Z",
+        "monthly_call_count": 2,
+        "monthly_input_tokens": 1000,
+        "monthly_limit_usd": 100,
+        "monthly_usd": 1.5,
+        "next_accounting_boundary_at": "2026-08-09T00:00:00+08:00",
+        "soft_limit_hit": false,
+        "timezone": "Asia/Shanghai",
+        "weekly_call_count": 2,
+        "weekly_input_tokens": 1000,
+        "weekly_limit_usd": 50,
+        "weekly_usd": 1.5
+      },
+      "weekly_limit_usd": 50
+    }
+  ],
+  "models": [
+    {
+      "billing_mode": "tokens",
+      "cache_read_price_per_million": 0.1,
+      "dispatch": "round-robin",
+      "free": false,
+      "input_price_per_million": 1,
+      "name": "Chat",
+      "output_price_per_million": 2,
+      "ref_count": 1,
+      "ref_keys": [
+        "team-a"
+      ],
+      "targets": [
+        {
+          "group": "team",
+          "provider": "codex",
+          "target_model": "gpt-5.6"
+        },
+        {
+          "provider": "openai",
+          "target_model": "gpt-5.6"
+        }
+      ]
+    }
+  ]
+}

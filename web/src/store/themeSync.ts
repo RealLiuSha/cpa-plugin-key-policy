@@ -115,7 +115,7 @@ export function _teardownThemeSync(): void {
   document.documentElement.removeAttribute(THEME_ATTR);
 }
 
-// For tests: expose the resolver so cases can assert mapping without a live parent.
+// For tests: expose the resolver so cases can assert theme resolution without a live parent.
 export function _resolveParentTheme(): AppliedTheme | null {
   return readParentTheme();
 }

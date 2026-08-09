@@ -10,36 +10,14 @@ const (
 	prechargeMaxQueue = 1024
 )
 
-// RecordUsage bills a finalized usage record delivered by the host via the
-// usage.handle plugin call. CPA parses the token counts itself (including the
-// final usage frame of a streaming response) before invoking us, so we receive
-// ready-made Input/Output token counts rather than a body to parse. This is
-// the billing entry point that covers streaming responses — the host never
-// invokes response.intercept_after on the streaming path. Best-effort: unknown
-// keys or aliases cost nothing.
-//
-// failed reports whether the upstream request failed (non-2xx). Per-call
-// billing only charges on success (failed=false); token billing is implicitly
-// zero on failure (no tokens reported). Failed requests never increment
-// CallCount.
-//
-// key resolution: the host's UsageRecord.APIKey is NOT the client's plaintext
-// secret — CPA stores our auth result's Principal (set to key.ID) into the
-// request context as "userApiKey" and forwards that. So we match by key.ID
-// first, then fall back to a plaintext-secret match for forward compatibility
-// (in case a future CPA build forwards the raw secret).
-//
-// alias resolution: prefer the client-requested Alias (what the caller put in
-// the request body's "model" field); fall back to the resolved upstream Model.
-func (s *Store) RecordUsage(apiKeyOrID, alias, model string, failed bool, detail UsageDetail) float64 {
-	return s.recordUsage(apiKeyOrID, alias, model, failed, detail, true)
+func (s *Store) RecordUsage(apiKeyOrID, requestedModel, targetModel string, failed bool, detail UsageDetail) float64 {
+	return s.recordUsage(apiKeyOrID, requestedModel, targetModel, failed, detail, true)
 }
 
-func (s *Store) recordUsage(apiKeyOrID, alias, model string, failed bool, detail UsageDetail, consumePrecharge bool) float64 {
+func (s *Store) recordUsage(apiKeyOrID, requestedModel, targetModel string, failed bool, detail UsageDetail, consumePrecharge bool) float64 {
 	if !s.Enabled() {
 		return 0
 	}
-	// Match by ID first (the documented wire value), then by plaintext secret.
 	key := s.findByID(apiKeyOrID)
 	if key == nil || !key.Enabled {
 		key = s.findBySecret(apiKeyOrID)
@@ -47,92 +25,71 @@ func (s *Store) recordUsage(apiKeyOrID, alias, model string, failed bool, detail
 	if key == nil || !key.Enabled {
 		return 0
 	}
-	_, usageLedger := s.runtimeComponents()
-	// Resolve the alias to price against. Prefer the client-requested alias
-	// (matches what the user configured prices for); fall back to the upstream
-	// model id, which equals the alias for this plugin (alias == target_model).
-	resolved := strings.TrimSpace(alias)
-	if resolved == "" {
-		resolved = strings.TrimSpace(model)
+	publicModel := strings.TrimSpace(requestedModel)
+	if publicModel == "" {
+		publicModel = strings.TrimSpace(targetModel)
 	}
-	if resolved == "" {
-		return 0
-	}
-	// Canonicalize to the configured rule.Alias spelling so pure case variants
-	// share one ByAlias bucket. Unknown aliases keep existing zero-cost /
-	// reject-at-auth semantics and must not create forged empty ledger rows.
-	rule, ok := key.ModelForAlias(resolved)
+	model, ok := s.modelForKey(key, publicModel)
 	if !ok {
 		return 0
 	}
-	resolved = rule.Alias
+	publicModel = model.Name
+	target := model.Targets[0]
+	for _, candidate := range model.Targets {
+		if strings.EqualFold(candidate.TargetModel, targetModel) {
+			target = candidate
+			break
+		}
+	}
+	route := resolveModelRoute(model, target)
+	_, usageLedger := s.runtimeComponents()
 
-	// Per-call billing: a fixed USD charge per SUCCESSFUL request, independent
-	// of token counts. Failed requests are not charged and don't count. A
-	// PerCallUSD of 0 is allowed (free calls); CallCount still increments so the
-	// UI can report call volume. The token-price fields on the rule are dormant
-	// under this mode.
-	if strings.EqualFold(rule.BillingMode, "per_call") {
+	if route.BillingMode == "per_call" {
 		if failed {
 			return 0
 		}
-		if consumePrecharge && s.consumePrecharge(key.ID, resolved) {
+		if consumePrecharge && s.consumePrecharge(key.ID, publicModel) {
 			return 0
 		}
-		cost := rule.PerCallUSD
-		if cost < 0 {
-			cost = 0
-		}
+		cost := route.PerCallUSD
 		if usageLedger != nil {
-			// callCount=1 regardless of cost (even free calls count toward volume).
-			usageLedger.RecordCost(key.ID, resolved, cost, 0, 0, 0, 0, 1)
+			usageLedger.RecordCost(key.ID, publicModel, cost, 0, 0, 0, 0, 1)
 		}
 		return cost
 	}
 
-	usageFound := detail.InputTokens > 0 || detail.OutputTokens > 0
-	if !usageFound {
+	if detail.InputTokens <= 0 && detail.OutputTokens <= 0 {
 		return 0
 	}
-	// Cache-aware billing: the usage.handle detail carries cache-read / cached
-	// token counts. We price cache-hit input tokens at the alias's cache-read
-	// price (falling back to the input price when none is configured), with
-	// provider-specific semantics for whether cache hits sit inside or outside
-	// InputTokens. The owning rule's provider selects the semantics.
-	provider := rule.Provider
-	inputPerMillion, outputPerMillion, cacheReadPerMillion, priced := key.PriceForAlias(resolved)
-	cost, cacheCost, cacheReadTokens := ComputeCacheCostBreakdown(provider, inputPerMillion, outputPerMillion, cacheReadPerMillion, priced, detail)
-	// Non-cache input tokens billed at the input price — the denominator partner
-	// for hit-rate = cacheRead / (cacheRead + input). Must mirror the biller's
-	// internal split so the reported rate matches the actual pricing.
+	cost, cacheCost, cacheReadTokens := ComputeCacheCostBreakdown(
+		route.Provider,
+		route.InputPricePerMillion,
+		route.OutputPricePerMillion,
+		route.CacheReadPricePerMillion,
+		true,
+		detail,
+	)
 	var nonCacheInput int64
-	if priced && (detail.InputTokens > 0 || detail.OutputTokens > 0) {
-		if isCacheAdditiveProvider(provider) {
-			nonCacheInput = detail.InputTokens + detail.CacheCreationTokens
-		} else {
-			cr := detail.CacheReadTokens
-			if cr == 0 {
-				cr = detail.CachedTokens
-			}
-			if cr > detail.InputTokens {
-				cr = detail.InputTokens
-			}
-			nonCacheInput = detail.InputTokens - cr
+	if isCacheAdditiveProvider(route.Provider) {
+		nonCacheInput = detail.InputTokens + detail.CacheCreationTokens
+	} else {
+		cacheRead := detail.CacheReadTokens
+		if cacheRead == 0 {
+			cacheRead = detail.CachedTokens
 		}
+		if cacheRead > detail.InputTokens {
+			cacheRead = detail.InputTokens
+		}
+		nonCacheInput = detail.InputTokens - cacheRead
 	}
-	if priced && usageFound && usageLedger != nil {
-		// Record even when cost == 0 (priced-but-free alias: all token prices 0).
-		// Token (input/output/cache) + call counters must advance so the UI
-		// reports usage volume and hit-rate; USD stays 0. Previously `cost > 0`
-		// dropped free-but-priced requests entirely, hiding their volume.
-		// callCount=1: this was a successful, token-billed request.
-		usageLedger.RecordCost(key.ID, resolved, cost, cacheCost, cacheReadTokens, nonCacheInput, int64(detail.OutputTokens), 1)
+	if usageLedger != nil {
+		usageLedger.RecordCost(key.ID, publicModel, cost, cacheCost, cacheReadTokens, nonCacheInput, detail.OutputTokens, 1)
 	}
 	return cost
 }
 
-func prechargeKey(keyID, alias string) string {
-	return strings.ToLower(strings.TrimSpace(keyID)) + "\x00" + strings.ToLower(strings.TrimSpace(alias))
+func prechargeKey(keyID, model string) string {
+	return strings.ToLower(strings.TrimSpace(keyID)) + "\x00" + strings.ToLower(strings.TrimSpace(model))
 }
 
 func (s *Store) billingNow() time.Time {
@@ -145,8 +102,8 @@ func (s *Store) billingNow() time.Time {
 	return time.Now()
 }
 
-func (s *Store) rememberPrecharge(keyID, alias string) {
-	key := prechargeKey(keyID, alias)
+func (s *Store) rememberPrecharge(keyID, model string) {
+	key := prechargeKey(keyID, model)
 	if key == "\x00" {
 		return
 	}
@@ -159,7 +116,7 @@ func (s *Store) rememberPrecharge(keyID, alias string) {
 		first++
 	}
 	queue = append(queue[first:], now)
-	// TRADEOFF: Retain at most 1024 unmatched precharges per key and alias, revisit if legitimate two-minute concurrency approaches this ceiling.
+	// TRADEOFF: Retain at most 1024 unmatched precharges per key and model, revisit if legitimate two-minute concurrency approaches this ceiling.
 	if len(queue) > prechargeMaxQueue {
 		queue = queue[len(queue)-prechargeMaxQueue:]
 	}
@@ -167,8 +124,8 @@ func (s *Store) rememberPrecharge(keyID, alias string) {
 	s.mu.Unlock()
 }
 
-func (s *Store) consumePrecharge(keyID, alias string) bool {
-	key := prechargeKey(keyID, alias)
+func (s *Store) consumePrecharge(keyID, model string) bool {
+	key := prechargeKey(keyID, model)
 	if key == "\x00" {
 		return false
 	}
@@ -186,7 +143,7 @@ func (s *Store) consumePrecharge(keyID, alias string) bool {
 		delete(s.precharges, key)
 		return false
 	}
-	// TRADEOFF: FIFO key-alias matching can pair concurrent requests imprecisely, revisit when usage.handle exposes a stable request id
+	// TRADEOFF: FIFO key-model matching can pair concurrent requests imprecisely, revisit when usage.handle exposes a stable request id
 	queue = queue[1:]
 	if len(queue) == 0 {
 		delete(s.precharges, key)

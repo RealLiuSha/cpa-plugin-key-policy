@@ -19,6 +19,7 @@ func newTestStore(t *testing.T) (*Store, string) {
 	err = store.Configure(Config{
 		Enabled:   true,
 		StateFile: filepath.Join(t.TempDir(), "state.json"),
+		Models:    []ModelDefinition{freeTestModel("fast", "codex", "gpt-5-codex")},
 		Keys: []KeyConfig{
 			{
 				ID:         "team-a",
@@ -27,9 +28,7 @@ func newTestStore(t *testing.T) (*Store, string) {
 				KeyHash:    hash,
 				KeyPreview: PreviewKey(plain),
 				RPM:        1,
-				Models: []ModelRule{
-					{Alias: "fast", Provider: "codex", TargetModel: "gpt-5-codex"},
-				},
+				Models:     modelRefs("fast"),
 			},
 		},
 	})
@@ -51,7 +50,7 @@ func TestStoreAuthenticateAllowedAndRoute(t *testing.T) {
 	store, plain := newTestStore(t)
 	headers := http.Header{"Authorization": {"Bearer " + plain}}
 	decision := store.Authenticate("POST", "/v1/chat/completions", headers, nil, []byte(`{"model":"fast"}`))
-	if !decision.Known || !decision.Allowed || decision.Rule.TargetModel != "gpt-5-codex" {
+	if !decision.Known || !decision.Allowed || decision.Route.TargetModel != "gpt-5-codex" {
 		t.Fatalf("decision = %+v, want allowed", decision)
 	}
 	rule, keyID, ok := store.Route(headers, nil, "fast")
@@ -86,7 +85,7 @@ func TestStoreAuthenticateRateLimits(t *testing.T) {
 	}
 }
 
-// perCallImageStore builds a store with one per_call-billed image alias, used
+// perCallImageStore builds a store with one per_call-billed image model, used
 // to exercise the access-time pre-charge for image/video endpoints.
 func perCallImageStore(t *testing.T) (*Store, string) {
 	t.Helper()
@@ -99,16 +98,17 @@ func perCallImageStore(t *testing.T) (*Store, string) {
 	err = store.Configure(Config{
 		Enabled:   true,
 		StateFile: filepath.Join(t.TempDir(), "state.json"),
+		Models: []ModelDefinition{
+			perCallTestModel("grok-imagine-image-quality", "xai", "grok-imagine-image-quality", 2),
+			freeTestModel("fast", "codex", "gpt-5-codex"),
+		},
 		Keys: []KeyConfig{
 			{
 				ID:      "img-team",
 				Name:    "Image Team",
 				Enabled: true,
 				KeyHash: hash,
-				Models: []ModelRule{
-					{Alias: "grok-imagine-image-quality", Provider: "xai", TargetModel: "grok-imagine-image-quality", BillingMode: "per_call", PerCallUSD: 2},
-					{Alias: "fast", Provider: "codex", TargetModel: "gpt-5-codex"},
-				},
+				Models:  modelRefs("grok-imagine-image-quality", "fast"),
 			},
 		},
 	})
@@ -199,7 +199,7 @@ func TestAuthenticatePerCallVideoPreCharged(t *testing.T) {
 func TestAuthenticatePerCallChatNotPreCharged(t *testing.T) {
 	store, plain := perCallImageStore(t)
 	headers := http.Header{"Authorization": {"Bearer " + plain}}
-	// Same per_call alias, but on a chat endpoint — must NOT pre-charge. Chat
+	// Same per_call model, but on a chat endpoint — must NOT pre-charge. Chat
 	// is billed via usage.handle (CPA emits a record there), and pre-charging
 	// would double-bill.
 	decision := store.Authenticate("POST", "/v1/chat/completions", headers, nil, []byte(`{"model":"grok-imagine-image-quality"}`))
@@ -215,12 +215,12 @@ func TestAuthenticatePerCallChatNotPreCharged(t *testing.T) {
 func TestAuthenticateTokenModeImageNotPreCharged(t *testing.T) {
 	store, plain := perCallImageStore(t)
 	headers := http.Header{"Authorization": {"Bearer " + plain}}
-	// Image endpoint, but the alias is token-billed ("fast") — pre-charge only
-	// applies to per_call aliases. Token-mode images would be billed by tokens
+	// Image endpoint, but the model is token-billed ("fast") — pre-charge only
+	// applies to per_call models. Token-mode images would be billed by tokens
 	// if CPA reported usage, and pre-charging a fixed USD would be wrong.
 	decision := store.Authenticate("POST", "/v1/images/generations", headers, nil, []byte(`{"model":"fast","prompt":"x"}`))
 	if !decision.Allowed || decision.PreCharged {
-		t.Fatalf("decision = %+v, want Allowed and NOT PreCharged for token-mode alias", decision)
+		t.Fatalf("decision = %+v, want Allowed and NOT PreCharged for token-mode model", decision)
 	}
 	sum := store.UsageSummaryFor(imgTeamKey(store))
 	if sum.DailyUSD != 0 {
@@ -268,17 +268,21 @@ func TestConfigureDoesNotResurrectKeysMissingFromState(t *testing.T) {
 	}
 	// Seed initial state with one key on disk.
 	s1 := NewStore()
+	models := []ModelDefinition{freeTestModel("fast", "codex", "gpt-5-codex")}
 	if err := s1.Configure(Config{Enabled: true, StateFile: path, Keys: []KeyConfig{
-		{ID: "on-disk", Enabled: true, KeyHash: onDiskHash, Models: []ModelRule{{Alias: "fast", Provider: "codex", TargetModel: "gpt-5-codex"}}},
-	}}); err != nil {
+		{ID: "on-disk", Enabled: true, KeyHash: onDiskHash, Models: modelRefs("fast")},
+	}, Models: models}); err != nil {
 		t.Fatal(err)
 	}
 	// Add a second key via the management API (persisted to disk).
-	if err := s1.UpsertKey(KeyConfig{ID: "in-mem", Enabled: true, KeyHash: revokedHash, Models: []ModelRule{{Alias: "fast", Provider: "codex", TargetModel: "gpt-5-codex"}}}, true); err != nil {
+	if err := s1.UpsertKey(KeyConfig{ID: "in-mem", Enabled: true, KeyHash: revokedHash, Models: modelRefs("fast")}, true); err != nil {
 		t.Fatal(err)
 	}
 	// Simulate a stale disk snapshot: write a state containing only "on-disk".
-	if err := SaveState(path, []KeyConfig{{ID: "on-disk", Enabled: true, KeyHash: onDiskHash, Models: []ModelRule{{Alias: "fast", Provider: "codex", TargetModel: "gpt-5-codex"}}}}, nil, nil); err != nil {
+	s1.mu.RLock()
+	datasetID := s1.datasetID
+	s1.mu.RUnlock()
+	if err := SaveState(path, datasetID, []KeyConfig{{ID: "on-disk", Enabled: true, KeyHash: onDiskHash, Models: modelRefs("fast")}}, models, nil); err != nil {
 		t.Fatal(err)
 	}
 	// Reconfigure with the same path. The persisted state lacks "in-mem", so it
@@ -313,9 +317,10 @@ func TestConfigureFlushesBeforeReload(t *testing.T) {
 	}
 	s := NewStore()
 	s.SetClock(func() time.Time { return now })
+	models := []ModelDefinition{tokenTestModel("fast", "openai", "m", 3, 15)}
 	if err := s.Configure(Config{Enabled: true, StateFile: path, Keys: []KeyConfig{
-		{ID: "k", Enabled: true, KeyHash: hash, Models: []ModelRule{{Alias: "fast", Provider: "openai", TargetModel: "m", InputPricePerMillion: 3, OutputPricePerMillion: 15}}},
-	}}); err != nil {
+		{ID: "k", Enabled: true, KeyHash: hash, Models: modelRefs("fast")},
+	}, Models: models}); err != nil {
 		t.Fatal(err)
 	}
 	s.StartUsageFlusher()
@@ -325,8 +330,8 @@ func TestConfigureFlushesBeforeReload(t *testing.T) {
 	_ = s.RecordUsage("k", "fast", "m", false, UsageDetail{InputTokens: 1_000_000, OutputTokens: 500_000})
 	// Reconfigure with the same path. Bug 2 fix: Configure flushes first.
 	if err := s.Configure(Config{Enabled: true, StateFile: path, Keys: []KeyConfig{
-		{ID: "k", Enabled: true, KeyHash: hash, Models: []ModelRule{{Alias: "fast", Provider: "openai", TargetModel: "m", InputPricePerMillion: 3, OutputPricePerMillion: 15}}},
-	}}); err != nil {
+		{ID: "k", Enabled: true, KeyHash: hash, Models: modelRefs("fast")},
+	}, Models: models}); err != nil {
 		t.Fatal(err)
 	}
 	sum := s.UsageSummaryFor(imgKey(s, "k"))
@@ -351,8 +356,8 @@ func TestFlushUsagePreservesDiskKeys(t *testing.T) {
 	seed := NewStore()
 	seed.SetClock(func() time.Time { return now })
 	if err := seed.Configure(Config{Enabled: true, StateFile: path, Keys: []KeyConfig{
-		{ID: "survivor", Enabled: true, KeyHash: hash, Models: []ModelRule{{Alias: "fast", Provider: "openai", TargetModel: "m", InputPricePerMillion: 3, OutputPricePerMillion: 15}}},
-	}}); err != nil {
+		{ID: "survivor", Enabled: true, KeyHash: hash, Models: modelRefs("fast")},
+	}, Models: []ModelDefinition{tokenTestModel("fast", "openai", "m", 3, 15)}}); err != nil {
 		t.Fatal(err)
 	}
 	// Build a second store pointed at the same path but with NO keys in memory,
@@ -387,7 +392,7 @@ func TestSaveUsageDoesNotOverwriteCorruptState(t *testing.T) {
 	if err := os.WriteFile(path, original, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := SaveUsage(filepath.Join(filepath.Dir(path), "cpa-key-policy-usage.json"), map[string]*UsageState{}); err != nil {
+	if err := SaveUsage(filepath.Join(filepath.Dir(path), "cpa-key-policy-usage.json"), "test-dataset", map[string]*UsageState{}); err != nil {
 		t.Fatal(err)
 	}
 	current, err := os.ReadFile(path)
@@ -408,10 +413,10 @@ func TestKeysSnapshotSortedByID(t *testing.T) {
 	}
 	s := NewStore()
 	if err := s.Configure(Config{Enabled: true, StateFile: filepath.Join(t.TempDir(), "state.json"), Keys: []KeyConfig{
-		{ID: "zeta", Enabled: true, KeyHash: hash, Models: []ModelRule{{Alias: "a", Provider: "x", TargetModel: "m"}}},
-		{ID: "alpha", Enabled: true, KeyHash: hash, Models: []ModelRule{{Alias: "a", Provider: "x", TargetModel: "m"}}},
-		{ID: "mid", Enabled: true, KeyHash: hash, Models: []ModelRule{{Alias: "a", Provider: "x", TargetModel: "m"}}},
-	}}); err != nil {
+		{ID: "zeta", Enabled: true, KeyHash: hash, Models: modelRefs("a")},
+		{ID: "alpha", Enabled: true, KeyHash: hash, Models: modelRefs("a")},
+		{ID: "mid", Enabled: true, KeyHash: hash, Models: modelRefs("a")},
+	}, Models: []ModelDefinition{freeTestModel("a", "x", "m")}}); err != nil {
 		t.Fatal(err)
 	}
 	got := s.Keys()
@@ -471,8 +476,8 @@ func TestStopUsageFlusherFlushesWithoutWorker(t *testing.T) {
 	store := NewStore()
 	store.SetClock(func() time.Time { return now })
 	if err := store.Configure(Config{Enabled: true, StateFile: path, Keys: []KeyConfig{
-		{ID: "shutdown-key", Enabled: true, KeyHash: hash, Models: []ModelRule{{Alias: "fast", Provider: "openai", TargetModel: "m", BillingMode: "per_call", PerCallUSD: 1}}},
-	}}); err != nil {
+		{ID: "shutdown-key", Enabled: true, KeyHash: hash, Models: modelRefs("fast")},
+	}, Models: []ModelDefinition{perCallTestModel("fast", "openai", "m", 1)}}); err != nil {
 		t.Fatal(err)
 	}
 	store.RecordUsage("shutdown-key", "fast", "m", false, UsageDetail{})
@@ -485,7 +490,7 @@ func TestStopUsageFlusherFlushesWithoutWorker(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	usage := usageState["shutdown-key"]
+	usage := usageState.Usage["shutdown-key"]
 	bucket := usage.Days["2026-07-18"]
 	if usage == nil || bucket.TotalUSD != 1 || bucket.CallCount != 1 {
 		t.Fatalf("persisted usage = %#v, want one $1 call", usage)

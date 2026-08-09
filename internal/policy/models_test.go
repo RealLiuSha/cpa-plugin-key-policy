@@ -54,11 +54,11 @@ func TestIsModelsEndpoint(t *testing.T) {
 }
 
 func TestRewriteTopLevelModel(t *testing.T) {
-	got, ok := RewriteTopLevelModel([]byte(`{"id":"1","model":"real"}`), "alias")
+	got, ok := RewriteTopLevelModel([]byte(`{"id":"1","model":"upstream"}`), "public-model")
 	if !ok {
 		t.Fatal("RewriteTopLevelModel() changed = false")
 	}
-	if string(got) != `{"id":"1","model":"alias"}` {
+	if string(got) != `{"id":"1","model":"public-model"}` {
 		t.Fatalf("RewriteTopLevelModel() = %s", got)
 	}
 }

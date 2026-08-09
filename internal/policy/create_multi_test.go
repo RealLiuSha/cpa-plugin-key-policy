@@ -1,55 +1,46 @@
 package policy
 
 import (
+	"net/http"
 	"path/filepath"
 	"testing"
 )
 
-// TestUpsertKeyMultiTargetAliasPopulatesAliases reproduces the bug where
-// creating a key with a multi-target alias (same alias name, different
-// targets) results in aliases=[] even though models has 2 entries.
-func TestUpsertKeyMultiTargetAliasPopulatesAliases(t *testing.T) {
-	dir := t.TempDir()
-	stateFile := filepath.Join(dir, "state.json")
-	s := NewStore()
-	if err := s.Configure(Config{Enabled: true, StateFile: stateFile}); err != nil {
-		t.Fatal(err)
-	}
-
-	// Create a key with a multi-target alias "test" (2 entries, same alias).
-	input := KeyConfig{
-		ID:            "mt-key",
-		Enabled:       true,
-		RPM:           0,
-		DailyLimitUSD: 0,
-		Models: []ModelRule{
-			{Alias: "test", Provider: "nvidia", TargetModel: "z-ai/glm-5.2", BillingMode: "tokens"},
-			{Alias: "test", Provider: "opencode", TargetModel: "glm-5.2", BillingMode: "tokens"},
+func TestUpsertKeyReferencesMultiTargetModelWithoutPersistingRoutes(t *testing.T) {
+	plain := "multi-target-key"
+	hash, _ := HashKey(plain)
+	model := ModelDefinition{
+		Name: "test", Dispatch: "round-robin", BillingMode: "tokens", Free: true,
+		Targets: []ModelTarget{
+			{Provider: "nvidia", TargetModel: "z-ai/glm-5.2"},
+			{Provider: "opencode", TargetModel: "glm-5.2"},
 		},
 	}
-	if err := s.UpsertKey(input, true); err != nil {
-		t.Fatalf("UpsertKey: %v", err)
+	store := NewStore()
+	if err := store.Configure(Config{Enabled: true, StateFile: filepath.Join(t.TempDir(), "state.json"), Models: []ModelDefinition{model}}); err != nil {
+		t.Fatal(err)
 	}
-
-	key, ok := s.findKeyLocked("mt-key")
+	if err := store.UpsertKey(KeyConfig{ID: "mt-key", Enabled: true, KeyHash: hash, Models: modelRefs("test")}, true); err != nil {
+		t.Fatal(err)
+	}
+	key := store.findByID("mt-key")
+	if key == nil || len(key.Models) != 1 || key.Models[0].Name != "test" {
+		t.Fatalf("key = %+v", key)
+	}
+	headers := http.Header{"Authorization": {"Bearer " + plain}}
+	first, _, ok := store.Route(headers, nil, "test")
 	if !ok {
-		t.Fatal("key not found")
+		t.Fatal("first route not handled")
 	}
-	t.Logf("after upsert: aliases=%+v models=%+v", key.Aliases, key.Models)
-	if len(key.Aliases) != 1 {
-		t.Fatalf("expected 1 alias ref (deduped), got %d: %+v", len(key.Aliases), key.Aliases)
+	second, _, ok := store.Route(headers, nil, "test")
+	if !ok || first.TargetModel == second.TargetModel {
+		t.Fatalf("round robin routes = %+v then %+v", first, second)
 	}
-	if key.Aliases[0].Alias != "test" {
-		t.Fatalf("expected alias ref 'test', got %q", key.Aliases[0].Alias)
+	state, err := LoadState(store.StatePath())
+	if err != nil {
+		t.Fatal(err)
 	}
-	if len(key.Models) != 2 {
-		t.Fatalf("expected 2 resolved models, got %d: %+v", len(key.Models), key.Models)
+	if len(state.Keys[0].Models) != 1 || len(state.Models[0].Targets) != 2 {
+		t.Fatalf("persisted state = %+v", state)
 	}
-}
-
-func (s *Store) findKeyLocked(id string) (*KeyConfig, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	k, ok := s.keys[id]
-	return k, ok
 }

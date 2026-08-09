@@ -1,0 +1,31 @@
+{
+  "version": 2,
+  "usage": {
+    "team-a": {
+      "days": {
+        "2026-08-07": {"total_usd": 1, "call_count": 1, "input_tokens": 1000000},
+        "2026-08-08": {"total_usd": 0.5, "call_count": 2, "input_tokens": 500000, "output_tokens": 100000}
+      },
+      "by_alias": {
+        "chat": {
+          "2026-08-07": {"total_usd": 1, "call_count": 1, "input_tokens": 1000000},
+          "2026-08-08": {"total_usd": 0.5, "call_count": 1, "input_tokens": 500000, "output_tokens": 100000}
+        },
+        "FREE": {
+          "2026-08-08": {"call_count": 1}
+        }
+      }
+    },
+    "team-b": {
+      "days": {
+        "2026-08-08": {"total_usd": 1, "call_count": 2}
+      },
+      "by_alias": {
+        "Image": {
+          "2026-08-08": {"total_usd": 1, "call_count": 2}
+        }
+      }
+    }
+  },
+  "updated_at": "2026-08-08T00:00:00Z"
+}

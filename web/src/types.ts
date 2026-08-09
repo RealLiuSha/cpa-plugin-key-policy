@@ -1,28 +1,26 @@
-// Shapes mirrored from the cpa-key-policy plugin (internal/policy/config.go)
-// and CPA management responses. Only the fields the UI needs are declared.
-
-export interface ModelRule {
-  alias: string;
+export interface ModelTarget {
   provider: string;
   target_model: string;
-  // Optional tier/plan narrowing for providers whose auth files carry an
-  // identity claim (codex plan_type, antigravity tier). Empty = "any file for
-  // the provider" (legacy). The plugin's Scheduler filters auth candidates by
-  // this so a downstream key pinned to, say, codex "team" only ever lands on a
-  // team auth file. UI catalog groups mirror this value.
   group?: string;
+}
+
+export interface ModelDefinition {
+  name: string;
+  targets: ModelTarget[];
+  dispatch: "round-robin" | "priority";
+  billing_mode: "tokens" | "per_call";
+  free: boolean;
   input_price_per_million?: number;
   output_price_per_million?: number;
   cache_read_price_per_million?: number;
-  // billing_mode selects how this alias is billed per successful request:
-  //   - "tokens" (default): bill by token counts using the three prices above.
-  //   - "per_call": bill a fixed per_call_usd per successful request, ignoring
-  //     token counts. The token-price fields are preserved but dormant.
-  billing_mode?: "tokens" | "per_call";
-  // per_call_usd is the fixed USD charge per successful request when
-  // billing_mode === "per_call". 0 is allowed (free calls). Only meaningful
-  // under "per_call".
   per_call_usd?: number;
+  ref_count?: number;
+  ref_keys?: string[];
+}
+
+export interface KeyModelRef {
+  name: string;
+  daily_limit_usd?: number;
 }
 
 export interface UsageSummary {
@@ -32,10 +30,7 @@ export interface UsageSummary {
   daily_limit_usd: number;
   weekly_limit_usd: number;
   monthly_limit_usd?: number;
-  daily_reset_at?: string;
-  weekly_reset_at?: string;
-  // Cache reporting (omitted when zero). Hit-rate is derived client-side as
-  // cache_read_tokens / (cache_read_tokens + input_tokens).
+  next_accounting_boundary_at?: string;
   daily_cache_cost_usd?: number;
   weekly_cache_cost_usd?: number;
   monthly_cache_cost_usd?: number;
@@ -45,8 +40,6 @@ export interface UsageSummary {
   daily_input_tokens?: number;
   weekly_input_tokens?: number;
   monthly_input_tokens?: number;
-  // Call counts: successful requests billed into the window (token or
-  // per-call). Failed requests don't count. Display only.
   daily_call_count?: number;
   weekly_call_count?: number;
   monthly_call_count?: number;
@@ -61,12 +54,10 @@ export interface KeyPublic {
   enabled: boolean;
   key_preview: string;
   rpm: number;
-  models: ModelRule[];
-  aliases?: KeyAliasRef[];
+  models: KeyModelRef[];
   daily_limit_usd: number;
   weekly_limit_usd: number;
   monthly_limit_usd?: number;
-  // Per-key override for GET /v1/models (see KeyFormValues).
   allow_models_endpoint?: boolean;
   usage: UsageSummary;
   created_at?: string;
@@ -79,8 +70,7 @@ export interface KeyWriteRequest {
   enabled?: boolean;
   key?: string;
   rpm?: number;
-  models?: ModelRule[];
-  aliases?: KeyAliasRef[];
+  models?: KeyModelRef[];
   daily_limit_usd?: number;
   weekly_limit_usd?: number;
   monthly_limit_usd?: number;
@@ -99,9 +89,6 @@ export interface RotateKeyResponse {
   generated: boolean;
 }
 
-// UsageWindow mirrors policy.UsageWindow: a dollar total bound to a window
-// start, plus cache/input/output/call counters for display. The key detail
-// page reads daily, trailing-7-day, and trailing-30-day values per alias.
 export interface UsageWindow {
   total_usd: number;
   window_start?: string;
@@ -112,15 +99,10 @@ export interface UsageWindow {
   call_count?: number;
 }
 
-// AliasUsageEntry mirrors policy.AliasUsageEntry: one row of the per-alias
-// usage breakdown for a key. Configured aliases have in_config=true; aliases
-// with historical usage that are no longer in the key's config have
-// in_config=false (residuals).
-export interface AliasUsageEntry {
-  alias: string;
-  provider?: string;
-  target_model?: string;
+export interface ModelUsageEntry {
+  name: string;
   billing_mode?: "tokens" | "per_call";
+  free: boolean;
   per_call_usd?: number;
   in_config: boolean;
   daily: UsageWindow;
@@ -134,16 +116,11 @@ export interface KeyUsageResponse {
   daily_limit_usd: number;
   weekly_limit_usd: number;
   monthly_limit_usd?: number;
-  aliases: AliasUsageEntry[];
+  models: ModelUsageEntry[];
 }
 
-// A model the user can pick when creating/editing a key.
 export interface CatalogModel {
   provider: string;
-  // group is set for providers whose auth files carry a tier/plan identity
-  // (codex plan_type, antigravity tier). Same model may appear under several
-  // groups when multiple tiers' auth files all support it — each is a distinct
-  // selectable row pinning a different tier.
   group?: string;
   model: string;
 }
@@ -151,61 +128,19 @@ export interface CatalogModel {
 export interface StatusResponse {
   enabled: boolean;
   state_file: string;
+  dataset_id?: string;
   key_count: number;
+  model_count?: number;
   rpm_usage?: Record<string, unknown>;
   usage?: Record<string, UsageSummary>;
 }
 
-// --- Advanced Mapping types ---
-
-// AliasTarget is one selectable destination for an alias.
-export interface AliasTarget {
-  provider: string;
-  target_model: string;
-  group?: string;
-}
-
-// AliasMapping is one entry in the global alias mapping table.
-// Global aliases are the single price / billing_mode authority for the Web UI.
-export interface AliasMapping {
-  alias: string;
-  targets: AliasTarget[];
-  dispatch: "round-robin" | "priority";
-  billing_mode: "tokens" | "per_call";
-  input_price_per_million?: number;
-  output_price_per_million?: number;
-  cache_read_price_per_million?: number;
-  per_call_usd?: number;
-  // Runtime-only fields from GET /aliases (not persisted).
-  ref_count?: number;
-  ref_keys?: string[];
-}
-
-// ClassifyRule is a user-defined credential classification rule.
 export interface ClassifyRule {
   name: string;
-  field: string; // "filename" | "provider" | "plan_type" | "tier" | custom
-  pattern: string; // regex
-  group: string; // target group name
+  field: string;
+  pattern: string;
+  group: string;
   enabled: boolean;
-}
-
-// KeyAliasRef is a key's reference to a global alias.
-// Optional price override fields are YAML-only / hand-edit escape hatches:
-// resolve still honours them server-side, but the Web UI never writes them.
-// Prefer editing prices on the global alias (mapping page / import-prices).
-// null/undefined = use global default.
-export interface KeyAliasRef {
-  alias: string;
-  daily_limit_usd?: number;
-  /** YAML-only override; Web UI does not write. */
-  input_price_per_million?: number | null;
-  /** YAML-only override; Web UI does not write. */
-  output_price_per_million?: number | null;
-  /** YAML-only override; Web UI does not write. */
-  cache_read_price_per_million?: number | null;
-  /** YAML-only override; Web UI does not write. */
-  per_call_usd?: number | null;
 }
 
 export interface UsageBucket {
@@ -219,7 +154,7 @@ export interface UsageBucket {
 
 export interface UsageHistoryDay extends UsageBucket {
   date: string;
-  by_alias?: Record<string, UsageBucket>;
+  by_model?: Record<string, UsageBucket>;
 }
 
 export interface KeyHistoryResponse {
@@ -241,19 +176,16 @@ export interface AuditEvent {
   changes?: Record<string, AuditChange>;
 }
 
-// --- Price import (POST /aliases/import-prices) ---
-
 export interface PriceImportMatch {
   model: string;
-  // Optional: omitted fields are not written (server keeps existing values).
   prompt_price_per_1m?: number;
   completion_price_per_1m?: number;
   cache_read_price_per_1m?: number;
-  cache_write_price_per_1m?: number; // accepted/ignored by server
+  cache_write_price_per_1m?: number;
 }
 
 export interface PriceImportApplied {
-  alias: string;
+  model: string;
   old_input_price_per_million: number;
   old_output_price_per_million: number;
   old_cache_read_price_per_million: number;
@@ -263,13 +195,11 @@ export interface PriceImportApplied {
   note?: string;
 }
 
-export interface PriceImportUnchanged {
-  alias: string;
-}
+export interface PriceImportUnchanged { model: string }
 
 export interface PriceImportSkipped {
+  match_model?: string;
   model?: string;
-  alias?: string;
   reason: string;
 }
 
@@ -285,15 +215,13 @@ export interface PriceImportRequest {
   matches: PriceImportMatch[];
 }
 
-// CredentialDescriptor is a normalized credential description for classify preview.
 export interface CredentialDescriptor {
   id: string;
   provider: string;
   attributes?: Record<string, string>;
 }
 
-// ClassifyPreviewResponse is the result of POST /classify-preview.
 export interface ClassifyPreviewResponse {
-  groups: Record<string, string[]>; // group name → credential IDs
-  group_counts: Record<string, number>; // group name → count
+  groups: Record<string, string[]>;
+  group_counts: Record<string, number>;
 }

@@ -2,286 +2,261 @@ package policy
 
 import (
 	"bytes"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"math"
+	"sort"
+	"strings"
 	"time"
 
 	"cpa-key-policy/internal/policy/persist"
 )
 
 const (
-	usageFileVersion = 2
-	legacyWeekWindow = 7 * 24 * time.Hour
+	stateFileVersion = 3
+	usageFileVersion = 3
 )
 
+var ErrMigrationRequired = errors.New("model schema migration required")
+
 type persistedState struct {
-	Version       int             `json:"version"`
-	Keys          []KeyConfig     `json:"keys"`
-	Usage         json.RawMessage `json:"usage,omitempty"`
-	UpdatedAt     time.Time       `json:"updated_at"`
-	Aliases       []AliasMapping  `json:"aliases,omitempty"`
-	ClassifyRules []ClassifyRule  `json:"classify_rules,omitempty"`
+	Version       int               `json:"version"`
+	DatasetID     string            `json:"dataset_id"`
+	Keys          []KeyConfig       `json:"keys"`
+	Models        []ModelDefinition `json:"models"`
+	ClassifyRules []ClassifyRule    `json:"classify_rules,omitempty"`
+	UpdatedAt     time.Time         `json:"updated_at"`
 }
 
 type persistedUsage struct {
 	Version   int                    `json:"version"`
+	DatasetID string                 `json:"dataset_id"`
 	Usage     map[string]*UsageState `json:"usage"`
-	UpdatedAt time.Time              `json:"updated_at,omitempty"`
+	UpdatedAt time.Time              `json:"updated_at"`
 }
 
-type legacyUsageState struct {
-	Daily   UsageWindow                `json:"daily"`
-	Weekly  UsageWindow                `json:"weekly"`
-	ByAlias map[string]json.RawMessage `json:"by_alias,omitempty"`
-}
-
-// UsageMigrated reports whether LoadState converted a v1 aggregate ledger.
-func (s *State) UsageMigrated() bool {
-	return s != nil && s.usageMigrated
-}
-
-// PreMigrationUsageTotals returns the aggregate values stored in legacy
-// windows before v1-to-v2 conversion. V2 entries are absent from this map.
-func (s *State) PreMigrationUsageTotals() map[string]UsageMigrationTotals {
-	if s == nil {
-		return map[string]UsageMigrationTotals{}
-	}
-	result := make(map[string]UsageMigrationTotals, len(s.preMigrationTotals))
-	for id, totals := range s.preMigrationTotals {
-		result[id] = totals
-	}
-	return result
+type UsageFile struct {
+	Version   int
+	DatasetID string
+	Usage     map[string]*UsageState
+	UpdatedAt time.Time
 }
 
 func ResolveStatePath(path string) (string, error) {
 	return persist.ResolvePath(path, DefaultConfig().StateFile)
 }
 
-func LoadState(path string) (*State, error) {
-	location, err := time.LoadLocation(DefaultConfig().UsageTimezone)
-	if err != nil {
-		location = time.UTC
+func NewDatasetID() (string, error) {
+	var raw [16]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "", fmt.Errorf("generate dataset id: %w", err)
 	}
-	return LoadStateAt(path, time.Now(), location)
+	return hex.EncodeToString(raw[:]), nil
 }
 
-func LoadStateAt(path string, now time.Time, location *time.Location) (*State, error) {
-	if err := persist.CleanupStaleTemps(path, now); err != nil {
+func LoadState(path string) (*State, error) {
+	if err := persist.CleanupStaleTemps(path, time.Now()); err != nil {
 		return nil, err
 	}
 	raw, err := persist.Read(path)
 	if err != nil {
 		return nil, err
 	}
+	var header struct {
+		Version   int    `json:"version"`
+		DatasetID string `json:"dataset_id"`
+	}
+	if err := json.Unmarshal(raw, &header); err != nil {
+		return nil, fmt.Errorf("decode state header: %w", err)
+	}
+	if header.Version != stateFileVersion {
+		return nil, schemaVersionError("state", header.Version)
+	}
+	if strings.TrimSpace(header.DatasetID) == "" {
+		return nil, errors.New("state dataset_id is required")
+	}
 	var disk persistedState
-	if err := json.Unmarshal(raw, &disk); err != nil {
-		return nil, err
+	if err := decodeJSONStrict(raw, &disk); err != nil {
+		return nil, fmt.Errorf("decode state v3: %w", err)
 	}
-	usage, before, migrated, err := decodeUsageMap(disk.Usage, now, location)
-	if err != nil {
-		return nil, err
-	}
-	version := disk.Version
-	if version == 0 {
-		version = 1
+	cfg := Config{Enabled: true, Keys: disk.Keys, Models: disk.Models, ClassifyRules: disk.ClassifyRules}
+	if err := normalizeConfig(&cfg); err != nil {
+		return nil, fmt.Errorf("validate state v3: %w", err)
 	}
 	return &State{
-		Version: version, Keys: disk.Keys, Usage: usage, UpdatedAt: disk.UpdatedAt,
-		Aliases: disk.Aliases, ClassifyRules: disk.ClassifyRules,
-		usageMigrated: migrated, preMigrationTotals: before,
+		Version:       disk.Version,
+		DatasetID:     strings.TrimSpace(disk.DatasetID),
+		Keys:          cfg.Keys,
+		Models:        cfg.Models,
+		ClassifyRules: cfg.ClassifyRules,
+		UpdatedAt:     disk.UpdatedAt,
 	}, nil
 }
 
-func LoadUsage(path string) (map[string]*UsageState, error) {
+func LoadUsage(path string) (*UsageFile, error) {
 	raw, err := persist.Read(path)
 	if err != nil {
 		return nil, err
 	}
+	var header struct {
+		Version   int    `json:"version"`
+		DatasetID string `json:"dataset_id"`
+	}
+	if err := json.Unmarshal(raw, &header); err != nil {
+		return nil, fmt.Errorf("decode usage header: %w", err)
+	}
+	if header.Version != usageFileVersion {
+		return nil, schemaVersionError("usage", header.Version)
+	}
+	if strings.TrimSpace(header.DatasetID) == "" {
+		return nil, errors.New("usage dataset_id is required")
+	}
 	var disk persistedUsage
-	if err := json.Unmarshal(raw, &disk); err != nil {
-		return nil, err
+	if err := decodeJSONStrict(raw, &disk); err != nil {
+		return nil, fmt.Errorf("decode usage v3: %w", err)
 	}
 	if disk.Usage == nil {
 		disk.Usage = make(map[string]*UsageState)
 	}
-	return disk.Usage, nil
-}
-
-func stripDerived(keys []KeyConfig) []KeyConfig {
-	clean := make([]KeyConfig, len(keys))
-	for i := range keys {
-		clean[i] = keys[i]
-		clean[i].Models = nil
+	if err := ValidateUsageStates(disk.Usage); err != nil {
+		return nil, fmt.Errorf("validate usage v3: %w", err)
 	}
-	return clean
+	return &UsageFile{
+		Version:   disk.Version,
+		DatasetID: strings.TrimSpace(disk.DatasetID),
+		Usage:     disk.Usage,
+		UpdatedAt: disk.UpdatedAt,
+	}, nil
 }
 
-// SaveState persists policy configuration only. Usage has a separate atomic
-// file so high-frequency accounting flushes never rewrite keys.
-func SaveState(path string, keys []KeyConfig, aliases []AliasMapping, rules []ClassifyRule) error {
+func schemaVersionError(kind string, version int) error {
+	if version <= 2 {
+		return fmt.Errorf("%w: %s version %d is not supported by v3; run migrate-model-schema first", ErrMigrationRequired, kind, version)
+	}
+	return fmt.Errorf("%s version %d is newer than supported version %d", kind, version, stateFileVersion)
+}
+
+func decodeJSONStrict(raw []byte, target any) error {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		return err
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		if err == nil {
+			return errors.New("multiple JSON values are not allowed")
+		}
+		return err
+	}
+	return nil
+}
+
+func SaveState(path, datasetID string, keys []KeyConfig, models []ModelDefinition, rules []ClassifyRule) error {
+	raw, err := MarshalState(datasetID, keys, models, rules, time.Now().UTC())
+	if err != nil {
+		return err
+	}
+	return persist.AtomicWrite(path, raw)
+}
+
+func MarshalState(datasetID string, keys []KeyConfig, models []ModelDefinition, rules []ClassifyRule, updatedAt time.Time) ([]byte, error) {
+	datasetID = strings.TrimSpace(datasetID)
+	if datasetID == "" {
+		return nil, errors.New("state dataset_id is required")
+	}
+	cfg := Config{Enabled: true, Keys: append([]KeyConfig(nil), keys...), Models: append([]ModelDefinition(nil), models...), ClassifyRules: append([]ClassifyRule(nil), rules...)}
+	if err := normalizeConfig(&cfg); err != nil {
+		return nil, err
+	}
 	state := persistedState{
-		Version: usageFileVersion, Keys: stripDerived(keys), UpdatedAt: time.Now().UTC(),
-		Aliases: aliases, ClassifyRules: rules,
+		Version: stateFileVersion, DatasetID: datasetID, Keys: cfg.Keys, Models: cfg.Models,
+		ClassifyRules: cfg.ClassifyRules, UpdatedAt: updatedAt.UTC(),
 	}
-	raw, err := json.MarshalIndent(state, "", "  ")
+	return json.MarshalIndent(state, "", "  ")
+}
+
+func SaveUsage(path, datasetID string, usage map[string]*UsageState) error {
+	raw, err := MarshalUsage(datasetID, usage, time.Now().UTC())
 	if err != nil {
 		return err
 	}
 	return persist.AtomicWrite(path, raw)
 }
 
-func SaveUsage(path string, usage map[string]*UsageState) error {
-	disk := persistedUsage{Version: usageFileVersion, Usage: usage}
-	raw, err := json.Marshal(disk)
-	if err != nil {
-		return err
+func MarshalUsage(datasetID string, usage map[string]*UsageState, updatedAt time.Time) ([]byte, error) {
+	datasetID = strings.TrimSpace(datasetID)
+	if datasetID == "" {
+		return nil, errors.New("usage dataset_id is required")
 	}
-	return persist.AtomicWrite(path, raw)
+	if err := ValidateUsageStates(usage); err != nil {
+		return nil, err
+	}
+	disk := persistedUsage{
+		Version: usageFileVersion, DatasetID: datasetID, Usage: usage, UpdatedAt: updatedAt.UTC(),
+	}
+	return json.MarshalIndent(disk, "", "  ")
 }
 
-func decodeUsageMap(raw json.RawMessage, now time.Time, location *time.Location) (map[string]*UsageState, map[string]UsageMigrationTotals, bool, error) {
-	result := make(map[string]*UsageState)
-	before := make(map[string]UsageMigrationTotals)
-	if len(bytes.TrimSpace(raw)) == 0 || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
-		return result, before, false, nil
+func ValidateUsageStates(states map[string]*UsageState) error {
+	keyIDs := make([]string, 0, len(states))
+	for keyID := range states {
+		keyIDs = append(keyIDs, keyID)
 	}
-	var entries map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &entries); err != nil {
-		return nil, nil, false, err
-	}
-	migrated := false
-	for id, entry := range entries {
-		var shape map[string]json.RawMessage
-		if err := json.Unmarshal(entry, &shape); err != nil {
-			return nil, nil, false, err
+	sort.Strings(keyIDs)
+	for _, keyID := range keyIDs {
+		state := states[keyID]
+		if state == nil {
+			return fmt.Errorf("key %q has null usage state", keyID)
 		}
-		if _, isV2 := shape["days"]; isV2 {
-			var state UsageState
-			if err := json.Unmarshal(entry, &state); err != nil {
-				return nil, nil, false, err
+		if state.Days == nil {
+			state.Days = make(map[string]UsageBucket)
+		}
+		if state.ByModel == nil {
+			state.ByModel = make(map[string]map[string]UsageBucket)
+		}
+		modelNames := make([]string, 0, len(state.ByModel))
+		for name := range state.ByModel {
+			if strings.TrimSpace(name) == "" {
+				return fmt.Errorf("key %q has empty by_model name", keyID)
 			}
-			if state.Days == nil {
-				state.Days = make(map[string]UsageBucket)
+			modelNames = append(modelNames, name)
+		}
+		sort.Strings(modelNames)
+		allDates := make(map[string]struct{}, len(state.Days))
+		for date := range state.Days {
+			allDates[date] = struct{}{}
+		}
+		for _, name := range modelNames {
+			for date := range state.ByModel[name] {
+				allDates[date] = struct{}{}
 			}
-			if state.ByAlias == nil {
-				state.ByAlias = make(map[string]map[string]UsageBucket)
+		}
+		for date := range allDates {
+			var sum UsageBucket
+			for _, name := range modelNames {
+				sum = addUsageBucket(sum, state.ByModel[name][date])
 			}
-			result[id] = &state
-			continue
-		}
-		var legacy legacyUsageState
-		if err := json.Unmarshal(entry, &legacy); err != nil {
-			return nil, nil, false, err
-		}
-		before[id] = summarizeEffectiveLegacyUsage(legacy, now, location)
-		result[id] = migrateLegacyUsageState(legacy, now, location)
-		migrated = true
-	}
-	return result, before, migrated, nil
-}
-
-func migrateLegacyUsageState(legacy legacyUsageState, now time.Time, location *time.Location) *UsageState {
-	if location == nil {
-		location = time.UTC
-	}
-	state := &UsageState{Days: make(map[string]UsageBucket), ByAlias: make(map[string]map[string]UsageBucket)}
-	migrateLegacyWindows(state.Days, legacy.Daily, legacy.Weekly, now, location)
-	for alias, raw := range legacy.ByAlias {
-		var windows struct {
-			Daily  UsageWindow `json:"daily"`
-			Weekly UsageWindow `json:"weekly"`
-		}
-		var shape map[string]json.RawMessage
-		if json.Unmarshal(raw, &shape) != nil {
-			continue
-		}
-		_, hasDaily := shape["daily"]
-		_, hasWeekly := shape["weekly"]
-		if hasDaily || hasWeekly {
-			if json.Unmarshal(raw, &windows) != nil {
-				continue
+			if !usageBucketsEqual(state.Days[date], sum) {
+				return fmt.Errorf("key %q date %q days bucket does not equal by_model sum", keyID, date)
 			}
-		} else {
-			if json.Unmarshal(raw, &windows.Daily) != nil {
-				continue
-			}
-			windows.Weekly = windows.Daily
-		}
-		days := make(map[string]UsageBucket)
-		migrateLegacyWindows(days, windows.Daily, windows.Weekly, now, location)
-		if len(days) > 0 {
-			state.ByAlias[alias] = days
 		}
 	}
-	return state
+	return nil
 }
 
-func legacyDailyBelongsToToday(daily UsageWindow, now time.Time, location *time.Location) bool {
-	return !daily.WindowStart.IsZero() && daily.WindowStart.In(location).Format(dateLayout) == now.In(location).Format(dateLayout)
+func usageBucketsEqual(left, right UsageBucket) bool {
+	return nearlyEqual(left.TotalUSD, right.TotalUSD) &&
+		left.CallCount == right.CallCount &&
+		left.CacheReadTokens == right.CacheReadTokens &&
+		nearlyEqual(left.CacheCostUSD, right.CacheCostUSD) &&
+		left.InputTokens == right.InputTokens &&
+		left.OutputTokens == right.OutputTokens
 }
 
-func legacyWeeklyIsActive(weekly UsageWindow, now time.Time) bool {
-	return !weekly.WindowStart.IsZero() && now.Sub(weekly.WindowStart) < legacyWeekWindow
-}
-
-func summarizeEffectiveLegacyUsage(legacy legacyUsageState, now time.Time, location *time.Location) UsageMigrationTotals {
-	result := UsageMigrationTotals{}
-	if legacyDailyBelongsToToday(legacy.Daily, now, location) {
-		result.DailyUSD = roundedUSD(legacy.Daily.TotalUSD)
-	}
-	if legacyWeeklyIsActive(legacy.Weekly, now) {
-		result.WeeklyUSD = roundedUSD(legacy.Weekly.TotalUSD)
-	}
-	// The v1 format never stored a trailing-30-day aggregate. nil is serialized
-	// as JSON null so operators cannot mistake the old weekly value for a month.
-	result.MonthlyUSD = nil
-	return result
-}
-
-func migrateLegacyWindows(days map[string]UsageBucket, daily, weekly UsageWindow, now time.Time, location *time.Location) {
-	localNow := now.In(location)
-	today := localNow.Format(dateLayout)
-	dailyBucket := usageBucketFromWindow(daily)
-	dailyIncluded := legacyDailyBelongsToToday(daily, now, location)
-	if dailyIncluded {
-		days[today] = addUsageBucket(days[today], dailyBucket)
-	}
-	weeklyBucket := UsageBucket{}
-	if legacyWeeklyIsActive(weekly, now) {
-		weeklyBucket = usageBucketFromWindow(weekly)
-	}
-	residual := weeklyBucket
-	if dailyIncluded {
-		residual = subtractUsageBucket(weeklyBucket, dailyBucket)
-	}
-	if residual == (UsageBucket{}) {
-		return
-	}
-	date := weekly.WindowStart.In(location).Format(dateLayout)
-	if weekly.WindowStart.IsZero() || date > today {
-		date = today
-	}
-	weeklyOldest := time.Date(localNow.Year(), localNow.Month(), localNow.Day(), 0, 0, 0, 0, location).AddDate(0, 0, -6).Format(dateLayout)
-	if date < weeklyOldest {
-		date = weeklyOldest
-	}
-	days[date] = addUsageBucket(days[date], residual)
-}
-
-func usageBucketFromWindow(window UsageWindow) UsageBucket {
-	return UsageBucket{
-		TotalUSD: window.TotalUSD, CallCount: window.CallCount,
-		CacheReadTokens: window.CacheReadTokens, CacheCostUSD: window.CacheCostUSD,
-		InputTokens: window.InputTokens, OutputTokens: window.OutputTokens,
-	}
-}
-
-func subtractUsageBucket(total, part UsageBucket) UsageBucket {
-	return UsageBucket{
-		TotalUSD:        max(total.TotalUSD-part.TotalUSD, 0),
-		CallCount:       max(total.CallCount-part.CallCount, 0),
-		CacheReadTokens: max(total.CacheReadTokens-part.CacheReadTokens, 0),
-		CacheCostUSD:    max(total.CacheCostUSD-part.CacheCostUSD, 0),
-		InputTokens:     max(total.InputTokens-part.InputTokens, 0),
-		OutputTokens:    max(total.OutputTokens-part.OutputTokens, 0),
-	}
+func nearlyEqual(left, right float64) bool {
+	return math.Abs(left-right) <= 1e-9
 }

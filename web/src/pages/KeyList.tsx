@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { listKeys } from "../api/keys";
 import { extractApiError } from "../api/error";
-import type { KeyPublic, ModelRule } from "../types";
+import type { KeyModelRef, KeyPublic } from "../types";
 import KeyMoreMenu from "../components/KeyMoreMenu";
 import { MobileTabBar } from "../components/MobileChrome";
 import PlainKeyModal from "../components/PlainKeyModal";
@@ -12,15 +12,15 @@ import { useT } from "../i18n";
 export const KEY_LIST_PAGE_SIZE = 10;
 export type KeySort = "daily" | "ratio" | "active";
 
-/** Deduplicate model rules by alias (case-insensitive) for chip display. */
-export function uniqueAliases(models: ModelRule[] | undefined): string[] {
+/** Deduplicate public model references case-insensitively for chip display. */
+export function uniqueModelNames(models: KeyModelRef[] | undefined): string[] {
   const out: string[] = [];
   const seen = new Set<string>();
   for (const m of models ?? []) {
-    const key = (m.alias ?? "").toLowerCase();
+    const key = (m.name ?? "").toLowerCase();
     if (key && !seen.has(key)) {
       seen.add(key);
-      out.push(m.alias);
+      out.push(m.name);
     }
   }
   return out;
@@ -28,7 +28,7 @@ export function uniqueAliases(models: ModelRule[] | undefined): string[] {
 
 /**
  * Client-side filter for the key list. Matches id, name, key preview, and
- * model aliases (case-insensitive substring). Empty query returns all keys.
+ * public model names (case-insensitive substring). Empty query returns all keys.
  */
 export function filterKeys(keys: KeyPublic[], query: string): KeyPublic[] {
   const q = query.trim().toLowerCase();
@@ -37,8 +37,8 @@ export function filterKeys(keys: KeyPublic[], query: string): KeyPublic[] {
     if (k.id.toLowerCase().includes(q)) return true;
     if ((k.name ?? "").toLowerCase().includes(q)) return true;
     if ((k.key_preview ?? "").toLowerCase().includes(q)) return true;
-    for (const a of uniqueAliases(k.models)) {
-      if (a.toLowerCase().includes(q)) return true;
+    for (const modelName of uniqueModelNames(k.models)) {
+      if (modelName.toLowerCase().includes(q)) return true;
     }
     return false;
   });
@@ -115,6 +115,17 @@ export function formatResetCountdown(resetAt: string | undefined, nowMs: number)
   const minutes = Math.floor((seconds % 3600) / 60);
   const rest = seconds % 60;
   return [hours, minutes, rest].map((part) => String(part).padStart(2, "0")).join(":");
+}
+
+export type AccountingBoundaryKind = "daily" | "weekly" | "monthly" | "unlimited";
+
+/** Select the shortest configured quota window whose accounting consequence is next. */
+export function accountingBoundaryKind(key: KeyPublic): AccountingBoundaryKind {
+  const hasModelDailyLimit = key.models.some((model) => (model.daily_limit_usd ?? 0) > 0);
+  if (key.usage.daily_limit_usd > 0 || hasModelDailyLimit) return "daily";
+  if (key.usage.weekly_limit_usd > 0) return "weekly";
+  if ((key.usage.monthly_limit_usd ?? 0) > 0) return "monthly";
+  return "unlimited";
 }
 
 export default function KeyList() {
@@ -240,8 +251,7 @@ export default function KeyList() {
                       <th title={t("usage.windowHelp", { timezone: keys[0]?.usage.timezone || "Asia/Shanghai" })}>
                         {t("keys.colUsage")} · {keys[0]?.usage.timezone || "Asia/Shanghai"}
                       </th>
-                      <th>{t("keys.colModels")}</th>
-                      <th>{t("keys.colAliases")}</th>
+                      <th>{t("keys.colAvailableModels")}</th>
                       <th>{t("keys.colActions")}</th>
                     </tr>
                   </thead>
@@ -354,9 +364,9 @@ function KeyTableRow({
   nowMs: number;
 }) {
   const t = useT();
-  const aliases = uniqueAliases(k.models);
-  const shown = aliases.slice(0, 3);
-  const more = Math.max(0, aliases.length - 3);
+  const modelNames = uniqueModelNames(k.models);
+  const shown = modelNames.slice(0, 3);
+  const more = Math.max(0, modelNames.length - 3);
   const unlimited = t("usage.unlimited");
   const daily = formatUsageWindow(k.usage.daily_usd, k.usage.daily_limit_usd, unlimited);
   const weekly = formatUsageWindow(k.usage.weekly_usd, k.usage.weekly_limit_usd, unlimited);
@@ -365,6 +375,7 @@ function KeyTableRow({
   const monthlyHit = isLimitHit(k.usage.monthly_usd ?? 0, k.usage.monthly_limit_usd ?? 0);
   const anyHit = dailyHit || weeklyHit || monthlyHit;
   const state = !k.enabled ? "disabled" : anyHit ? "limited" : k.usage.soft_limit_hit ? "warning" : "normal";
+  const boundaryKind = accountingBoundaryKind(k);
 
   return (
     <tr
@@ -390,15 +401,17 @@ function KeyTableRow({
           {t("usage.last7Days")} {weekly}
         </div>
         <div className="muted usage-reset-countdown" data-testid={`usage-reset-${k.id}`}>
-          {t("usage.nextReset")} {formatResetCountdown(k.usage.daily_reset_at, nowMs)}
+          {boundaryKind === "unlimited"
+            ? t("usage.boundaryUnlimited")
+            : `${t(`usage.boundary${boundaryKind[0].toUpperCase()}${boundaryKind.slice(1)}`)} ${formatResetCountdown(k.usage.next_accounting_boundary_at, nowMs)}`}
         </div>
       </td>
-      <td>{aliases.length}</td>
       <td>
         {shown.length > 0 ? (
-          <div className="key-alias-chips">
-            {shown.map((a) => (
-              <span key={a} className="chip">{a}</span>
+          <div className="key-model-chips">
+            <span className="muted">{modelNames.length}</span>
+            {shown.map((modelName) => (
+              <span key={modelName} className="chip">{modelName}</span>
             ))}
             {more > 0 && <span className="chip more">+{more}</span>}
           </div>
@@ -436,9 +449,9 @@ function KeyMobileCard({
   nowMs: number;
 }) {
   const t = useT();
-  const aliases = uniqueAliases(k.models);
-  const shownChips = aliases.slice(0, 2);
-  const moreCount = Math.max(0, aliases.length - 2);
+  const modelNames = uniqueModelNames(k.models);
+  const shownChips = modelNames.slice(0, 2);
+  const moreCount = Math.max(0, modelNames.length - 2);
   const dailyLimit = k.usage.daily_limit_usd > 0 ? k.usage.daily_limit_usd : 0;
   const weeklyLimit = k.usage.weekly_limit_usd > 0 ? k.usage.weekly_limit_usd : 0;
   const monthlyLimit = (k.usage.monthly_limit_usd ?? 0) > 0 ? k.usage.monthly_limit_usd ?? 0 : 0;
@@ -453,6 +466,7 @@ function KeyMobileCard({
   const barUsed = dailyLimit > 0 ? k.usage.daily_usd : weeklyLimit > 0 ? k.usage.weekly_usd : k.usage.monthly_usd ?? 0;
   const pct = barLimit > 0 ? Math.min(100, (barUsed / barLimit) * 100) : 0;
   const unlimited = t("usage.unlimited");
+  const boundaryKind = accountingBoundaryKind(k);
 
   return (
     <div
@@ -476,15 +490,17 @@ function KeyMobileCard({
         </span>
       </div>
       <div className="kc-meta">
-        <span>{aliases.length} {t("keys.mobile.modelsSuffix")}</span>
-        <span>{t("usage.nextReset")} {formatResetCountdown(k.usage.daily_reset_at, nowMs)}</span>
+        <span>{boundaryKind === "unlimited"
+          ? t("usage.boundaryUnlimited")
+          : `${t(`usage.boundary${boundaryKind[0].toUpperCase()}${boundaryKind.slice(1)}`)} ${formatResetCountdown(k.usage.next_accounting_boundary_at, nowMs)}`}</span>
       </div>
-      {shownChips.length > 0 && (
-        <div className="kc-chips">
-          {shownChips.map((a) => <span key={a} className="chip">{a}</span>)}
+      <div className="kc-models">
+        <span className="muted">{t("keys.availableModelsCount", { count: modelNames.length })}</span>
+        {shownChips.length > 0 && <div className="kc-chips">
+          {shownChips.map((modelName) => <span key={modelName} className="chip">{modelName}</span>)}
           {moreCount > 0 && <span className="chip more">+{moreCount}</span>}
-        </div>
-      )}
+        </div>}
+      </div>
       <div className="kc-actions">
         <KeyActions
           k={k}

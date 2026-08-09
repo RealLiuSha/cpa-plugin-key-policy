@@ -14,14 +14,14 @@ import (
 func TestManagementMutationsProduceAuditEvents(t *testing.T) {
 	dir := t.TempDir()
 	store := NewStore()
-	if err := store.Configure(Config{Enabled: true, StateFile: filepath.Join(dir, "state.json")}); err != nil {
+	if err := store.Configure(Config{Enabled: true, StateFile: filepath.Join(dir, "state.json"), Models: []ModelDefinition{freeTestModel("fast", "codex", "m")}}); err != nil {
 		t.Fatal(err)
 	}
 	hash, err := HashKey("cpa_audit")
 	if err != nil {
 		t.Fatal(err)
 	}
-	key := KeyConfig{ID: "audit-key", Enabled: true, KeyHash: hash, DailyLimitUSD: 1, WeeklyLimitUSD: 5, MonthlyLimitUSD: 10, Models: []ModelRule{{Alias: "fast", Provider: "codex", TargetModel: "m"}}}
+	key := KeyConfig{ID: "audit-key", Enabled: true, KeyHash: hash, DailyLimitUSD: 1, WeeklyLimitUSD: 5, MonthlyLimitUSD: 10, Models: modelRefs("fast")}
 	if err := store.UpsertKey(key, true); err != nil {
 		t.Fatal(err)
 	}
@@ -41,15 +41,15 @@ func TestManagementMutationsProduceAuditEvents(t *testing.T) {
 	if err := store.DeleteKey(key.ID); err != nil {
 		t.Fatal(err)
 	}
-	alias := AliasMapping{Alias: "audit-alias", Targets: []AliasTarget{{Provider: "codex", TargetModel: "m"}}}
-	if err := store.UpsertAlias(alias); err != nil {
+	model := freeTestModel("audit-model", "codex", "m")
+	if err := store.UpsertModel(model); err != nil {
 		t.Fatal(err)
 	}
-	alias.Dispatch = "priority"
-	if err := store.UpsertAlias(alias); err != nil {
+	model.Dispatch = "priority"
+	if err := store.UpsertModel(model); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.DeleteAlias(alias.Alias); err != nil {
+	if err := store.DeleteModel(model.Name); err != nil {
 		t.Fatal(err)
 	}
 	rule := ClassifyRule{Name: "audit-rule", Field: "provider", Pattern: "codex", Group: "paid", Enabled: true}
@@ -77,10 +77,13 @@ func TestManagementMutationsProduceAuditEvents(t *testing.T) {
 			t.Fatalf("actor = %q", event.Actor)
 		}
 	}
-	for _, action := range []string{"create_key", "update_key", "rotate_key", "reset_usage", "delete_key", "create_alias", "update_alias", "delete_alias", "create_classify_rule", "update_classify_rule", "reorder_classify_rules", "delete_classify_rule"} {
+	for _, action := range []string{"create_key", "update_key", "rotate_key", "reset_usage", "delete_key", "create_model", "update_model", "delete_model", "create_classify_rule", "update_classify_rule", "reorder_classify_rules", "delete_classify_rule"} {
 		if actions[action] == 0 {
 			t.Errorf("missing audit action %q: %+v", action, actions)
 		}
+	}
+	if actions["update_key"] != 1 || actions["rotate_key"] != 1 {
+		t.Fatalf("key update and rotation must each emit exactly one semantic event: %+v", actions)
 	}
 	keyEvents, err := store.AuditEvents("audit-key", 100)
 	if err != nil {
@@ -114,7 +117,7 @@ func TestAuditWriteFailureDoesNotFailManagementOperation(t *testing.T) {
 	defer log.SetOutput(previousLogWriter)
 	dir := t.TempDir()
 	store := NewStore()
-	if err := store.Configure(Config{Enabled: true, StateFile: filepath.Join(dir, "state.json")}); err != nil {
+	if err := store.Configure(Config{Enabled: true, StateFile: filepath.Join(dir, "state.json"), Models: []ModelDefinition{freeTestModel("fast", "codex", "m")}}); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Mkdir(filepath.Join(dir, "cpa-key-policy-audit.jsonl"), 0o700); err != nil {
@@ -124,7 +127,7 @@ func TestAuditWriteFailureDoesNotFailManagementOperation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = store.UpsertKey(KeyConfig{ID: "still-created", Enabled: true, KeyHash: hash, Models: []ModelRule{{Alias: "fast", Provider: "codex", TargetModel: "m"}}}, true)
+	err = store.UpsertKey(KeyConfig{ID: "still-created", Enabled: true, KeyHash: hash, Models: modelRefs("fast")}, true)
 	if err != nil {
 		t.Fatalf("audit failure escaped management operation: %v", err)
 	}

@@ -1,10 +1,8 @@
-import { useCallback, useEffect, useState, type ReactNode } from "react";
-import { Link, useNavigate } from "react-router-dom";
-import type { KeyPublic, ModelRule, AliasMapping, KeyAliasRef, KeyWriteRequest } from "../types";
-import ModelPicker from "./ModelPicker";
-import { fetchAliases } from "../api/mappings";
+import { useEffect, useMemo, useState } from "react";
+import { useNavigate } from "react-router-dom";
+import type { KeyModelRef, KeyPublic, KeyWriteRequest, ModelDefinition } from "../types";
+import { fetchModelDefinitions } from "../api/modelDefinitions";
 import { extractApiError } from "../api/error";
-import { formatTierLabel } from "../api/models";
 import { useT } from "../i18n";
 
 export interface KeyFormValues {
@@ -12,127 +10,52 @@ export interface KeyFormValues {
   name: string;
   enabled: boolean;
   rpm: number;
-  models: ModelRule[];
-  aliases: KeyAliasRef[];
+  models: KeyModelRef[];
   daily_limit_usd: number;
   weekly_limit_usd: number;
   monthly_limit_usd: number;
-  // Per-key override for GET /v1/models. CPA cannot filter the model list per
-  // downstream key, so the only plugin-enforceable choice is binary: 401 (hide
-  // the list) or allow (client sees the full global list). Default false.
   allow_models_endpoint?: boolean;
 }
 
 export function keyWriteRequestFromForm(values: KeyFormValues): KeyWriteRequest {
   return {
-    ...values,
+    id: values.id,
     name: values.name.trim() || undefined,
+    enabled: values.enabled,
+    rpm: values.rpm,
+    models: values.models,
+    daily_limit_usd: values.daily_limit_usd,
+    weekly_limit_usd: values.weekly_limit_usd,
+    monthly_limit_usd: values.monthly_limit_usd,
+    allow_models_endpoint: values.allow_models_endpoint,
   };
-}
-
-/** Meta passed to parent onSubmit so post-save UX (navigate / toast) can react. */
-export interface KeyFormSubmitMeta {
-  /** Newly selected aliases that are unpriced (tokens + three prices 0, or not yet in global table). */
-  newUnpricedCount: number;
 }
 
 interface Props {
   initial?: KeyPublic;
   idReadOnly?: boolean;
   submitLabel: string;
-  onSubmit: (v: KeyFormValues, meta: KeyFormSubmitMeta) => Promise<void>;
+  onSubmit: (values: KeyFormValues) => Promise<void>;
   onCancel: () => void;
-  // top-level error to render
   error?: string;
-  // route path for the standalone model-picker page (e.g. "/keys/new/models").
-  // When set, the desktop form renders a chip box + "add model" button that
-  // navigates here with the current models as router state. The picker page
-  // navigates back with state.pickedModels, which the parent merges into
-  // `initial` before re-rendering this form.
-  pickPath?: string;
-  // extra-danger button config for the footer (edit mode). When provided,
-  // renders a danger-outline button on the far right of the footer.
+  returnPath?: string;
   dangerLabel?: string;
   onDanger?: () => void;
 }
 
-// Stable identity for a selected model row (group|alias). Used for chip keys
-// and dedupe; no longer used for price maps.
-function modelKey(m: { alias: string; group?: string; provider?: string; target_model?: string }): string {
-  const g = (m.group ?? "").toLowerCase();
-  const p = (m.provider ?? "").toLowerCase();
-  const t = (m.target_model ?? "").toLowerCase();
-  return `${g}|${m.alias.toLowerCase()}|${p}|${t}`;
+function parseNumber(value: string): number {
+  const parsed = Number.parseFloat(value);
+  return Number.isFinite(parsed) ? parsed : 0;
 }
 
-function parseNum(value: string): number {
-  const n = parseFloat(value);
-  return Number.isFinite(n) ? n : 0;
-}
-
-/** tokens (or empty default) with all three token prices at 0. */
-export function isUnpricedAlias(a: Pick<AliasMapping, "billing_mode" | "input_price_per_million" | "output_price_per_million" | "cache_read_price_per_million">): boolean {
-  if (a.billing_mode === "per_call") return false;
-  return (a.input_price_per_million ?? 0) === 0
-    && (a.output_price_per_million ?? 0) === 0
-    && (a.cache_read_price_per_million ?? 0) === 0;
-}
-
-/** Strip price / billing fields so key submit never claims to set prices. */
-export function modelsWithoutPrices(models: ModelRule[]): ModelRule[] {
-  return models.map((m) => {
-    const out: ModelRule = {
-      alias: m.alias,
-      provider: m.provider,
-      target_model: m.target_model,
-    };
-    if (m.group) out.group = m.group;
-    return out;
+function priceSummary(model: ModelDefinition, translate: (key: string, variables?: Record<string, string | number>) => string): string {
+  if (model.free) return translate("models.free");
+  if (model.billing_mode === "per_call") return translate("models.pricePerCallSummary", { price: model.per_call_usd ?? 0 });
+  return translate("models.priceTokenSummary", {
+    input: model.input_price_per_million ?? 0,
+    output: model.output_price_per_million ?? 0,
+    cache: model.cache_read_price_per_million ?? 0,
   });
-}
-
-/**
- * Count aliases present in `models` but not in `initialModels` that are unpriced
- * against the global alias table (missing alias ⇒ will be created at 0 = unpriced).
- */
-export function countNewUnpricedAliases(
-  models: ModelRule[],
-  initialModels: ModelRule[] | undefined,
-  globalAliases: AliasMapping[],
-): number {
-  const initialAliases = new Set((initialModels ?? []).map((m) => m.alias.toLowerCase()));
-  const byName = new Map(globalAliases.map((a) => [a.alias.toLowerCase(), a]));
-  let n = 0;
-  const seen = new Set<string>();
-  for (const m of models) {
-    const lk = m.alias.toLowerCase();
-    if (seen.has(lk) || initialAliases.has(lk)) continue;
-    seen.add(lk);
-    const global = byName.get(lk);
-    if (!global || isUnpricedAlias(global)) n++;
-  }
-  return n;
-}
-
-function aliasRefsForModels(
-  models: ModelRule[],
-  initialRefs: KeyAliasRef[] | undefined,
-  dailyLimits: Record<string, number>,
-): KeyAliasRef[] {
-  const previous = new Map((initialRefs ?? []).map((ref) => [ref.alias.toLowerCase(), ref]));
-  const seen = new Set<string>();
-  const refs: KeyAliasRef[] = [];
-  for (const model of models) {
-    const canonical = model.alias.toLowerCase();
-    if (seen.has(canonical)) continue;
-    seen.add(canonical);
-    refs.push({
-      ...previous.get(canonical),
-      alias: model.alias,
-      daily_limit_usd: dailyLimits[canonical] ?? previous.get(canonical)?.daily_limit_usd ?? 0,
-    });
-  }
-  return refs;
 }
 
 export default function KeyForm({
@@ -142,499 +65,169 @@ export default function KeyForm({
   onSubmit,
   onCancel,
   error,
-  pickPath,
+  returnPath,
   dangerLabel,
   onDanger,
 }: Props) {
-  const nav = useNavigate();
-  const [id, setId] = useState(initial?.id ?? "");
+  const navigate = useNavigate();
+  const t = useT();
+  const [id, setID] = useState(initial?.id ?? "");
   const [name, setName] = useState(initial?.name ?? "");
   const [enabled, setEnabled] = useState(initial?.enabled ?? true);
-  const [rpm, setRpm] = useState(initial?.rpm ?? 0);
+  const [rpm, setRPM] = useState(initial?.rpm ?? 0);
   const [dailyLimit, setDailyLimit] = useState(initial?.daily_limit_usd ?? 0);
   const [weeklyLimit, setWeeklyLimit] = useState(initial?.weekly_limit_usd ?? 0);
   const [monthlyLimit, setMonthlyLimit] = useState(initial?.monthly_limit_usd ?? 0);
-  const [aliasDailyLimits, setAliasDailyLimits] = useState<Record<string, number>>(() =>
-    Object.fromEntries((initial?.aliases ?? []).map((ref) => [ref.alias.toLowerCase(), ref.daily_limit_usd ?? 0])),
-  );
-  const [allowModels, setAllowModels] = useState<boolean>(initial?.allow_models_endpoint ?? false);
-  const t = useT();
-
-  const [models, setModels] = useState<ModelRule[]>(initial?.models ?? []);
+  const [allowModels, setAllowModels] = useState(initial?.allow_models_endpoint ?? false);
+  const [selected, setSelected] = useState<KeyModelRef[]>(initial?.models ?? []);
+  const [definitions, setDefinitions] = useState<ModelDefinition[]>([]);
+  const [loadingModels, setLoadingModels] = useState(true);
   const [busy, setBusy] = useState(false);
-  const [localErr, setLocalErr] = useState("");
+  const [localError, setLocalError] = useState("");
 
-  // Global alias table: used for "existing aliases" chips and unpriced checks.
-  // aliasesReady gates submit meta so we never count "all new = unpriced" while
-  // the table is still inflight (empty array would over-count).
-  const [globalAliases, setGlobalAliases] = useState<AliasMapping[]>([]);
-  const [aliasesReady, setAliasesReady] = useState(false);
   useEffect(() => {
     let alive = true;
-    void fetchAliases()
-      .then((list) => {
-        if (!alive) return;
-        setGlobalAliases(list);
-        setAliasesReady(true);
+    void fetchModelDefinitions()
+      .then((models) => {
+        if (alive) setDefinitions(models);
       })
-      .catch(() => {
-        // Failed load: still mark ready with empty table so submit is not stuck.
-        // Missing aliases are treated as not-yet-created (0-price) — same as
-        // after a successful empty list.
-        if (!alive) return;
-        setGlobalAliases([]);
-        setAliasesReady(true);
+      .catch((reason) => {
+        if (alive) setLocalError(extractApiError(reason, t("picker.loadFailed")));
+      })
+      .finally(() => {
+        if (alive) setLoadingModels(false);
       });
     return () => { alive = false; };
-  }, []);
+  }, [t]);
 
-  const aliasByName = useCallback((aliasName: string): AliasMapping | undefined => {
-    const lk = aliasName.toLowerCase();
-    return globalAliases.find((a) => a.alias.toLowerCase() === lk);
-  }, [globalAliases]);
+  const selectedByName = useMemo(
+    () => new Map(selected.map((ref) => [ref.name.toLowerCase(), ref])),
+    [selected],
+  );
 
-  // aliasSelected reports whether every target of `a` is already in `models`.
-  const aliasSelected = useCallback((a: AliasMapping) => {
-    return a.targets.every((tgt) =>
-      models.some((m) =>
-        m.alias.toLowerCase() === a.alias.toLowerCase() &&
-        m.provider.toLowerCase() === tgt.provider.toLowerCase() &&
-        m.target_model.toLowerCase() === tgt.target_model.toLowerCase() &&
-        (m.group ?? "").toLowerCase() === (tgt.group ?? "").toLowerCase(),
-      ),
-    );
-  }, [models]);
+  const currentValues = (): KeyFormValues => ({
+    id: id.trim(), name, enabled, rpm, models: selected,
+    daily_limit_usd: dailyLimit, weekly_limit_usd: weeklyLimit,
+    monthly_limit_usd: monthlyLimit, allow_models_endpoint: allowModels,
+  });
 
-  const toggleAlias = useCallback((a: AliasMapping) => {
-    if (aliasSelected(a)) {
-      setModels((prev) => prev.filter((m) =>
-        !(m.alias.toLowerCase() === a.alias.toLowerCase()),
-      ));
-    } else {
-      const newRules: ModelRule[] = a.targets.map((tgt) => ({
-        alias: a.alias,
-        provider: tgt.provider,
-        target_model: tgt.target_model,
-        group: tgt.group ?? "",
-      }));
-      setModels((prev) => {
-        const filtered = prev.filter((m) => m.alias.toLowerCase() !== a.alias.toLowerCase());
-        return [...filtered, ...newRules];
-      });
-    }
-  }, [aliasSelected]);
-
-  const handleModelsChange = useCallback((next: ModelRule[]) => {
-    setModels(next);
-  }, []);
-
-  /** Unique alias names currently selected (for unpriced checks). */
-  const selectedAliasNames = (() => {
-    const names: string[] = [];
-    const seen = new Set<string>();
-    for (const m of models) {
-      const lk = m.alias.toLowerCase();
-      if (seen.has(lk)) continue;
-      seen.add(lk);
-      names.push(m.alias);
-    }
-    return names;
-  })();
-
-  const isAliasUnpriced = (aliasName: string): boolean => {
-    const global = aliasByName(aliasName);
-    if (!global) {
-      // Not yet in global table → will be created at 0 price on save.
-      return true;
-    }
-    return isUnpricedAlias(global);
+  const toggleModel = (model: ModelDefinition) => {
+    const key = model.name.toLowerCase();
+    setSelected((previous) => {
+      if (previous.some((ref) => ref.name.toLowerCase() === key)) {
+        return previous.filter((ref) => ref.name.toLowerCase() !== key);
+      }
+      return [...previous, { name: model.name, daily_limit_usd: 0 }];
+    });
   };
 
-  const submit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setLocalErr("");
+  const setModelDailyLimit = (modelName: string, value: number) => {
+    setSelected((previous) => previous.map((ref) =>
+      ref.name.toLowerCase() === modelName.toLowerCase()
+        ? { ...ref, daily_limit_usd: value }
+        : ref,
+    ));
+  };
+
+  const createModel = () => {
+    navigate("/models/new", {
+      state: {
+        returnTo: returnPath ?? window.location.pathname,
+        draftKey: currentValues(),
+      },
+    });
+  };
+
+  const submit = async (event: React.FormEvent) => {
+    event.preventDefault();
+    setLocalError("");
     if (!id.trim()) {
-      setLocalErr(t("keyForm.idRequired"));
+      setLocalError(t("keyForm.idRequired"));
       return;
     }
-    // Wait for global alias table so newUnpricedCount is not computed against
-    // an empty inflight list (which would treat every new alias as unpriced).
-    if (!aliasesReady) {
-      setLocalErr(t("keyForm.aliasesLoading") || t("keys.loading") || "Loading...");
-      return;
-    }
-    // Models without price fields — global alias table is the price authority.
-    const stripped = modelsWithoutPrices(models);
-    const newUnpriced = countNewUnpricedAliases(stripped, initial?.models, globalAliases);
-    const meta: KeyFormSubmitMeta = { newUnpricedCount: newUnpriced };
-    const immediatelyBlocked = initial ? [
-      { label: t("keyForm.dailyLimitLabel"), limit: dailyLimit, used: initial.usage.daily_usd },
-      { label: t("keyForm.weeklyLimitLabel"), limit: weeklyLimit, used: initial.usage.weekly_usd },
-      { label: t("keyForm.monthlyLimitLabel"), limit: monthlyLimit, used: initial.usage.monthly_usd ?? 0 },
-    ].filter(({ limit, used }) => limit > 0 && used > 0 && limit <= used) : [];
-    if (immediatelyBlocked.length > 0) {
-      const details = immediatelyBlocked
-        .map(({ label, used, limit }) => `${label}: $${used.toFixed(2)} → $${limit.toFixed(2)}`)
-        .join("\n");
-      if (!window.confirm(t("keyForm.limitBelowUsageConfirm", { details }))) return;
-    }
-    const aliases = aliasRefsForModels(stripped, initial?.aliases, aliasDailyLimits);
-    if (aliases.some((ref) => (ref.daily_limit_usd ?? 0) < 0)) {
-      setLocalErr(t("keyForm.aliasLimitInvalid"));
+    if ([rpm, dailyLimit, weeklyLimit, monthlyLimit, ...selected.map((ref) => ref.daily_limit_usd ?? 0)].some((value) => value < 0)) {
+      setLocalError(t("keyForm.modelLimitInvalid"));
       return;
     }
     setBusy(true);
     try {
-      await onSubmit({
-        id: id.trim(),
-        name: name.trim(),
-        enabled,
-        rpm,
-        models: stripped,
-        aliases,
-        daily_limit_usd: dailyLimit,
-        weekly_limit_usd: weeklyLimit,
-        monthly_limit_usd: monthlyLimit,
-        allow_models_endpoint: allowModels,
-      }, meta);
-      // After-save unpriced guidance is owned by KeyEdit/KeyNew via meta —
-      // do not render a second banner here (avoids duplicate DOM notices).
-    } catch (err) {
-      setLocalErr(extractApiError(err, t("keyForm.submitFailed")));
+      await onSubmit(currentValues());
+    } catch (reason) {
+      setLocalError(extractApiError(reason, t("keyForm.submitFailed")));
     } finally {
       setBusy(false);
     }
   };
 
-  const renderModelChips = () => (
-    <div className="model-chips-box">
-      {models.length === 0 && <span className="mc-empty">{t("keyForm.modelsEmpty")}</span>}
-      {models.map((m) => {
-        const unpriced = isAliasUnpriced(m.alias);
-        return (
-          <span key={modelKey(m)} className={"mc-chip" + (unpriced ? " mc-chip-unpriced" : "")}>
-            {m.alias}{m.group ? " · " + formatTierLabel(t, m.group) : ""}
-            {unpriced && (
-              <Link
-                className="mc-unpriced-link"
-                to={`/mapping/alias/${encodeURIComponent(m.alias)}`}
-                title={t("keyForm.unpricedTitle")}
-                onClick={(ev) => ev.stopPropagation()}
-              >
-                {t("keyForm.unpricedBadge")}
-              </Link>
-            )}
-            <button
-              type="button"
-              className="mc-x"
-              onClick={() => {
-                setModels((prev) => prev.filter((x) => modelKey(x) !== modelKey(m)));
-              }}
-              aria-label={t("keyForm.removeModel")}
-            >
-              ×
-            </button>
-          </span>
-        );
-      })}
-      {pickPath && (
-        <button type="button" className="mc-add" onClick={() => nav(pickPath, { state: { models } })}>
-          + {t("keyForm.addModel")}
-        </button>
-      )}
-    </div>
-  );
-
-  const renderAliasLimits = () => selectedAliasNames.length > 0 && (
-    <div className="kf-alias-limits">
-      <div className="muted kf-alias-limits-title">{t("keyForm.aliasDailyLimitsLabel")}</div>
-      {selectedAliasNames.map((alias) => {
-        const canonical = alias.toLowerCase();
-        return (
-          <label className="kf-alias-limit-row" key={canonical}>
-            <span>{t("keyForm.aliasDailyLimitLabel", { alias })}</span>
-            <input
-              className="input"
-              type="number"
-              min={0}
-              step="0.01"
-              data-alias-limit={canonical}
-              value={aliasDailyLimits[canonical] ?? 0}
-              onChange={(event) => setAliasDailyLimits((current) => ({
-                ...current,
-                [canonical]: parseNum(event.target.value),
-              }))}
-            />
-          </label>
-        );
-      })}
-      <p className="muted kf-hint">{t("keyForm.aliasDailyLimitHint")}</p>
-    </div>
-  );
-
-  const section = (title: string, children: ReactNode) => (
-    <section className="kf-section mobile-only">
-      <div className="section-label">{title}</div>
-      <div className="kf-section-card">{children}</div>
-    </section>
-  );
-
   return (
-    <form className="card key-form" onSubmit={submit}>
-      <div className="mobile-only kf-sections">
-        {section(t("keyForm.mobile.sectionBasic"), (
-          <>
-            <div className="form-row">
-              <label>{t("keyForm.idLabel")}</label>
-              <input
-                className={"input" + (idReadOnly ? " mono" : "")}
-                value={id}
-                onChange={(e) => setId(e.target.value)}
-                readOnly={idReadOnly}
-                placeholder={t("keyForm.idPlaceholder")}
-                autoFocus={!idReadOnly}
-              />
-            </div>
-            <div className="form-row">
-              <label>{t("keyForm.nameLabel")}</label>
-              <input
-                className="input"
-                value={name}
-                onChange={(e) => setName(e.target.value)}
-                placeholder={t("keyForm.namePlaceholder")}
-              />
-            </div>
-            <div className="form-row kf-switch-row">
-              <label className="switch">
-                <input type="checkbox" checked={enabled} onChange={(e) => setEnabled(e.target.checked)} />
-                <span className="track"><span className="thumb" /></span>
-                <span>{t("keyForm.enableKey")}</span>
-              </label>
-            </div>
-            <div className="form-row">
-              <label>{t("keyForm.rpmLabel")}</label>
-              <input
-                className="input"
-                type="number"
-                min={0}
-                value={rpm}
-                onChange={(e) => setRpm(parseInt(e.target.value || "0", 10) || 0)}
-              />
-            </div>
-          </>
-        ))}
-        {section(t("keyForm.mobile.sectionLimits"), (
-          <>
-            <div className="form-row">
-              <label>{t("keyForm.dailyLimitLabel")}</label>
-              {initial && <span className="muted kf-current-usage">{t("keyForm.currentUsage", { amount: initial.usage.daily_usd.toFixed(2) })}</span>}
-              <input
-                className="input"
-                type="number"
-                min={0}
-                step="0.01"
-                value={dailyLimit}
-                onChange={(e) => setDailyLimit(parseNum(e.target.value))}
-              />
-            </div>
-            <div className="form-row">
-              <label>{t("keyForm.weeklyLimitLabel")}</label>
-              {initial && <span className="muted kf-current-usage">{t("keyForm.currentUsage", { amount: initial.usage.weekly_usd.toFixed(2) })}</span>}
-              <input
-                className="input"
-                type="number"
-                min={0}
-                step="0.01"
-                value={weeklyLimit}
-                onChange={(e) => setWeeklyLimit(parseNum(e.target.value))}
-              />
-            </div>
-            <div className="form-row">
-              <label>{t("keyForm.monthlyLimitLabel")}</label>
-              {initial && <span className="muted kf-current-usage">{t("keyForm.currentUsage", { amount: (initial.usage.monthly_usd ?? 0).toFixed(2) })}</span>}
-              <input className="input" type="number" min={0} step="0.01" value={monthlyLimit} onChange={(e) => setMonthlyLimit(parseNum(e.target.value))} />
-            </div>
-          </>
-        ))}
-        {section(t("keyForm.mobile.sectionAccess"), (
-          <>
-            <label className="switch kf-access-switch" title={t("keyForm.allowModelsTitle")}>
-              <input type="checkbox" checked={allowModels} onChange={(e) => setAllowModels(e.target.checked)} />
-              <span className="track"><span className="thumb" /></span>
-              <span>{t("keyForm.allowModelsLabel")}</span>
-            </label>
-            <p className="muted kf-hint">{t("keyForm.allowModelsHint")}</p>
-          </>
-        ))}
-        <section className="kf-section mobile-only">
-          <div className="section-label">{t("keyForm.mobile.sectionModels")}</div>
-          {globalAliases.length > 0 && (
-            <div className="form-row kf-alias-pick" style={{ marginBottom: 12 }}>
-              <div className="kf-alias-chips">
-                {globalAliases.map((a) => {
-                  const on = aliasSelected(a);
-                  return (
-                    <button key={a.alias} type="button" className={"kf-alias-chip" + (on ? " selected" : "")} onClick={() => toggleAlias(a)}>
-                      {a.alias}{a.targets.length > 1 ? ` (${a.targets.length})` : ""}
-                    </button>
-                  );
-                })}
-              </div>
-            </div>
-          )}
-          <div className="form-row" style={{ marginBottom: 12 }}>
-            {pickPath ? renderModelChips() : (
-              <ModelPicker initial={initial?.models} onChange={handleModelsChange} />
-            )}
-          </div>
-          {renderAliasLimits()}
-          {selectedAliasNames.some(isAliasUnpriced) && (
-            <p className="muted kf-warn">⚠ {t("keyForm.unpricedHint")}</p>
-          )}
-        </section>
-      </div>
+    <form className="key-form" onSubmit={submit}>
+      {(error || localError) && <div className="error">{error || localError}</div>}
 
-      <div className="mobile-hidden">
-        <div className="row2">
-          <div className="form-row">
-            <label>{t("keyForm.idLabel")}</label>
-            <input
-              className="input"
-              value={id}
-              onChange={(e) => setId(e.target.value)}
-              readOnly={idReadOnly}
-              placeholder={t("keyForm.idPlaceholder")}
-              autoFocus={!idReadOnly}
-            />
-          </div>
-          <div className="form-row">
-            <label>{t("keyForm.nameLabel")}</label>
-            <input
-              className="input"
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-              placeholder={t("keyForm.namePlaceholder")}
-            />
-          </div>
+      <section className="kf-section">
+        <h2>{t("keyForm.mobile.sectionBasic")}</h2>
+        <div className="form-grid">
+          <label>{t("keyForm.idLabel")}<input className="input" value={id} disabled={idReadOnly} onChange={(event) => setID(event.target.value)} /></label>
+          <label>{t("keyForm.nameLabel")}<input className="input" value={name} onChange={(event) => setName(event.target.value)} /></label>
+          <label>{t("keyForm.rpmLabel")}<input className="input" type="number" min="0" value={rpm} onChange={(event) => setRPM(parseNumber(event.target.value))} /></label>
+          <label className="check-row"><input type="checkbox" checked={enabled} onChange={(event) => setEnabled(event.target.checked)} />{t("keyForm.enableKey")}</label>
         </div>
-        <div className="row2">
-          <div className="form-row">
-            <label>{t("keyForm.rpmLabel")}</label>
-            <input
-              className="input"
-              type="number"
-              min={0}
-              value={rpm}
-              onChange={(e) => setRpm(parseInt(e.target.value || "0", 10) || 0)}
-            />
-          </div>
-          <div className="form-row">
-            <label>{t("keyForm.statusLabel")}</label>
-            <label className="switch">
-              <input
-                type="checkbox"
-                checked={enabled}
-                onChange={(e) => setEnabled(e.target.checked)}
-              />
-              <span className="track"><span className="thumb" /></span>
-              <span>{t("keyForm.enableKey")}</span>
-            </label>
-          </div>
-        </div>
+      </section>
 
-        <div className="row2">
-          <div className="form-row">
-            <label>{t("keyForm.dailyLimitLabel")}</label>
-            {initial && <span className="muted kf-current-usage">{t("keyForm.currentUsage", { amount: initial.usage.daily_usd.toFixed(2) })}</span>}
-            <input
-              className="input"
-              type="number"
-              min={0}
-              step="0.01"
-              value={dailyLimit}
-              onChange={(e) => setDailyLimit(parseNum(e.target.value))}
-            />
-          </div>
-          <div className="form-row">
-            <label>{t("keyForm.weeklyLimitLabel")}</label>
-            {initial && <span className="muted kf-current-usage">{t("keyForm.currentUsage", { amount: initial.usage.weekly_usd.toFixed(2) })}</span>}
-            <input
-              className="input"
-              type="number"
-              min={0}
-              step="0.01"
-              value={weeklyLimit}
-              onChange={(e) => setWeeklyLimit(parseNum(e.target.value))}
-            />
-          </div>
+      <section className="kf-section">
+        <h2>{t("keyForm.mobile.sectionLimits")}</h2>
+        <div className="form-grid">
+          <label>{t("keyForm.dailyLimitLabel")}<input className="input" type="number" min="0" step="0.01" value={dailyLimit} onChange={(event) => setDailyLimit(parseNumber(event.target.value))} /></label>
+          <label>{t("keyForm.weeklyLimitLabel")}<input className="input" type="number" min="0" step="0.01" value={weeklyLimit} onChange={(event) => setWeeklyLimit(parseNumber(event.target.value))} /></label>
+          <label>{t("keyForm.monthlyLimitLabel")}<input className="input" type="number" min="0" step="0.01" value={monthlyLimit} onChange={(event) => setMonthlyLimit(parseNumber(event.target.value))} /></label>
         </div>
-        <div className="form-row">
-          <label>{t("keyForm.monthlyLimitLabel")}</label>
-          {initial && <span className="muted kf-current-usage">{t("keyForm.currentUsage", { amount: (initial.usage.monthly_usd ?? 0).toFixed(2) })}</span>}
-          <input className="input" type="number" min={0} step="0.01" value={monthlyLimit} onChange={(e) => setMonthlyLimit(parseNum(e.target.value))} />
-        </div>
+      </section>
 
-        <div className="form-row">
-          <label className="switch" title={t("keyForm.allowModelsTitle")}>
-            <input
-              type="checkbox"
-              checked={allowModels}
-              onChange={(e) => setAllowModels(e.target.checked)}
-            />
-            <span className="track"><span className="thumb" /></span>
-            <span>{t("keyForm.allowModelsLabel")}</span>
-          </label>
-          <span className="muted" style={{ fontSize: "0.85em", marginLeft: 8 }}>
-            {t("keyForm.allowModelsHint")}
-          </span>
+      <section className="kf-section">
+        <div className="section-title-row">
+          <div>
+            <h2>{t("keyForm.availableModels")}</h2>
+            <p className="muted">{t("keyForm.availableModelsHint")}</p>
+          </div>
+          <button type="button" className="btn sm" onClick={createModel}>{t("keyForm.newModel")}</button>
         </div>
-
-        {globalAliases.length > 0 && (
-          <div className="form-row kf-alias-pick">
-            <label>{t("keyForm.existingAliases")}</label>
-            <div className="kf-alias-chips">
-              {globalAliases.map((a) => {
-                const on = aliasSelected(a);
-                return (
-                  <button
-                    key={a.alias}
-                    type="button"
-                    className={"kf-alias-chip" + (on ? " selected" : "")}
-                    onClick={() => toggleAlias(a)}
-                    title={a.targets.map((tg) => `${tg.provider}·${tg.target_model}${tg.group ? `·${tg.group}` : ""}`).join("\n")}
-                  >
-                    {a.alias}{a.targets.length > 1 ? ` (${a.targets.length})` : ""}
-                  </button>
-                );
-              })}
-            </div>
+        {loadingModels ? <div className="muted">{t("picker.loading")}</div> : definitions.length === 0 ? (
+          <div className="muted">{t("keyForm.noDefinedModels")}</div>
+        ) : (
+          <div className="model-definition-list">
+            {definitions.map((model) => {
+              const ref = selectedByName.get(model.name.toLowerCase());
+              return (
+                <div className={"model-definition-row" + (ref ? " active" : "")} key={model.name}>
+                  <label className="model-definition-main">
+                    <input type="checkbox" checked={!!ref} onChange={() => toggleModel(model)} />
+                    <span><strong>{model.name}</strong><small>{priceSummary(model, t)}</small></span>
+                  </label>
+                  {ref && (
+                    <label className="model-limit-field">
+                      {t("keyForm.modelDailyLimit", { model: model.name })}
+                      <input className="input" type="number" min="0" step="0.01" value={ref.daily_limit_usd ?? 0} onChange={(event) => setModelDailyLimit(model.name, parseNumber(event.target.value))} />
+                    </label>
+                  )}
+                </div>
+              );
+            })}
           </div>
         )}
+      </section>
 
-        <div className="form-row">
-          <label>{t("keyForm.modelsLabel")}</label>
-          {pickPath ? renderModelChips() : (
-            <ModelPicker initial={initial?.models} onChange={handleModelsChange} />
-          )}
-          {selectedAliasNames.some(isAliasUnpriced) && (
-            <p className="muted kf-warn" style={{ marginTop: 8 }}>⚠ {t("keyForm.unpricedHint")}</p>
-          )}
-        </div>
-        {renderAliasLimits()}
-      </div>
+      <section className="kf-section">
+        <label className="check-row" title={t("keyForm.allowModelsTitle")}>
+          <input type="checkbox" checked={allowModels} onChange={(event) => setAllowModels(event.target.checked)} />
+          {t("keyForm.allowModelsLabel")}
+        </label>
+        <p className="muted">{t("keyForm.allowModelsHint")}</p>
+      </section>
 
-      {(localErr || error) && <div className="error">{localErr || error}</div>}
-
-      <div className="actions fp-foot">
-        <button className="btn primary" type="submit" disabled={busy || !aliasesReady} data-testid="keyform-submit">
-          {busy ? t("keyForm.submitting") : (!aliasesReady ? (t("keys.loading") || "...") : submitLabel)}
-        </button>
-        <button className="btn" type="button" onClick={onCancel}>{t("keyForm.cancel")}</button>
-        {dangerLabel && onDanger && (
-          <span className="fp-foot-right">
-            <button type="button" className="btn danger-outline" onClick={onDanger}>{dangerLabel}</button>
-          </span>
-        )}
+      <div className="form-actions">
+        {dangerLabel && onDanger && <button type="button" className="btn danger" onClick={onDanger}>{dangerLabel}</button>}
+        <span className="form-actions-spacer" />
+        <button type="button" className="btn" onClick={onCancel}>{t("keyForm.cancel")}</button>
+        <button className="btn primary" disabled={busy}>{busy ? t("keyForm.submitting") : submitLabel}</button>
       </div>
     </form>
   );

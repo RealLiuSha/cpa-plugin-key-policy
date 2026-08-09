@@ -49,13 +49,13 @@ describe("translate", () => {
     expect(translate("keys.reset")).toBe("重置");
     expect(translate("keys.resetRpm")).toBe("重置 RPM");
     expect(translate("keys.resetKey")).toBe("重置密钥");
-    expect(translate("keys.colAliases")).toBe("模型别名");
+    expect(translate("keys.colAvailableModels")).toBe("可用模型");
     _resetLocale("en");
     expect(translate("keys.more")).toBe("More");
     expect(translate("keys.reset")).toBe("Reset");
     expect(translate("keys.resetRpm")).toBe("Reset RPM");
     expect(translate("keys.resetKey")).toBe("Reset key");
-    expect(translate("keys.colAliases")).toBe("Aliases");
+    expect(translate("keys.colAvailableModels")).toBe("Available models");
     _resetLocale("zh-TW");
     expect(translate("keys.more")).toBe("更多");
     expect(translate("keys.resetKey")).toBe("重設金鑰");
@@ -69,14 +69,24 @@ describe("translate", () => {
       _resetLocale(locale);
       for (const key of [
         "usage.last7Days",
-        "usage.nextReset",
+        "usage.boundaryDaily",
+        "usage.boundaryWeekly",
+        "usage.boundaryMonthly",
+        "usage.boundaryUnlimited",
         "usage.windowHelp",
         "keyForm.monthlyLimitLabel",
         "keyForm.limitBelowUsageConfirm",
-        "keyForm.aliasDailyLimitsLabel",
+        "keyForm.modelDailyLimit",
         "keys.resetMonthlyConfirm",
         "keyUsage.tabMonthly",
         "keyUsage.historyTitle",
+        "keyUsage.colModel",
+        "models.title",
+        "models.priceHint",
+        "models.priceTokenSummary",
+        "credentialGroups.title",
+        "credentialGroups.preview",
+        "credentialGroups.matchCount",
         "audit.title",
         "audit.actorHint",
       ]) {
