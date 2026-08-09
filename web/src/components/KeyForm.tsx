@@ -39,6 +39,7 @@ interface Props {
   onCancel: () => void;
   error?: string;
   returnPath?: string;
+  showCurrentUsage?: boolean;
   dangerLabel?: string;
   onDanger?: () => void;
 }
@@ -66,6 +67,7 @@ export default function KeyForm({
   onCancel,
   error,
   returnPath,
+  showCurrentUsage = false,
   dangerLabel,
   onDanger,
 }: Props) {
@@ -82,6 +84,8 @@ export default function KeyForm({
   const [selected, setSelected] = useState<KeyModelRef[]>(initial?.models ?? []);
   const [definitions, setDefinitions] = useState<ModelDefinition[]>([]);
   const [loadingModels, setLoadingModels] = useState(true);
+  const [modelQuery, setModelQuery] = useState("");
+  const [showSelectedOnly, setShowSelectedOnly] = useState(false);
   const [busy, setBusy] = useState(false);
   const [localError, setLocalError] = useState("");
 
@@ -103,6 +107,17 @@ export default function KeyForm({
   const selectedByName = useMemo(
     () => new Map(selected.map((ref) => [ref.name.toLowerCase(), ref])),
     [selected],
+  );
+  const filteredDefinitions = useMemo(() => {
+    const query = modelQuery.trim().toLowerCase();
+    if (!query) return definitions;
+    return definitions.filter((model) => model.name.toLowerCase().includes(query));
+  }, [definitions, modelQuery]);
+  const visibleDefinitions = useMemo(
+    () => showSelectedOnly
+      ? filteredDefinitions.filter((model) => selectedByName.has(model.name.toLowerCase()))
+      : filteredDefinitions,
+    [filteredDefinitions, selectedByName, showSelectedOnly],
   );
 
   const currentValues = (): KeyFormValues => ({
@@ -128,6 +143,24 @@ export default function KeyForm({
         : ref,
     ));
   };
+
+  const selectVisibleModels = () => {
+    setSelected((previous) => {
+      const next = new Map(previous.map((ref) => [ref.name.toLowerCase(), ref]));
+      for (const model of visibleDefinitions) {
+        if (!next.has(model.name.toLowerCase())) next.set(model.name.toLowerCase(), { name: model.name, daily_limit_usd: 0 });
+      }
+      return [...next.values()];
+    });
+  };
+
+  const clearVisibleModels = () => {
+    const visibleNames = new Set(visibleDefinitions.map((model) => model.name.toLowerCase()));
+    setSelected((previous) => previous.filter((ref) => !visibleNames.has(ref.name.toLowerCase())));
+  };
+
+  const canSelectVisible = visibleDefinitions.some((model) => !selectedByName.has(model.name.toLowerCase()));
+  const canClearVisible = visibleDefinitions.some((model) => selectedByName.has(model.name.toLowerCase()));
 
   const createModel = () => {
     navigate("/models/new", {
@@ -160,25 +193,43 @@ export default function KeyForm({
   };
 
   return (
-    <form className="key-form" onSubmit={submit}>
+    <form className="card key-form" onSubmit={submit}>
       {(error || localError) && <div className="error">{error || localError}</div>}
 
       <section className="kf-section">
         <h2>{t("keyForm.mobile.sectionBasic")}</h2>
         <div className="form-grid">
-          <label>{t("keyForm.idLabel")}<input className="input" value={id} disabled={idReadOnly} onChange={(event) => setID(event.target.value)} /></label>
-          <label>{t("keyForm.nameLabel")}<input className="input" value={name} onChange={(event) => setName(event.target.value)} /></label>
-          <label>{t("keyForm.rpmLabel")}<input className="input" type="number" min="0" value={rpm} onChange={(event) => setRPM(parseNumber(event.target.value))} /></label>
-          <label className="check-row"><input type="checkbox" checked={enabled} onChange={(event) => setEnabled(event.target.checked)} />{t("keyForm.enableKey")}</label>
+          <label><span className="field-label">{t("keyForm.idLabel")}</span><input className="input" value={id} disabled={idReadOnly} placeholder={t("keyForm.idPlaceholder")} onChange={(event) => setID(event.target.value)} /></label>
+          <label><span className="field-label">{t("keyForm.nameLabel")}</span><input className="input" value={name} placeholder={t("keyForm.namePlaceholder")} onChange={(event) => setName(event.target.value)} /></label>
+          <label><span className="field-label">{t("keyForm.rpmLabel")}</span><input className="input" type="number" min="0" value={rpm} onChange={(event) => setRPM(parseNumber(event.target.value))} /></label>
+          <fieldset className="check-field">
+            <legend>{t("keyForm.statusLabel")}</legend>
+            <label className="check-row"><input type="checkbox" checked={enabled} onChange={(event) => setEnabled(event.target.checked)} />{t("keyForm.enableKey")}</label>
+          </fieldset>
         </div>
       </section>
 
       <section className="kf-section">
         <h2>{t("keyForm.mobile.sectionLimits")}</h2>
         <div className="form-grid">
-          <label>{t("keyForm.dailyLimitLabel")}<input className="input" type="number" min="0" step="0.01" value={dailyLimit} onChange={(event) => setDailyLimit(parseNumber(event.target.value))} /></label>
-          <label>{t("keyForm.weeklyLimitLabel")}<input className="input" type="number" min="0" step="0.01" value={weeklyLimit} onChange={(event) => setWeeklyLimit(parseNumber(event.target.value))} /></label>
-          <label>{t("keyForm.monthlyLimitLabel")}<input className="input" type="number" min="0" step="0.01" value={monthlyLimit} onChange={(event) => setMonthlyLimit(parseNumber(event.target.value))} /></label>
+          <label>
+            <span className="field-label">{t("keyForm.dailyLimitLabel")}</span>
+            <input className="input" type="number" min="0" step="0.01" value={dailyLimit} onChange={(event) => setDailyLimit(parseNumber(event.target.value))} />
+            <small className="field-hint">{t("keyForm.dailyLimitHint")}</small>
+            {showCurrentUsage && initial && <small className="kf-current-usage">{t("keyForm.currentUsage", { amount: initial.usage.daily_usd.toFixed(2) })}</small>}
+          </label>
+          <label>
+            <span className="field-label">{t("keyForm.weeklyLimitLabel")}</span>
+            <input className="input" type="number" min="0" step="0.01" value={weeklyLimit} onChange={(event) => setWeeklyLimit(parseNumber(event.target.value))} />
+            <small className="field-hint">{t("keyForm.weeklyLimitHint")}</small>
+            {showCurrentUsage && initial && <small className="kf-current-usage">{t("keyForm.currentUsage", { amount: initial.usage.weekly_usd.toFixed(2) })}</small>}
+          </label>
+          <label>
+            <span className="field-label">{t("keyForm.monthlyLimitLabel")}</span>
+            <input className="input" type="number" min="0" step="0.01" value={monthlyLimit} onChange={(event) => setMonthlyLimit(parseNumber(event.target.value))} />
+            <small className="field-hint">{t("keyForm.monthlyLimitHint")}</small>
+            {showCurrentUsage && initial && <small className="kf-current-usage">{t("keyForm.currentUsage", { amount: (initial.usage.monthly_usd ?? 0).toFixed(2) })}</small>}
+          </label>
         </div>
       </section>
 
@@ -193,8 +244,18 @@ export default function KeyForm({
         {loadingModels ? <div className="muted">{t("picker.loading")}</div> : definitions.length === 0 ? (
           <div className="muted">{t("keyForm.noDefinedModels")}</div>
         ) : (
-          <div className="model-definition-list">
-            {definitions.map((model) => {
+          <>
+            <div className="model-definition-toolbar" role="group" aria-label={t("keyForm.modelToolsLabel")}>
+              <input className="input model-definition-search" aria-label={t("keyForm.searchModelsPlaceholder")} value={modelQuery} placeholder={t("keyForm.searchModelsPlaceholder")} onChange={(event) => setModelQuery(event.target.value)} />
+              <div className="model-definition-tools">
+                <button type="button" className="btn sm" disabled={!canSelectVisible} onClick={selectVisibleModels}>{t("picker.selectAll")}</button>
+                <button type="button" className="btn sm" disabled={!canClearVisible} onClick={clearVisibleModels}>{t("picker.clearAll")}</button>
+                <button type="button" className={`btn sm${showSelectedOnly ? " active" : ""}`} aria-pressed={showSelectedOnly} onClick={() => setShowSelectedOnly((current) => !current)}>{t("keyForm.showSelectedOnly")}</button>
+              </div>
+              <span className="model-selection-count">{t("keyForm.selectedModelsSummary", { selected: selected.length, total: definitions.length })}</span>
+            </div>
+            {visibleDefinitions.length === 0 ? <div className="empty-state">{t("keyForm.noModelMatch")}</div> : <div className="model-definition-list">
+            {visibleDefinitions.map((model) => {
               const ref = selectedByName.get(model.name.toLowerCase());
               return (
                 <div className={"model-definition-row" + (ref ? " active" : "")} key={model.name}>
@@ -203,19 +264,21 @@ export default function KeyForm({
                     <span><strong>{model.name}</strong><small>{priceSummary(model, t)}</small></span>
                   </label>
                   {ref && (
-                    <label className="model-limit-field">
-                      {t("keyForm.modelDailyLimit", { model: model.name })}
-                      <input className="input" type="number" min="0" step="0.01" value={ref.daily_limit_usd ?? 0} onChange={(event) => setModelDailyLimit(model.name, parseNumber(event.target.value))} />
+                    <label className="model-limit-field" title={t("keyForm.modelDailyLimit", { model: model.name })}>
+                      <span>{t("keyForm.modelDailyLimitShort")}</span>
+                      <input className="input" aria-label={t("keyForm.modelDailyLimit", { model: model.name })} type="number" min="0" step="0.01" value={ref.daily_limit_usd ?? 0} onChange={(event) => setModelDailyLimit(model.name, parseNumber(event.target.value))} />
                     </label>
                   )}
                 </div>
               );
             })}
-          </div>
+            </div>}
+          </>
         )}
       </section>
 
       <section className="kf-section">
+        <h2>{t("keyForm.mobile.sectionAccess")}</h2>
         <label className="check-row" title={t("keyForm.allowModelsTitle")}>
           <input type="checkbox" checked={allowModels} onChange={(event) => setAllowModels(event.target.checked)} />
           {t("keyForm.allowModelsLabel")}

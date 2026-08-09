@@ -1,4 +1,5 @@
 import { useT } from "../i18n";
+import Modal from "./Modal";
 
 interface Props {
   plainKey: string;
@@ -17,18 +18,15 @@ export default function PlainKeyModal({ plainKey, title, onClose }: Props) {
     }
   };
   return (
-    <div className="modal-overlay" onClick={onClose}>
-      <div className="modal" onClick={(e) => e.stopPropagation()}>
-        <h3>{title ?? t("plainModal.defaultTitle")}</h3>
-        <div className="error" style={{ fontWeight: 600 }}>
-          {t("plainModal.warning")}
-        </div>
-        <div className="keybox">{plainKey}</div>
-        <div className="actions">
-          <button className="btn primary" onClick={copy}>{t("plainModal.copy")}</button>
-          <button className="btn" onClick={onClose}>{t("plainModal.saved")}</button>
-        </div>
+    <Modal title={title ?? t("plainModal.defaultTitle")} closeLabel={t("plainModal.saved")} onClose={onClose}>
+      <div className="error" style={{ fontWeight: 600 }}>
+        {t("plainModal.warning")}
       </div>
-    </div>
+      <div className="keybox">{plainKey}</div>
+      <div className="actions">
+        <button className="btn primary" onClick={copy}>{t("plainModal.copy")}</button>
+        <button className="btn" onClick={onClose}>{t("plainModal.saved")}</button>
+      </div>
+    </Modal>
   );
 }

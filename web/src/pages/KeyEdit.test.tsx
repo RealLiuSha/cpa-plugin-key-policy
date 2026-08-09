@@ -96,6 +96,7 @@ describe("KeyEdit v3 model return flow", () => {
     const checked = [...container.querySelectorAll<HTMLInputElement>(".model-definition-main input")].filter((input) => input.checked);
     expect(checked).toHaveLength(2);
     expect(container.querySelector<HTMLInputElement>('input[value="Draft name"]')).not.toBeNull();
+    expect(container.textContent).toContain("keyForm.currentUsage");
 
     await act(async () => {
       container.querySelector("form")!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
