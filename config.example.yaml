@@ -1,5 +1,5 @@
-# Example CLIProxyAPI snippet for cpa-key-policy.
-# Replace placeholders. Do not commit real secrets or production hosts.
+# Example CLIProxyAPI snippet for cpa-key-policy v0.5.
+# Replace placeholders. Never commit real keys or production paths.
 
 plugins:
   enabled: true
@@ -8,14 +8,38 @@ plugins:
     cpa-key-policy:
       enabled: true
       priority: 10
-      # Runtime source of truth for keys, aliases, and classify rules.
-      # Usage is stored separately as cpa-key-policy-usage.json beside this file.
+      # State and usage are a paired v3 dataset. Existing state keeps keys;
+      # non-empty models/classify_rules here may intentionally override those
+      # definitions during reconfigure.
       state_file: "cpa-key-policy-state.json"
-      # Natural-day accounting boundary. Invalid zones fall back to UTC with a warning.
       usage_timezone: "Asia/Shanghai"
 
-      # Prefer creating keys/aliases/classify rules via Web UI or Management API.
-      # Seed keys below are mainly for first boot when state_file does not exist.
+      models:
+        - name: "fast"
+          targets:
+            - provider: "codex"
+              target_model: "gpt-5.6"
+              group: "team"
+            - provider: "openai"
+              target_model: "gpt-5.6"
+          dispatch: "round-robin"
+          billing_mode: "tokens"
+          free: false
+          input_price_per_million: 1
+          output_price_per_million: 2
+          cache_read_price_per_million: 0.1
+
+        - name: "community"
+          targets:
+            - provider: "codex"
+              target_model: "community-model"
+              group: "free"
+          dispatch: "priority"
+          billing_mode: "tokens"
+          free: true
+
+      # Seed keys are used only when state_file does not exist. Afterwards,
+      # create and edit keys through the Web UI or management API.
       keys:
         - id: "team-a"
           name: "Team A"
@@ -26,16 +50,14 @@ plugins:
           daily_limit_usd: 10
           weekly_limit_usd: 50
           monthly_limit_usd: 150
-          # Either bind models directly…
           models:
-            - alias: "fast"
-              provider: "codex"
-              target_model: "gpt-5.4-mini"
-              group: "free" # built-in tier; custom groups use classify:name
-            - alias: "compat-demo"
-              provider: "cerebras" # openai-compatibility channel name
-              target_model: "gpt-oss-120b"
-          # …or reference global aliases created in the UI / POST /aliases:
-          # aliases:
-          #   - alias: "cheap-chat"
-          #     daily_limit_usd: 5 # per-key cap for this alias; 0 = unlimited
+            - name: "fast"
+              daily_limit_usd: 5
+            - name: "community"
+
+      classify_rules:
+        - name: "team"
+          field: "plan_type"
+          pattern: "^team$"
+          group: "team"
+          enabled: true

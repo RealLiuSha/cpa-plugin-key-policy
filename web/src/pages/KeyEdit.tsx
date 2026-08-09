@@ -1,88 +1,81 @@
 import { useEffect, useMemo, useState } from "react";
-import { Link, useNavigate, useParams, useLocation } from "react-router-dom";
-import { listKeys, patchKey, rotateKey, deleteKey } from "../api/keys";
-import type { KeyPublic, ModelRule } from "../types";
-import KeyForm, { keyWriteRequestFromForm } from "../components/KeyForm";
+import { useLocation, useNavigate, useParams } from "react-router-dom";
+import { deleteKey, listKeys, patchKey, rotateKey } from "../api/keys";
+import KeyForm, { keyWriteRequestFromForm, type KeyFormValues } from "../components/KeyForm";
 import KeyMoreMenu, { type KeyMoreMenuItem } from "../components/KeyMoreMenu";
 import { MobileFormHeader, MobileTabBar } from "../components/MobileChrome";
 import PlainKeyModal from "../components/PlainKeyModal";
 import { useT } from "../i18n";
+import type { KeyPublic } from "../types";
 
 const EDIT_RESET_ITEMS: KeyMoreMenuItem[] = ["daily", "weekly", "monthly", "rpm"];
 
+interface ReturnedModelState {
+  createdModel?: string;
+  draftKey?: KeyFormValues;
+}
+
 export default function KeyEdit() {
   const { id } = useParams<{ id: string }>();
-  const nav = useNavigate();
-  const loc = useLocation();
+  const navigate = useNavigate();
+  const location = useLocation();
   const t = useT();
   const [key, setKey] = useState<KeyPublic | null>(null);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
   const [plain, setPlain] = useState<string | null>(null);
   const [plainTitle, setPlainTitle] = useState("");
-  // Post-save unpriced guidance. Must live here (not only in KeyForm): after a
-  // successful patch we would otherwise nav("/keys") and unmount KeyForm before
-  // its local unpricedHint could render.
-  const [unpricedAfterSave, setUnpricedAfterSave] = useState(0);
 
   useEffect(() => {
-    (async () => {
+    void (async () => {
       setLoading(true);
       try {
         const all = await listKeys();
-        const found = all.find((k) => k.id === decodeURIComponent(id ?? ""));
-        if (!found) setError(t("keys.notFound"));
-        else setKey(found);
-      } catch (e) {
-        setError((e as Error).message ?? t("keys.loadFailed"));
+        const found = all.find((candidate) => candidate.id === decodeURIComponent(id ?? ""));
+        if (found) setKey(found); else setError(t("keys.notFound"));
+      } catch (reason) {
+        setError((reason as Error).message ?? t("keys.loadFailed"));
       } finally {
         setLoading(false);
       }
     })();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [id]);
+  }, [id, t]);
 
-  // When the model-picker page returns, merge its selection into the loaded
-  // key's models, preserving everything else (id/name/limits/prices). The
-  // KeyForm price-map init keeps existing rows for aliases that survived.
-  const picked = (loc.state as { pickedModels?: ModelRule[] } | null)?.pickedModels;
+  const returned = location.state as ReturnedModelState | null;
   const initial = useMemo<KeyPublic | null>(() => {
     if (!key) return null;
-    if (!picked) return key;
-    return { ...key, models: picked };
-  }, [key, picked]);
+    if (!returned?.draftKey) return key;
+    const models = [...returned.draftKey.models];
+    if (returned.createdModel && !models.some((model) => model.name.toLowerCase() === returned.createdModel?.toLowerCase())) {
+      models.push({ name: returned.createdModel, daily_limit_usd: 0 });
+    }
+    return { ...key, ...returned.draftKey, id: key.id, models };
+  }, [key, returned]);
 
   if (loading) return <div className="muted">{t("keys.loading")}</div>;
-  if (error || !key) return <div className="error">{error || t("edit.notFound")}</div>;
-  if (!initial) return null;
-
-  const title = t("edit.title", { id: key.id });
+  if (error || !key || !initial) return <div className="error">{error || t("edit.notFound")}</div>;
 
   const onRotate = async () => {
     if (!confirm(t("keys.rotateConfirm", { id: key.id }))) return;
     try {
-      const r = await rotateKey(key.id);
-      setPlain(r.plain_key);
+      const response = await rotateKey(key.id);
+      setPlain(response.plain_key);
       setPlainTitle(t("keys.rotated"));
-    } catch (e) {
-      alert((e as Error).message ?? t("keys.rotateFailed"));
+    } catch (reason) {
+      alert((reason as Error).message ?? t("keys.rotateFailed"));
     }
   };
   const onDelete = async () => {
     if (!confirm(t("keys.deleteConfirm", { id: key.id }))) return;
     try {
       await deleteKey(key.id);
-      nav("/keys");
-    } catch (e) {
-      alert((e as Error).message ?? t("keys.deleteFailed"));
+      navigate("/keys");
+    } catch (reason) {
+      alert((reason as Error).message ?? t("keys.deleteFailed"));
     }
   };
-
-  const resetMenuProps = {
-    keyId: key.id,
-    items: EDIT_RESET_ITEMS,
-    summaryLabel: t("keys.reset"),
-  };
+  const resetMenuProps = { keyId: key.id, items: EDIT_RESET_ITEMS, summaryLabel: t("keys.reset") };
+  const title = t("edit.title", { id: key.id });
 
   return (
     <div className="form-page">
@@ -90,53 +83,27 @@ export default function KeyEdit() {
         <h1>{t("edit.hTitle")}</h1>
         <div className="fp-actions">
           <KeyMoreMenu {...resetMenuProps} />
-          <button className="btn sm" onClick={onRotate}>{t("keys.resetKey")}</button>
-          <button className="btn sm" onClick={() => nav("/keys")}>{t("keyForm.cancel")}</button>
+          <button className="btn sm" onClick={() => void onRotate()}>{t("keys.resetKey")}</button>
+          <button className="btn sm" onClick={() => navigate("/keys")}>{t("keyForm.cancel")}</button>
         </div>
       </div>
-      <div className="fp-idline mobile-hidden">
-        {key.id}<span className="fp-name">{key.name}</span>
-      </div>
+      <div className="fp-idline mobile-hidden">{key.id}<span className="fp-name">{key.name}</span></div>
       <MobileFormHeader title={title} backTo="/keys" />
-      <div className="mobile-only mobile-key-reset">
-        <KeyMoreMenu {...resetMenuProps} />
-      </div>
-      {unpricedAfterSave > 0 && (
-        <div className="kf-unpriced-after-save" data-testid="unpriced-after-save">
-          {t("keyForm.unpricedAfterSave", { n: unpricedAfterSave })}{" "}
-          <Link to="/mapping">{t("keyForm.unpricedGoMapping")}</Link>
-          {" · "}
-          <button type="button" className="btn sm" onClick={() => nav("/keys")}>
-            {t("keyForm.cancel")}
-          </button>
-        </div>
-      )}
+      <div className="mobile-only mobile-key-reset"><KeyMoreMenu {...resetMenuProps} /></div>
       <KeyForm
         initial={initial}
         idReadOnly
-        pickPath={`/keys/${encodeURIComponent(key.id)}/edit/models`}
+        returnPath={`/keys/${encodeURIComponent(key.id)}/edit`}
         submitLabel={t("edit.save")}
-        onCancel={() => nav("/keys")}
+        onCancel={() => navigate("/keys")}
         dangerLabel={t("keys.delete")}
-        onDanger={onDelete}
-        onSubmit={async (v, meta) => {
-          await patchKey(keyWriteRequestFromForm(v));
-          // Stay when newly-added aliases still need pricing so the user can
-          // follow the mapping link; otherwise return to the list as before.
-          if (meta.newUnpricedCount > 0) {
-            setUnpricedAfterSave(meta.newUnpricedCount);
-            return;
-          }
-          nav("/keys");
+        onDanger={() => void onDelete()}
+        onSubmit={async (values) => {
+          await patchKey(keyWriteRequestFromForm(values));
+          navigate("/keys");
         }}
       />
-      {plain && (
-        <PlainKeyModal
-          plainKey={plain}
-          title={plainTitle}
-          onClose={() => setPlain(null)}
-        />
-      )}
+      {plain && <PlainKeyModal plainKey={plain} title={plainTitle} onClose={() => setPlain(null)} />}
       <MobileTabBar active="keys" />
     </div>
   );

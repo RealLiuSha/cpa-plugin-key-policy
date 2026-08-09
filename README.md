@@ -1,274 +1,118 @@
 # cpa-key-policy
 
-Downstream **API key policy** plugin for [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI).
+`cpa-key-policy` is a CLIProxyAPI plugin for issuing downstream keys, routing public model names to CPA capabilities, and enforcing RPM and USD limits. Version 0.5 uses a pure v3 model domain and is intentionally incompatible with older state files.
 
-In plain words: you issue your own `cpa_…` keys to clients. Each key only sees the models you allow, can be rate-limited and budget-limited, and is routed to real CPA upstream providers (Codex, Claude, OpenAI-compat channels, etc.). CPA’s own `api-keys` can still exist for admin use — **do not put plugin-issued keys into `api-keys`**, or you bypass this plugin.
+## Model domain
 
-| | |
-|---|---|
-| **Repo** | [origin652/cpa-plugin-key-policy](https://github.com/origin652/cpa-plugin-key-policy) |
-| **License** | MIT |
-| **Install** | [CLIProxyAPI Plugins Store](https://github.com/router-for-me/CLIProxyAPI-Plugins-Store) or build from source |
-| **中文说明** | [README.zh-CN.md](./README.zh-CN.md) |
+- A `ModelDefinition` owns the client-visible name, one or more upstream routes, dispatch policy, billing mode, and global price.
+- A `ModelTarget` selects a CPA `provider`, `target_model`, and optional credential `group`.
+- A `KeyModelRef` only grants a key access to a public model and may set a per-model daily USD limit.
+- Runtime routing resolves a target without persisting derived routes on the key.
 
----
+Multiple targets support `round-robin` or `priority` dispatch. Token-priced, per-call, and explicitly free models are supported. A non-free model must have a positive active price; marking a model free requires every price field to be zero.
 
-## What it does (human version)
+For example, an administrator can expose `asd` as one stable public model while routing it to both an upstream `gpt` capability and an upstream `grok` capability. Keys reference only `asd`; target selection and pricing remain owned by that single model definition.
 
-1. **Issue keys** — create many downstream keys; each has an allow-list of models (or shared aliases).
-2. **Route** — client calls with alias name `fast`; plugin rewrites to e.g. `codex` + `gpt-5.4-mini`.
-3. **Limit** — per-key RPM, daily / trailing-7-day / trailing-30-day USD caps, per-alias daily caps, token or per-call billing.
-4. **Isolate credentials (tiers / groups)** — pin a request to Codex free/team/… or to a **custom classify group** so it never lands on the wrong auth file.
-5. **Multi-target aliases** — one alias can point at several backends (priority or round-robin).
-6. **Web UI** — manage keys, global aliases, and credential classification inside CPA.
+## Configuration
 
----
-
-## Concepts
-
-### Downstream key
-
-A plugin-owned secret (`cpa_…`). Authenticated only by this plugin. Holds:
-
-- allowed **models** and/or **aliases**
-- RPM
-- optional daily / trailing-7-day / trailing-30-day dollar limits and per-alias daily limits
-- optional `allow_models_endpoint` (see below)
-
-### Alias (global mapping table)
-
-A reusable name like `fast` that expands to one or more **targets**:
-
-| Field | Meaning |
-|--------|---------|
-| `provider` | CPA provider id (`codex`, `claude`, or an openai-compatibility **name** such as `cerebras`) |
-| `target_model` | Real upstream model id |
-| `group` | Optional credential filter (see [Credential groups](#credential-groups-tiers--classify)) |
-| `dispatch` | `priority` (always first usable target) or `round-robin` |
-| billing | `tokens` (per-million prices) or `per_call` (fixed USD) |
-
-Keys can **reference** aliases instead of duplicating targets. Multi-target aliases expand to several rules with the same alias name; auth and routing share one pick per request so the `group` filter matches the chosen target.
-
-### Credential groups (tiers + classify)
-
-Two sources of “which auth file may serve this request”:
-
-| Kind | How it appears in the picker | Stored in mapping as |
-|------|------------------------------|----------------------|
-| **Built-in tier** (Codex `plan_type`, Antigravity `tier`) | e.g. Free tier / Team | bare name: `free`, `team`, `supported` |
-| **Custom classify rule** | e.g. **Custom · vip** | prefixed: `classify:vip` |
-
-**Runtime rule:** if a mapping sets a group, the plugin scheduler **only** picks auth files in that group. No match → hard failure (`auth_not_found`), never silently fall back to another tier.
-
-**Custom classification** (Web UI → Mapping → Credential Classification):
-
-- Match auth-file fields (`filename`, `provider`, `plan_type`, `tier`, …) with a regex.
-- Assign a **group name** you choose (stored bare on the rule).
-- Catalog and mappings use `classify:<name>` so it never collides with built-in `free` / `team`.
-- One file can match **multiple** custom groups (shown under each).
-- If no custom rule matches → built-in tier (for Codex/Antigravity) or flat (no group) for other auth-file providers.
-- OpenAI-compat / API-key channels stay **flat** (no groups).
-
-Configure classify rules in the UI, or via management API (`/classify-rules`, `/classify-preview`, `/catalog`). You do not need to hand-edit state JSON for normal use.
-
-### OpenAI-compatibility providers
-
-Channels under CPA `openai-compatibility` (e.g. a named proxy) use the **channel name** as `provider`. The plugin maps it to CPA’s internal key `openai-compatible-<name>` when routing. Models must be listed on that channel in CPA config, or the host reports no auth for that model.
-
----
-
-## Capabilities (plugin hooks)
-
-| Hook | Role |
-|------|------|
-| Frontend auth | Know plugin keys; enforce alias allow-list, RPM, budget; stamp route + group metadata |
-| Model router | Alias → provider + target model |
-| Scheduler | When `group` is set, filter auth candidates by tier / `classify:` group |
-| Response interceptor | Non-stream JSON: rewrite top-level `model` back to the alias |
-| Usage | Token / per-call billing into the state file |
-| Management API + embedded Web UI | Keys, aliases, classify rules, status |
-
----
-
-## Build
-
-Linux `.so` needs cgo and a matching toolchain:
-
-```bash
-make test
-make build-linux          # builds web UI, then linux amd64/arm64 .so
-# or
-make web-build
-GOOS=linux GOARCH=amd64 CGO_ENABLED=1 go build -buildvcs=false -tags cshared \
-  -buildmode=c-shared -o dist/cpa-key-policy_linux_amd64.so ./cmd/cpa-key-policy
-```
-
-On Windows, build the `.so` via WSL/Linux. `go test ./...` uses a non-cgo stub so unit tests run without a shared-library toolchain.
-
-Copy the `.so` into CPA `plugins.dir` and enable the plugin in config.
-
----
-
-## Config
-
-Minimal shape (see also [`config.example.yaml`](./config.example.yaml)):
+See [`config.example.yaml`](config.example.yaml). The v3 shape is:
 
 ```yaml
-plugins:
-  enabled: true
-  dir: "plugins"
-  configs:
-    cpa-key-policy:
-      enabled: true
-      priority: 10
-      state_file: "cpa-key-policy-state.json"
-      usage_timezone: "Asia/Shanghai"
+enabled: true
+state_file: cpa-key-policy-state.json
+usage_timezone: Asia/Shanghai
+
+models:
+  - name: fast
+    targets:
+      - {provider: codex, target_model: gpt-5.6, group: team}
+      - {provider: openai, target_model: gpt-5.6}
+    dispatch: round-robin
+    billing_mode: tokens
+    free: false
+    input_price_per_million: 1
+    output_price_per_million: 2
+
+keys:
+  - id: team-a
+    enabled: true
+    key_hash: sha256:replace-with-hash
+    models:
+      - {name: fast, daily_limit_usd: 5}
+    daily_limit_usd: 10
+    weekly_limit_usd: 50
+    monthly_limit_usd: 150
 ```
 
-Notes:
+The first boot creates paired state and usage files with the same `dataset_id`. Later startups reject missing pairs, mismatched datasets, v1/v2 files, and future versions. Existing state remains authoritative for keys; non-empty model or credential-rule configuration can intentionally override those definitions during reconfigure.
 
-- If `state_file` exists, it is the source of truth for keys / aliases / classify rules. Usage is stored separately as `cpa-key-policy-usage.json` in the same directory.
-- Usage is bucketed by natural day in `usage_timezone` (default `Asia/Shanghai`) and retained for 35 days. Invalid zones fall back to UTC with a warning.
-- Prefer creating keys and aliases in the **Web UI** or Management API; seed YAML `keys` is mainly for first boot.
-- Never commit real key hashes, management secrets, or live host URLs into public docs.
+## Accounting
 
-Before upgrading a v1 state file, back it up and inspect the deterministic migration report twice:
+Usage is stored as natural-day buckets under `by_model`. For every key and date, the key bucket must exactly equal the sum of its model buckets. Daily, trailing-7-day, and trailing-30-day totals are derived from the same buckets.
 
-```bash
-go run ./cmd/migrate-usage -state /path/to/cpa-key-policy-state.json -dry-run
-```
+Limits are evaluated for:
 
-The report contains `before_totals` and `after_totals`. `before_totals` reports the legacy daily/weekly windows that are still effective at migration time; its `monthly_usd` is `null` because v1 never stored a 30-day aggregate. Migration preserves effective daily usage, preserves a self-consistent weekly value, and raises an invalid `weekly < daily` value to daily so the new bucket invariant holds. Run without `-dry-run` to atomically write the independent usage file; `-out` overrides its destination.
+- key RPM;
+- key daily, trailing-7-day, and trailing-30-day USD totals;
+- per-model daily USD totals.
 
----
+The API exposes one `next_accounting_boundary_at` for the next natural-day boundary. Free models still count calls and tokens but add zero cost.
 
-## Web Management UI
+## Management API and Web UI
 
-Embedded in the plugin. After load, open:
+The embedded UI has four primary areas: Keys, Models, Credential Groups, and Audit. The management base path is:
 
 ```text
-http://<your-cpa-host>:<api-port>/v0/resource/plugins/cpa-key-policy/index.html
+/v0/management/plugins/cpa-key-policy
 ```
 
-Login with CPA **management** secret (`remote-management.secret-key` / management password). The secret stays in memory only (not `localStorage`); refresh → re-login.
+Important routes:
 
-UI areas:
+| Route | Purpose |
+| --- | --- |
+| `GET/POST/PATCH/DELETE /keys` | Key lifecycle and model references |
+| `POST /keys/rotate` | Rotate a key secret |
+| `POST /keys/reset-usage` | Reset daily, 7-day, or 30-day buckets |
+| `GET /keys/usage` | Per-model usage detail |
+| `GET /keys/history` | Natural-day history with `by_model` |
+| `GET/POST/DELETE /models` | Public model definitions |
+| `POST /models/import-prices` | Preview or apply existing-model prices |
+| `GET/POST/DELETE /classify-rules` | Credential-group rules |
+| `POST /classify-rules/reorder` | Rule priority |
+| `POST /classify-preview` | Preview credential classification |
+| `POST /catalog` | Build the current CPA capability catalog |
+| `GET /audit` | Append-only management audit events |
 
-| Tab / page | Use for |
-|------------|---------|
-| Keys | Create / edit / rotate / delete keys; bind models or aliases; RPM & budgets |
-| Key usage | Today / trailing 7-day / trailing 30-day totals and a 30-day daily chart |
-| Mapping → Aliases | Global multi-target aliases, dispatch, pricing |
-| Mapping → Classification | Custom credential groups + match preview |
-| Audit | Management mutations and before/after limit values |
-| Model picker | Catalog of providers; tier / **Custom · …** subgroups |
+Model price import never creates models, never changes free models, and only applies target-derived prices when all targets of a multi-target model are matched consistently.
 
-Dev UI without rebuilding the `.so`:
+## Build and verify
+
+Prerequisites are Go 1.25 and Node.js 20+.
 
 ```bash
 cd web
-npm install
-VITE_CPA_BASE=http://127.0.0.1:8317 npm run dev
-```
+npm ci
+npm test -- --run
+npm run typecheck
+VITE_HOSTED=1 npm run build
 
----
-
-## Management API (summary)
-
-Exact paths (no path templates). Auth: CPA management bearer token.
-
-**Keys**
-
-- `GET/POST/PATCH/DELETE …/keys` (`id` in query or body for mutate)
-- `POST …/keys/rotate?id=…`
-- `POST …/keys/reset-rpm?id=…`
-- `POST …/keys/reset-usage` with `{ "id": "…", "window": "daily" | "weekly" | "monthly" }`
-- `GET …/keys/usage?id=…`
-- `GET …/keys/history?id=…&days=30` (1–35 natural days, including per-alias buckets)
-- `GET …/audit?key_id=…&limit=100`
-- `GET …/status`
-
-**Aliases**
-
-- `GET/POST/DELETE …/aliases`
-
-**Classify**
-
-- `GET/POST/DELETE …/classify-rules`
-- `POST …/classify-rules/reorder`
-- `POST …/classify-preview` — group → credential ids (UI preview; bare group names)
-- `POST …/catalog` — body: auth-file credentials + models; response: picker `entries` with `classify:` groups
-
-Create key (plain key returned **once**):
-
-```bash
-curl -X POST "$CPA/v0/management/plugins/cpa-key-policy/keys" \
-  -H "Authorization: Bearer $MANAGEMENT_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "id": "team-a",
-    "name": "Team A",
-    "rpm": 60,
-    "models": [
-      {"alias":"fast","provider":"codex","target_model":"gpt-5.4-mini","group":"free"}
-    ]
-  }'
-```
-
-Create a multi-target alias:
-
-```bash
-curl -X POST "$CPA/v0/management/plugins/cpa-key-policy/aliases" \
-  -H "Authorization: Bearer $MANAGEMENT_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "alias": "cheap-chat",
-    "dispatch": "priority",
-    "billing_mode": "tokens",
-    "targets": [
-      {"provider":"cerebras","target_model":"gpt-oss-120b"},
-      {"provider":"codex","target_model":"gpt-5.4-mini","group":"free"}
-    ]
-  }'
-```
-
----
-
-## Client request behavior
-
-| Case | Result |
-|------|--------|
-| Known key + allowed alias | Auth OK → route → optional group filter → upstream |
-| Known key + unknown model | Auth rejected |
-| RPM / budget exceeded | Rejected |
-| Group set, no matching auth file | `auth_not_found` / unavailable (no cross-tier leak) |
-| Unknown key | Plugin declines; CPA may try native `api-keys` |
-| Non-stream chat response | Top-level `model` rewritten to alias |
-| Stream | Body not rewritten (v1) |
-
-### `/v1/models` on CPA main port
-
-Per-key `allow_models_endpoint`: **binary** — deny (401) or full global list. CPA cannot filter that list per plugin key on the main port.
-
-
----
-
-## Setup checklist
-
-1. Build / install the `.so` into CPA `plugins.dir`.
-2. Enable `plugins` + `cpa-key-policy` in CPA config; set `state_file`.
-3. Open the Web UI with the management secret.
-4. (Optional) Define **classify rules** if you need custom credential buckets.
-5. Create **aliases** (multi-target / pricing) and/or pick models per key (with tier or Custom group).
-6. Create keys, save the one-time `plain_key`, hand out to clients.
-7. Client: OpenAI-compatible base URL = CPA; `Authorization: Bearer cpa_…`; `model` = alias name.
-8. Ensure openai-compat channels list the models you map; empty model lists → host “no auth” errors.
-
----
-
-## Tests
-
-```bash
+cd ..
+cp web/dist/index.html internal/plugin/web/dist/index.html
 go test ./...
-cd web && npm test && npm run build
+go vet ./...
+make build-linux-amd64
+make check-migrator-linux-amd64
 ```
+
+The plugin artifact is `dist/cpa-key-policy_linux_amd64.so`; the offline migration artifacts are `dist/migrate-model-schema_linux_amd64` and its `.sha256` file.
+
+## Upgrade from v2
+
+The runtime does not migrate old files automatically. Follow [`docs/migrate-v2-to-v3.md`](docs/migrate-v2-to-v3.md) while CPA is stopped, migrate one instance at a time, and retain the rollback package after validation.
+
+## Security and operational notes
+
+- Store only hashes in configuration or state; generated plaintext keys are returned once.
+- State, usage, and rollback files may contain operationally sensitive metadata and must remain owner-readable only.
+- Management audit events record semantic mutations. A failed audit append is logged but does not roll back a successful state mutation.
+- The response interceptor rewrites non-stream response model IDs to the requested public model. Provider routing, scheduler selection, and billing formulas otherwise retain CPA behavior.

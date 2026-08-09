@@ -12,7 +12,18 @@ import (
 )
 
 func TestNewAppDoesNotWriteStateBeforeConfigure(t *testing.T) {
-	t.Chdir(t.TempDir())
+	previousDirectory, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chdir(previousDirectory); err != nil {
+			t.Errorf("restore working directory: %v", err)
+		}
+	})
 	app := NewApp()
 	if app == nil || app.store == nil {
 		t.Fatal("NewApp returned an incomplete app")
@@ -40,6 +51,12 @@ func configureTestApp(t *testing.T) (*App, string) {
 	yaml := []byte(`
 enabled: true
 state_file: "` + filepath.ToSlash(filepath.Join(t.TempDir(), "state.json")) + `"
+models:
+  - name: fast
+    free: true
+    targets:
+      - provider: codex
+        target_model: gpt-5-codex
 keys:
   - id: team-a
     name: Team A
@@ -48,9 +65,7 @@ keys:
     key_preview: "cpa_plu..._test"
     rpm: 60
     models:
-      - alias: fast
-        provider: codex
-        target_model: gpt-5-codex
+      - name: fast
 `)
 	req, _ := json.Marshal(LifecycleRequest{ConfigYAML: yaml})
 	if _, err := app.HandleMethod(MethodPluginReconfigure, req); err != nil {
@@ -162,7 +177,7 @@ func TestAppResponseInterceptorRewritesModel(t *testing.T) {
 
 func TestAppManagementCreateAndRotate(t *testing.T) {
 	app, _ := configureTestApp(t)
-	createBody := []byte(`{"id":"team-b","models":[{"alias":"sonnet","provider":"claude","target_model":"claude-sonnet"}]}`)
+	createBody := []byte(`{"id":"team-b","models":[{"name":"fast"}]}`)
 	req, _ := json.Marshal(ManagementRequest{
 		Method: http.MethodPost,
 		Path:   "/v0/management/plugins/cpa-key-policy/keys",
@@ -229,7 +244,7 @@ func TestAppResponseInterceptorPreservesUsageWithoutBilling(t *testing.T) {
 	if err := json.Unmarshal(env.Result, &resp); err != nil {
 		t.Fatal(err)
 	}
-	// The interceptor rewrites the top-level "model" to the alias ("fast") and
+	// The interceptor rewrites the top-level "model" to the public model and
 	// leaves usage intact. Parse rather than string-compare (Go encodes map keys
 	// in sorted order).
 	var body map[string]any
@@ -299,7 +314,7 @@ func TestAppPatchKeySetsLimits(t *testing.T) {
 	f := 1.5
 	patchBody, _ := json.Marshal(map[string]any{
 		"id": "team-a", "daily_limit_usd": f, "weekly_limit_usd": 10.0, "monthly_limit_usd": 30.0,
-		"aliases": []map[string]any{{"alias": "fast", "daily_limit_usd": 2.0}},
+		"models": []map[string]any{{"name": "fast", "daily_limit_usd": 2.0}},
 	})
 	req, _ := json.Marshal(ManagementRequest{
 		Method: http.MethodPatch,
@@ -319,7 +334,7 @@ func TestAppPatchKeySetsLimits(t *testing.T) {
 			DailyLimitUSD   float64              `json:"daily_limit_usd"`
 			WeeklyLimitUSD  float64              `json:"weekly_limit_usd"`
 			MonthlyLimitUSD float64              `json:"monthly_limit_usd"`
-			Aliases         []policy.KeyAliasRef `json:"aliases"`
+			Models          []policy.KeyModelRef `json:"models"`
 			Usage           policy.UsageSummary  `json:"usage"`
 		} `json:"key"`
 	}
@@ -329,8 +344,8 @@ func TestAppPatchKeySetsLimits(t *testing.T) {
 	if payload.Key.DailyLimitUSD != 1.5 || payload.Key.WeeklyLimitUSD != 10.0 || payload.Key.MonthlyLimitUSD != 30.0 {
 		t.Fatalf("limits = %+v", payload.Key)
 	}
-	if len(payload.Key.Aliases) != 1 || payload.Key.Aliases[0].Alias != "fast" || payload.Key.Aliases[0].DailyLimitUSD != 2 {
-		t.Fatalf("alias limits = %+v", payload.Key.Aliases)
+	if len(payload.Key.Models) != 1 || payload.Key.Models[0].Name != "fast" || payload.Key.Models[0].DailyLimitUSD != 2 {
+		t.Fatalf("model limits = %+v", payload.Key.Models)
 	}
 	if payload.Key.Usage.MonthlyLimitUSD != 30 || payload.Key.Usage.Timezone != "Asia/Shanghai" || payload.Key.Usage.LimitsChangedAt.IsZero() {
 		t.Fatalf("public usage fields = %+v", payload.Key.Usage)
@@ -367,7 +382,7 @@ func TestKeyHistoryAndAuditRoutes(t *testing.T) {
 		t.Fatalf("history response = %+v", history)
 	}
 	last := history.Days[len(history.Days)-1]
-	if !nearly(last.TotalUSD, 0.30) || !nearly(last.ByAlias["fast"].TotalUSD, 0.30) {
+	if !nearly(last.TotalUSD, 0.30) || !nearly(last.ByModel["fast"].TotalUSD, 0.30) {
 		t.Fatalf("history last day = %+v", last)
 	}
 
@@ -468,6 +483,14 @@ func configurePricedApp(t *testing.T) (*App, string) {
 	yaml := []byte(`
 enabled: true
 state_file: "` + filepath.ToSlash(filepath.Join(t.TempDir(), "state.json")) + `"
+models:
+  - name: fast
+    targets:
+      - provider: codex
+        target_model: gpt-5-codex
+    billing_mode: tokens
+    input_price_per_million: 1
+    output_price_per_million: 1
 keys:
   - id: priced
     enabled: true
@@ -476,11 +499,7 @@ keys:
     rpm: 0
     daily_limit_usd: 1.00
     models:
-      - alias: fast
-        provider: codex
-        target_model: gpt-5-codex
-        input_price_per_million: 1
-        output_price_per_million: 1
+      - name: fast
 `)
 	req, _ := json.Marshal(LifecycleRequest{ConfigYAML: yaml})
 	if _, err := app.HandleMethod(MethodPluginReconfigure, req); err != nil {
@@ -523,18 +542,17 @@ func TestUsageHandleBills(t *testing.T) {
 	}
 }
 
-// TestUsageHandleAliasFallbackToModel verifies that when the host does not set
-// an Alias, we price against the resolved upstream Model (which equals the
-// alias for this plugin, since alias == target_model).
+// TestUsageHandleAliasFallbackToModel verifies that when the host omits its
+// fixed requested-model transport field, the resolved upstream Model is used.
 func TestUsageHandleAliasFallbackToModel(t *testing.T) {
 	app, plain := configurePricedApp(t)
 	hdr := http.Header{"Authorization": {"Bearer " + plain}}
 
-	// No Alias, only the resolved Model. 2M input tokens × $1/M = $2.00.
+	// Only the resolved Model is present. 2M input tokens × $1/M = $2.00.
 	// APIKey is key.ID ("priced"), matching the real host wire value.
 	req, _ := json.Marshal(UsageHandleRequest{
 		APIKey: "priced",
-		Model:  "fast", // the configured alias; pricing lookup is alias-based
+		Model:  "fast",
 		Detail: UsageDetail{InputTokens: 2_000_000, OutputTokens: 0, TotalTokens: 2_000_000},
 	})
 	if _, err := app.HandleMethod(MethodUsageHandle, req); err != nil {
@@ -542,7 +560,7 @@ func TestUsageHandleAliasFallbackToModel(t *testing.T) {
 	}
 	d := app.Store().Authenticate("POST", "/v1/chat/completions", hdr, nil, []byte(`{"model":"fast"}`))
 	if d.Allowed || !d.CostLimited {
-		t.Fatalf("alias-fallback billing should block: %+v", d)
+		t.Fatalf("resolved-model fallback billing should block: %+v", d)
 	}
 }
 
@@ -588,18 +606,22 @@ func TestUsageHandleBillsCacheReadClaude(t *testing.T) {
 	yaml := []byte(`
 enabled: true
 state_file: "` + filepath.ToSlash(filepath.Join(t.TempDir(), "state.json")) + `"
+models:
+  - name: sonnet
+    targets:
+      - provider: claude
+        target_model: claude-sonnet-4
+    billing_mode: tokens
+    input_price_per_million: 1
+    output_price_per_million: 1
+    cache_read_price_per_million: 0.10
 keys:
   - id: cached
     enabled: true
     key_hash: "` + hash + `"
     daily_limit_usd: 1.00
     models:
-      - alias: sonnet
-        provider: claude
-        target_model: claude-sonnet-4
-        input_price_per_million: 1
-        output_price_per_million: 1
-        cache_read_price_per_million: 0.10
+      - name: sonnet
 `)
 	req, _ := json.Marshal(LifecycleRequest{ConfigYAML: yaml})
 	if _, err := app.HandleMethod(MethodPluginReconfigure, req); err != nil {
@@ -630,7 +652,7 @@ keys:
 }
 
 // TestUsageHandlePerCallBills verifies the full usage.handle path for a
-// per-call-billed alias: each successful record charges the fixed PerCallUSD
+// per-call-billed public model: each successful record charges the fixed PerCallUSD
 // (ignoring token counts), and a Failed record charges nothing.
 func TestUsageHandlePerCallBills(t *testing.T) {
 	app := NewApp()
@@ -639,6 +661,15 @@ func TestUsageHandlePerCallBills(t *testing.T) {
 	yaml := []byte(`
 enabled: true
 state_file: "` + filepath.ToSlash(filepath.Join(t.TempDir(), "state.json")) + `"
+models:
+  - name: fast
+    targets:
+      - provider: codex
+        target_model: gpt-5-codex
+    billing_mode: per_call
+    per_call_usd: 0.50
+    input_price_per_million: 999
+    output_price_per_million: 999
 keys:
   - id: percall
     enabled: true
@@ -646,13 +677,7 @@ keys:
     key_preview: "cpa_pe...app"
     daily_limit_usd: 1.00
     models:
-      - alias: fast
-        provider: codex
-        target_model: gpt-5-codex
-        billing_mode: per_call
-        per_call_usd: 0.50
-        input_price_per_million: 999
-        output_price_per_million: 999
+      - name: fast
 `)
 	req, _ := json.Marshal(LifecycleRequest{ConfigYAML: yaml})
 	if _, err := app.HandleMethod(MethodPluginReconfigure, req); err != nil {
@@ -705,9 +730,9 @@ keys:
 	}
 }
 
-// TestManagementKeyUsageEndpoint: GET /keys/usage?id=... returns the per-alias
+// TestManagementKeyUsageEndpoint: GET /keys/usage?id=... returns the per-model
 // breakdown for a key after usage.handle billing. Verifies the response shape
-// (key_id/key_name/aliases), per-alias daily+weekly figures, output tokens, and
+// (key_id/key_name/models), per-model daily+weekly figures, output tokens, and
 // the 404 for an unknown key.
 func TestManagementKeyUsageEndpoint(t *testing.T) {
 	app, _ := configurePricedApp(t)
@@ -737,23 +762,23 @@ func TestManagementKeyUsageEndpoint(t *testing.T) {
 	var got struct {
 		KeyID   string                   `json:"key_id"`
 		KeyName string                   `json:"key_name"`
-		Aliases []policy.AliasUsageEntry `json:"aliases"`
+		Models  []policy.ModelUsageEntry `json:"models"`
 	}
 	if err := json.Unmarshal(resp.Body, &got); err != nil {
 		t.Fatalf("unmarshal: %v, body=%s", err, resp.Body)
 	}
-	if got.KeyID != "priced" || len(got.Aliases) != 1 {
-		t.Fatalf("usage response = %+v, want key_id=priced 1 alias", got)
+	if got.KeyID != "priced" || len(got.Models) != 1 {
+		t.Fatalf("usage response = %+v, want key_id=priced 1 model", got)
 	}
-	a := got.Aliases[0]
-	if a.Alias != "fast" || !a.InConfig || a.Provider != "codex" {
-		t.Fatalf("alias row = %+v, want fast/in_config/codex", a)
+	model := got.Models[0]
+	if model.Name != "fast" || !model.InConfig {
+		t.Fatalf("model row = %+v, want fast/in_config", model)
 	}
-	if !nearly(a.Daily.TotalUSD, 0.30) || !nearly(a.Weekly.TotalUSD, 0.30) {
-		t.Fatalf("alias usd = %+v, want 0.30/0.30", a)
+	if !nearly(model.Daily.TotalUSD, 0.30) || !nearly(model.Weekly.TotalUSD, 0.30) {
+		t.Fatalf("model usd = %+v, want 0.30/0.30", model)
 	}
-	if a.Daily.CallCount != 1 || a.Daily.InputTokens != 200_000 || a.Daily.OutputTokens != 100_000 {
-		t.Fatalf("alias daily counters = %+v, want 1/200000/100000", a.Daily)
+	if model.Daily.CallCount != 1 || model.Daily.InputTokens != 200_000 || model.Daily.OutputTokens != 100_000 {
+		t.Fatalf("model daily counters = %+v, want 1/200000/100000", model.Daily)
 	}
 
 	// Missing id → 400.
@@ -875,12 +900,12 @@ func mustHandle(t *testing.T, app *App, method string, req []byte) []byte {
 	return raw
 }
 
-// TestAppMultiTargetAliasRoute verifies that a key with a multi-target alias
-// (same alias name, different targets) routes correctly via model.route.
+// TestAppMultiTargetModelRoute verifies that a key with a multi-target public
+// model routes correctly via model.route.
 // This reproduces the 502 bug: CPA calls model.route and the plugin must
 // return Handled=true with a valid Target/TargetModel for each round-robin
 // rotation.
-func TestAppMultiTargetAliasRoute(t *testing.T) {
+func TestAppMultiTargetModelRoute(t *testing.T) {
 	app := NewApp()
 	plain := "cpa_multi_target_test"
 	hash := hashForTest(t, plain)
@@ -888,8 +913,9 @@ func TestAppMultiTargetAliasRoute(t *testing.T) {
 	yaml := []byte(`
 enabled: true
 state_file: "` + stateFile + `"
-aliases:
-  - alias: mymulti
+models:
+  - name: mymulti
+    free: true
     targets:
       - {provider: opencode, target_model: glm-5.2}
       - {provider: nvidia, target_model: z-ai/glm-5.2}
@@ -899,8 +925,8 @@ keys:
   - id: mt-key
     enabled: true
     key_hash: "` + hash + `"
-    aliases:
-      - alias: mymulti
+    models:
+      - name: mymulti
 `)
 	req, _ := json.Marshal(LifecycleRequest{ConfigYAML: yaml})
 	if _, err := app.HandleMethod(MethodPluginReconfigure, req); err != nil {
@@ -977,6 +1003,34 @@ func TestResolveProviderKey(t *testing.T) {
 				t.Fatalf("resolveProviderKey(%q, %v) = %q, want %q", tc.provider, tc.avail, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestUsageHandleTransportJSONSnapshot(t *testing.T) {
+	if ABIVersion != 1 || SchemaVersion != 1 {
+		t.Fatalf("ABI/schema versions changed: %d/%d", ABIVersion, SchemaVersion)
+	}
+	raw, err := json.Marshal(UsageHandleRequest{
+		Model:  "upstream-model",
+		Alias:  "public-model",
+		APIKey: "key-id",
+		Detail: UsageDetail{InputTokens: 1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatal(err)
+	}
+	requestedModelField := string([]byte{65, 108, 105, 97, 115})
+	for _, field := range []string{"Model", requestedModelField, "APIKey", "Failed", "Detail"} {
+		if _, exists := payload[field]; !exists {
+			t.Fatalf("transport snapshot missing %q: %s", field, raw)
+		}
+	}
+	if len(payload) != 5 || string(payload[requestedModelField]) != `"public-model"` {
+		t.Fatalf("transport snapshot = %s", raw)
 	}
 }
 

@@ -34,25 +34,9 @@ type UsageDetail struct {
 	TotalTokens         int64
 }
 
-// PriceForAlias looks up the configured per-million-token prices for an alias
-// on this key. Returns ok=false when the alias has no rule (unknown alias) —
-// callers treat unknown aliases as zero-cost (billed at 0, not blocked).
-func (k *KeyConfig) PriceForAlias(alias string) (inputPerMillion, outputPerMillion, cacheReadPerMillion float64, ok bool) {
-	alias = strings.TrimSpace(alias)
-	if alias == "" {
-		return 0, 0, 0, false
-	}
-	for _, rule := range k.Models {
-		if strings.EqualFold(rule.Alias, alias) {
-			return rule.InputPricePerMillion, rule.OutputPricePerMillion, rule.CacheReadPricePerMillion, true
-		}
-	}
-	return 0, 0, 0, false
-}
-
 // ComputeCacheCost is the cache-aware biller for the usage.handle path. It takes
-// the full token detail (with cache breakdown) plus the alias's prices and the
-// owning rule's provider, and prices cache-hit input tokens at the cache-read
+// the full token detail (with cache breakdown) plus the public model's prices
+// and routed provider, and prices cache-hit input tokens at the cache-read
 // price instead of the regular input price. Provider semantics:
 //
 //   - Additive providers (Anthropic/Claude): cache-read tokens are reported
@@ -86,7 +70,7 @@ func ComputeCacheCost(provider string, inputPerMillion, outputPerMillion, cacheR
 //   - totalCost: the full dollar bill (same as ComputeCacheCost).
 //   - cacheCost: the dollar portion attributable to cache-hit input tokens
 //     (cacheRead × cachePrice / 1M). When no cache is configured (cacheRead=0)
-//     or the alias is unpriced, cacheCost is 0 even if cache hits existed
+//     or the model is unpriced, cacheCost is 0 even if cache hits existed
 //     (because they were folded into the input-price line, not separably priced).
 //   - cacheReadTokens: the cache-hit count billed at the cache price (post-clamp).
 func ComputeCacheCostBreakdown(provider string, inputPerMillion, outputPerMillion, cacheReadPerMillion float64, priced bool, detail UsageDetail) (totalCost, cacheCost float64, cacheReadTokens int64) {

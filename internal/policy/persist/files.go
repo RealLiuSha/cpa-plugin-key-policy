@@ -66,7 +66,15 @@ func AtomicWrite(path string, raw []byte) error {
 	if err := temp.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tempName, path)
+	if err := os.Rename(tempName, path); err != nil {
+		return err
+	}
+	directory, err := os.Open(filepath.Dir(path))
+	if err != nil {
+		return err
+	}
+	defer directory.Close()
+	return directory.Sync()
 }
 
 // CleanupStaleTemps removes interrupted atomic-write files for targetPath

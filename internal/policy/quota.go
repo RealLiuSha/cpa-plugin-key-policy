@@ -24,16 +24,15 @@ const (
 )
 
 type UsageResetResult struct {
-	KeyID            string           `json:"id"`
-	Window           UsageResetWindow `json:"window"`
-	BeforeDailyUSD   float64          `json:"before_daily_usd"`
-	BeforeWeeklyUSD  float64          `json:"before_weekly_usd"`
-	BeforeMonthlyUSD float64          `json:"before_monthly_usd"`
-	AfterDailyUSD    float64          `json:"after_daily_usd"`
-	AfterWeeklyUSD   float64          `json:"after_weekly_usd"`
-	AfterMonthlyUSD  float64          `json:"after_monthly_usd"`
-	DailyResetAt     time.Time        `json:"daily_reset_at"`
-	WeeklyResetAt    time.Time        `json:"weekly_reset_at"`
+	KeyID                    string           `json:"id"`
+	Window                   UsageResetWindow `json:"window"`
+	BeforeDailyUSD           float64          `json:"before_daily_usd"`
+	BeforeWeeklyUSD          float64          `json:"before_weekly_usd"`
+	BeforeMonthlyUSD         float64          `json:"before_monthly_usd"`
+	AfterDailyUSD            float64          `json:"after_daily_usd"`
+	AfterWeeklyUSD           float64          `json:"after_weekly_usd"`
+	AfterMonthlyUSD          float64          `json:"after_monthly_usd"`
+	NextAccountingBoundaryAt time.Time        `json:"next_accounting_boundary_at"`
 }
 
 // usageLedger owns the in-memory accounting time series. All persisted
@@ -102,17 +101,17 @@ func cloneUsageState(state *UsageState) *UsageState {
 	}
 	clone := &UsageState{
 		Days:    make(map[string]UsageBucket, len(state.Days)),
-		ByAlias: make(map[string]map[string]UsageBucket, len(state.ByAlias)),
+		ByModel: make(map[string]map[string]UsageBucket, len(state.ByModel)),
 	}
 	for date, bucket := range state.Days {
 		clone.Days[date] = bucket
 	}
-	for alias, days := range state.ByAlias {
-		aliasDays := make(map[string]UsageBucket, len(days))
+	for model, days := range state.ByModel {
+		modelDays := make(map[string]UsageBucket, len(days))
 		for date, bucket := range days {
-			aliasDays[date] = bucket
+			modelDays[date] = bucket
 		}
-		clone.ByAlias[alias] = aliasDays
+		clone.ByModel[model] = modelDays
 	}
 	return clone
 }
@@ -126,8 +125,8 @@ func (l *usageLedger) entryLocked(id string) *UsageState {
 	if state.Days == nil {
 		state.Days = make(map[string]UsageBucket)
 	}
-	if state.ByAlias == nil {
-		state.ByAlias = make(map[string]map[string]UsageBucket)
+	if state.ByModel == nil {
+		state.ByModel = make(map[string]map[string]UsageBucket)
 	}
 	return state
 }
@@ -195,7 +194,7 @@ func (l *usageLedger) evictExpiredLocked(now time.Time) bool {
 				changed = true
 			}
 		}
-		for alias, days := range state.ByAlias {
+		for model, days := range state.ByModel {
 			for date := range days {
 				if date < oldest {
 					delete(days, date)
@@ -203,18 +202,18 @@ func (l *usageLedger) evictExpiredLocked(now time.Time) bool {
 				}
 			}
 			if len(days) == 0 {
-				delete(state.ByAlias, alias)
+				delete(state.ByModel, model)
 			}
 		}
-		if len(state.Days) == 0 && len(state.ByAlias) == 0 {
+		if len(state.Days) == 0 && len(state.ByModel) == 0 {
 			delete(l.entries, id)
 		}
 	}
 	return changed
 }
 
-func (l *usageLedger) RecordCost(id, alias string, amount, cacheCost float64, cacheReadTokens, inputTokens, outputTokens int64, callCount int64) {
-	if strings.TrimSpace(id) == "" {
+func (l *usageLedger) RecordCost(id, model string, amount, cacheCost float64, cacheReadTokens, inputTokens, outputTokens int64, callCount int64) {
+	if strings.TrimSpace(id) == "" || strings.TrimSpace(model) == "" {
 		return
 	}
 	now := l.now()
@@ -231,46 +230,43 @@ func (l *usageLedger) RecordCost(id, alias string, amount, cacheCost float64, ca
 		OutputTokens:    outputTokens,
 	}
 	state.Days[date] = addUsageBucket(state.Days[date], delta)
-	if alias != "" {
-		aliasDays := state.ByAlias[alias]
-		if aliasDays == nil {
-			aliasDays = make(map[string]UsageBucket)
-			state.ByAlias[alias] = aliasDays
-		}
-		aliasDays[date] = addUsageBucket(aliasDays[date], delta)
+	modelDays := state.ByModel[model]
+	if modelDays == nil {
+		modelDays = make(map[string]UsageBucket)
+		state.ByModel[model] = modelDays
 	}
+	modelDays[date] = addUsageBucket(modelDays[date], delta)
 	l.evictExpiredLocked(now)
 	l.markDirtyLocked()
 }
 
 type UsageSummary struct {
-	DailyUSD               float64   `json:"daily_usd"`
-	WeeklyUSD              float64   `json:"weekly_usd"`
-	MonthlyUSD             float64   `json:"monthly_usd"`
-	DailyLimitUSD          float64   `json:"daily_limit_usd"`
-	WeeklyLimitUSD         float64   `json:"weekly_limit_usd"`
-	MonthlyLimitUSD        float64   `json:"monthly_limit_usd"`
-	DailyResetAt           time.Time `json:"daily_reset_at,omitempty"`
-	WeeklyResetAt          time.Time `json:"weekly_reset_at,omitempty"`
-	DailyCacheCostUSD      float64   `json:"daily_cache_cost_usd,omitempty"`
-	WeeklyCacheCostUSD     float64   `json:"weekly_cache_cost_usd,omitempty"`
-	MonthlyCacheCostUSD    float64   `json:"monthly_cache_cost_usd,omitempty"`
-	DailyCacheReadTokens   int64     `json:"daily_cache_read_tokens,omitempty"`
-	WeeklyCacheReadTokens  int64     `json:"weekly_cache_read_tokens,omitempty"`
-	MonthlyCacheReadTokens int64     `json:"monthly_cache_read_tokens,omitempty"`
-	DailyInputTokens       int64     `json:"daily_input_tokens,omitempty"`
-	WeeklyInputTokens      int64     `json:"weekly_input_tokens,omitempty"`
-	MonthlyInputTokens     int64     `json:"monthly_input_tokens,omitempty"`
-	DailyCallCount         int64     `json:"daily_call_count,omitempty"`
-	WeeklyCallCount        int64     `json:"weekly_call_count,omitempty"`
-	MonthlyCallCount       int64     `json:"monthly_call_count,omitempty"`
-	SoftLimitHit           bool      `json:"soft_limit_hit"`
-	Timezone               string    `json:"timezone"`
-	LimitsChangedAt        time.Time `json:"limits_changed_at,omitempty"`
+	DailyUSD                 float64   `json:"daily_usd"`
+	WeeklyUSD                float64   `json:"weekly_usd"`
+	MonthlyUSD               float64   `json:"monthly_usd"`
+	DailyLimitUSD            float64   `json:"daily_limit_usd"`
+	WeeklyLimitUSD           float64   `json:"weekly_limit_usd"`
+	MonthlyLimitUSD          float64   `json:"monthly_limit_usd"`
+	NextAccountingBoundaryAt time.Time `json:"next_accounting_boundary_at"`
+	DailyCacheCostUSD        float64   `json:"daily_cache_cost_usd,omitempty"`
+	WeeklyCacheCostUSD       float64   `json:"weekly_cache_cost_usd,omitempty"`
+	MonthlyCacheCostUSD      float64   `json:"monthly_cache_cost_usd,omitempty"`
+	DailyCacheReadTokens     int64     `json:"daily_cache_read_tokens,omitempty"`
+	WeeklyCacheReadTokens    int64     `json:"weekly_cache_read_tokens,omitempty"`
+	MonthlyCacheReadTokens   int64     `json:"monthly_cache_read_tokens,omitempty"`
+	DailyInputTokens         int64     `json:"daily_input_tokens,omitempty"`
+	WeeklyInputTokens        int64     `json:"weekly_input_tokens,omitempty"`
+	MonthlyInputTokens       int64     `json:"monthly_input_tokens,omitempty"`
+	DailyCallCount           int64     `json:"daily_call_count,omitempty"`
+	WeeklyCallCount          int64     `json:"weekly_call_count,omitempty"`
+	MonthlyCallCount         int64     `json:"monthly_call_count,omitempty"`
+	SoftLimitHit             bool      `json:"soft_limit_hit"`
+	Timezone                 string    `json:"timezone"`
+	LimitsChangedAt          time.Time `json:"limits_changed_at,omitempty"`
 }
 
-type aliasQuotaLimit struct {
-	Alias    string
+type modelQuotaLimit struct {
+	Name     string
 	DailyUSD float64
 }
 
@@ -281,7 +277,7 @@ type quotaLimits struct {
 	DailyUSD        float64
 	WeeklyUSD       float64
 	MonthlyUSD      float64
-	Aliases         []aliasQuotaLimit
+	Models          []modelQuotaLimit
 	LimitsChangedAt time.Time
 }
 
@@ -302,35 +298,34 @@ func limitWarning(used, limit float64) bool {
 func (l *usageLedger) summaryLocked(keyID string, limits quotaLimits, now time.Time) UsageSummary {
 	daily, weekly, monthly := l.windowBucketsLocked(l.entries[keyID], now)
 	summary := UsageSummary{
-		DailyUSD:               daily.TotalUSD,
-		WeeklyUSD:              weekly.TotalUSD,
-		MonthlyUSD:             monthly.TotalUSD,
-		DailyLimitUSD:          limits.DailyUSD,
-		WeeklyLimitUSD:         limits.WeeklyUSD,
-		MonthlyLimitUSD:        limits.MonthlyUSD,
-		DailyResetAt:           l.startOfDay(now).AddDate(0, 0, 1),
-		WeeklyResetAt:          l.startOfDay(now).AddDate(0, 0, 1),
-		DailyCacheCostUSD:      daily.CacheCostUSD,
-		WeeklyCacheCostUSD:     weekly.CacheCostUSD,
-		MonthlyCacheCostUSD:    monthly.CacheCostUSD,
-		DailyCacheReadTokens:   daily.CacheReadTokens,
-		WeeklyCacheReadTokens:  weekly.CacheReadTokens,
-		MonthlyCacheReadTokens: monthly.CacheReadTokens,
-		DailyInputTokens:       daily.InputTokens,
-		WeeklyInputTokens:      weekly.InputTokens,
-		MonthlyInputTokens:     monthly.InputTokens,
-		DailyCallCount:         daily.CallCount,
-		WeeklyCallCount:        weekly.CallCount,
-		MonthlyCallCount:       monthly.CallCount,
-		Timezone:               l.timezone,
-		LimitsChangedAt:        limits.LimitsChangedAt,
+		DailyUSD:                 daily.TotalUSD,
+		WeeklyUSD:                weekly.TotalUSD,
+		MonthlyUSD:               monthly.TotalUSD,
+		DailyLimitUSD:            limits.DailyUSD,
+		WeeklyLimitUSD:           limits.WeeklyUSD,
+		MonthlyLimitUSD:          limits.MonthlyUSD,
+		NextAccountingBoundaryAt: l.startOfDay(now).AddDate(0, 0, 1),
+		DailyCacheCostUSD:        daily.CacheCostUSD,
+		WeeklyCacheCostUSD:       weekly.CacheCostUSD,
+		MonthlyCacheCostUSD:      monthly.CacheCostUSD,
+		DailyCacheReadTokens:     daily.CacheReadTokens,
+		WeeklyCacheReadTokens:    weekly.CacheReadTokens,
+		MonthlyCacheReadTokens:   monthly.CacheReadTokens,
+		DailyInputTokens:         daily.InputTokens,
+		WeeklyInputTokens:        weekly.InputTokens,
+		MonthlyInputTokens:       monthly.InputTokens,
+		DailyCallCount:           daily.CallCount,
+		WeeklyCallCount:          weekly.CallCount,
+		MonthlyCallCount:         monthly.CallCount,
+		Timezone:                 l.timezone,
+		LimitsChangedAt:          limits.LimitsChangedAt,
 	}
 	summary.SoftLimitHit = limitWarning(summary.DailyUSD, limits.DailyUSD) ||
 		limitWarning(summary.WeeklyUSD, limits.WeeklyUSD) ||
 		limitWarning(summary.MonthlyUSD, limits.MonthlyUSD)
 	if state := l.entries[keyID]; state != nil {
-		for _, alias := range limits.Aliases {
-			if limitWarning(aliasBucketForDate(state, alias.Alias, l.dateKey(now)).TotalUSD, alias.DailyUSD) {
+		for _, model := range limits.Models {
+			if limitWarning(modelBucketForDate(state, model.Name, l.dateKey(now)).TotalUSD, model.DailyUSD) {
 				summary.SoftLimitHit = true
 				break
 			}
@@ -349,18 +344,18 @@ func (l *usageLedger) Summary(keyID string, limits quotaLimits) UsageSummary {
 	return l.summaryLocked(keyID, limits, now)
 }
 
-func aliasHardLimit(limits quotaLimits, requested string) float64 {
-	for _, alias := range limits.Aliases {
-		if strings.EqualFold(alias.Alias, requested) {
-			return alias.DailyUSD
+func modelHardLimit(limits quotaLimits, requested string) float64 {
+	for _, model := range limits.Models {
+		if strings.EqualFold(model.Name, requested) {
+			return model.DailyUSD
 		}
 	}
 	return 0
 }
 
-func (l *usageLedger) OverLimit(keyID, requestedAlias string, limits quotaLimits) (string, UsageSummary) {
-	aliasLimit := aliasHardLimit(limits, requestedAlias)
-	if limits.DailyUSD <= 0 && limits.WeeklyUSD <= 0 && limits.MonthlyUSD <= 0 && aliasLimit <= 0 {
+func (l *usageLedger) OverLimit(keyID, requestedModel string, limits quotaLimits) (string, UsageSummary) {
+	modelLimit := modelHardLimit(limits, requestedModel)
+	if limits.DailyUSD <= 0 && limits.WeeklyUSD <= 0 && limits.MonthlyUSD <= 0 && modelLimit <= 0 {
 		return "", UsageSummary{}
 	}
 	now := l.now()
@@ -379,18 +374,18 @@ func (l *usageLedger) OverLimit(keyID, requestedAlias string, limits quotaLimits
 	if limits.MonthlyUSD > 0 && summary.MonthlyUSD >= limits.MonthlyUSD {
 		return "monthly_exceeded", summary
 	}
-	if aliasLimit > 0 {
-		if state := l.entries[keyID]; state != nil && aliasBucketForDate(state, requestedAlias, l.dateKey(now)).TotalUSD >= aliasLimit {
-			return "alias_daily_exceeded", summary
+	if modelLimit > 0 {
+		if state := l.entries[keyID]; state != nil && modelBucketForDate(state, requestedModel, l.dateKey(now)).TotalUSD >= modelLimit {
+			return "model_daily_exceeded", summary
 		}
 	}
 	return "", UsageSummary{}
 }
 
-func aliasBucketForDate(state *UsageState, alias, date string) UsageBucket {
+func modelBucketForDate(state *UsageState, model, date string) UsageBucket {
 	var total UsageBucket
-	for name, days := range state.ByAlias {
-		if strings.EqualFold(name, alias) {
+	for name, days := range state.ByModel {
+		if strings.EqualFold(name, model) {
 			total = addUsageBucket(total, sumBuckets(days, date, date))
 		}
 	}
@@ -426,26 +421,25 @@ func (l *usageLedger) resetWindowLocked(id string, window UsageResetWindow, now 
 		from = l.dateKeyOffset(now, -29)
 	}
 	deleteBucketRange(state.Days, from, today)
-	for alias, days := range state.ByAlias {
+	for model, days := range state.ByModel {
 		deleteBucketRange(days, from, today)
 		if len(days) == 0 {
-			delete(state.ByAlias, alias)
+			delete(state.ByModel, model)
 		}
 	}
 	l.markDirtyLocked()
 	dailyAfter, weeklyAfter, monthlyAfter := l.windowBucketsLocked(state, now)
 	nextMidnight := l.startOfDay(now).AddDate(0, 0, 1)
 	return UsageResetResult{
-		KeyID:            id,
-		Window:           window,
-		BeforeDailyUSD:   dailyBefore.TotalUSD,
-		BeforeWeeklyUSD:  weeklyBefore.TotalUSD,
-		BeforeMonthlyUSD: monthlyBefore.TotalUSD,
-		AfterDailyUSD:    dailyAfter.TotalUSD,
-		AfterWeeklyUSD:   weeklyAfter.TotalUSD,
-		AfterMonthlyUSD:  monthlyAfter.TotalUSD,
-		DailyResetAt:     nextMidnight,
-		WeeklyResetAt:    nextMidnight,
+		KeyID:                    id,
+		Window:                   window,
+		BeforeDailyUSD:           dailyBefore.TotalUSD,
+		BeforeWeeklyUSD:          weeklyBefore.TotalUSD,
+		BeforeMonthlyUSD:         monthlyBefore.TotalUSD,
+		AfterDailyUSD:            dailyAfter.TotalUSD,
+		AfterWeeklyUSD:           weeklyAfter.TotalUSD,
+		AfterMonthlyUSD:          monthlyAfter.TotalUSD,
+		NextAccountingBoundaryAt: nextMidnight,
 	}
 }
 
@@ -472,11 +466,10 @@ func (l *usageLedger) resetWindowAndPersist(id string, window UsageResetWindow, 
 	return result, nil
 }
 
-type AliasUsageEntry struct {
-	Alias       string      `json:"alias"`
-	Provider    string      `json:"provider,omitempty"`
-	TargetModel string      `json:"target_model,omitempty"`
+type ModelUsageEntry struct {
+	Name        string      `json:"name"`
 	BillingMode string      `json:"billing_mode,omitempty"`
+	Free        bool        `json:"free"`
 	PerCallUSD  float64     `json:"per_call_usd,omitempty"`
 	InConfig    bool        `json:"in_config"`
 	Daily       UsageWindow `json:"daily"`
@@ -496,48 +489,45 @@ func usageWindowFromBucket(bucket UsageBucket, start time.Time) UsageWindow {
 	}
 }
 
-func (l *usageLedger) AliasUsage(keyID string, models []ModelRule) []AliasUsageEntry {
+func (l *usageLedger) ModelUsage(keyID string, models []ModelDefinition) []ModelUsageEntry {
 	now := l.now()
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.evictExpiredLocked(now) {
 		l.markDirtyLocked()
 	}
-	byAlias := make(map[string]AliasUsageEntry)
+	byModel := make(map[string]ModelUsageEntry)
 	canonical := make(map[string]string)
-	for _, rule := range models {
-		lower := strings.ToLower(rule.Alias)
-		canonical[lower] = rule.Alias
-		if _, exists := byAlias[rule.Alias]; exists {
-			continue
-		}
-		byAlias[rule.Alias] = AliasUsageEntry{
-			Alias: rule.Alias, Provider: rule.Provider, TargetModel: rule.TargetModel,
-			BillingMode: rule.BillingMode, PerCallUSD: rule.PerCallUSD, InConfig: true,
+	for _, model := range models {
+		lower := strings.ToLower(model.Name)
+		canonical[lower] = model.Name
+		byModel[model.Name] = ModelUsageEntry{
+			Name: model.Name, BillingMode: model.BillingMode, Free: model.Free,
+			PerCallUSD: model.PerCallUSD, InConfig: true,
 		}
 	}
 	if state := l.entries[keyID]; state != nil {
-		for alias, days := range state.ByAlias {
-			display := alias
-			if configured, ok := canonical[strings.ToLower(alias)]; ok {
+		for model, days := range state.ByModel {
+			display := model
+			if configured, ok := canonical[strings.ToLower(model)]; ok {
 				display = configured
 			}
-			entry, ok := byAlias[display]
+			entry, ok := byModel[display]
 			if !ok {
-				entry = AliasUsageEntry{Alias: display}
+				entry = ModelUsageEntry{Name: display}
 			}
 			today := l.dateKey(now)
 			entry.Daily = addUsageWindow(entry.Daily, usageWindowFromBucket(sumBuckets(days, today, today), l.startOfDay(now)))
 			entry.Weekly = addUsageWindow(entry.Weekly, usageWindowFromBucket(sumBuckets(days, l.dateKeyOffset(now, -6), today), l.startOfDay(now).AddDate(0, 0, -6)))
 			entry.Monthly = addUsageWindow(entry.Monthly, usageWindowFromBucket(sumBuckets(days, l.dateKeyOffset(now, -29), today), l.startOfDay(now).AddDate(0, 0, -29)))
-			byAlias[display] = entry
+			byModel[display] = entry
 		}
 	}
-	result := make([]AliasUsageEntry, 0, len(byAlias))
-	for _, entry := range byAlias {
+	result := make([]ModelUsageEntry, 0, len(byModel))
+	for _, entry := range byModel {
 		result = append(result, entry)
 	}
-	sort.Slice(result, func(i, j int) bool { return result[i].Alias < result[j].Alias })
+	sort.Slice(result, func(i, j int) bool { return result[i].Name < result[j].Name })
 	return result
 }
 
@@ -557,7 +547,7 @@ func addUsageWindow(dst, src UsageWindow) UsageWindow {
 type UsageHistoryDay struct {
 	Date string `json:"date"`
 	UsageBucket
-	ByAlias map[string]UsageBucket `json:"by_alias,omitempty"`
+	ByModel map[string]UsageBucket `json:"by_model,omitempty"`
 }
 
 type UsageMigrationTotals struct {
@@ -601,12 +591,12 @@ func (l *usageLedger) History(keyID string, count int) []UsageHistoryDay {
 	result := make([]UsageHistoryDay, 0, count)
 	for offset := -(count - 1); offset <= 0; offset++ {
 		date := l.dateKeyOffset(now, offset)
-		day := UsageHistoryDay{Date: date, ByAlias: make(map[string]UsageBucket)}
+		day := UsageHistoryDay{Date: date, ByModel: make(map[string]UsageBucket)}
 		if state != nil {
 			day.UsageBucket = state.Days[date]
-			for alias, days := range state.ByAlias {
+			for model, days := range state.ByModel {
 				if bucket, ok := days[date]; ok {
-					day.ByAlias[alias] = bucket
+					day.ByModel[model] = bucket
 				}
 			}
 		}

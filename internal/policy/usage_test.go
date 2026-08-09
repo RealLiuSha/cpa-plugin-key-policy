@@ -18,15 +18,13 @@ func newClockedStore(t *testing.T, now time.Time) (*Store, time.Time) {
 	err := store.Configure(Config{
 		Enabled:   true,
 		StateFile: filepath.Join(t.TempDir(), "state.json"),
+		Models:    []ModelDefinition{tokenTestModel("fast", "codex", "gpt-5-codex", 1, 2)},
 		Keys: []KeyConfig{
 			{
 				ID: "team-a", Enabled: true,
-				KeyHash:    hashForUsageTest(t, "cpa_usage"),
-				KeyPreview: "cpa_us..._age",
-				Models: []ModelRule{
-					{Alias: "fast", Provider: "codex", TargetModel: "gpt-5-codex",
-						InputPricePerMillion: 1, OutputPricePerMillion: 2},
-				},
+				KeyHash:        hashForUsageTest(t, "cpa_usage"),
+				KeyPreview:     "cpa_us..._age",
+				Models:         modelRefs("fast"),
 				DailyLimitUSD:  1.00,
 				WeeklyLimitUSD: 5.00,
 			},
@@ -38,12 +36,12 @@ func newClockedStore(t *testing.T, now time.Time) (*Store, time.Time) {
 	return store, tm
 }
 
-func TestUsageLedgerLoadAndSnapshotDeepCopyAliasMap(t *testing.T) {
+func TestUsageLedgerLoadAndSnapshotDeepCopyModelMap(t *testing.T) {
 	ledger := newUsageLedger(time.Now)
 	date := ledger.dateKey(time.Now())
 	sourceState := &UsageState{
 		Days: map[string]UsageBucket{date: {TotalUSD: 1}},
-		ByAlias: map[string]map[string]UsageBucket{
+		ByModel: map[string]map[string]UsageBucket{
 			"fast": {date: {TotalUSD: 1}},
 		},
 	}
@@ -52,18 +50,18 @@ func TestUsageLedgerLoadAndSnapshotDeepCopyAliasMap(t *testing.T) {
 	// Mutating the state object supplied by the persistence layer must not
 	// change the live ledger.
 	sourceState.Days[date] = UsageBucket{TotalUSD: 9}
-	sourceState.ByAlias["fast"] = map[string]UsageBucket{date: {TotalUSD: 9}}
+	sourceState.ByModel["fast"] = map[string]UsageBucket{date: {TotalUSD: 9}}
 	first := ledger.snapshot()["team-a"]
-	if !nearly(first.Days[date].TotalUSD, 1) || !nearly(first.ByAlias["fast"][date].TotalUSD, 1) {
+	if !nearly(first.Days[date].TotalUSD, 1) || !nearly(first.ByModel["fast"][date].TotalUSD, 1) {
 		t.Fatalf("loaded ledger shares source state: %+v", first)
 	}
 
 	// A caller mutating a persistence/reporting snapshot must likewise leave
 	// the live ledger untouched.
 	first.Days[date] = UsageBucket{TotalUSD: 7}
-	first.ByAlias["fast"] = map[string]UsageBucket{date: {TotalUSD: 7}}
+	first.ByModel["fast"] = map[string]UsageBucket{date: {TotalUSD: 7}}
 	second := ledger.snapshot()["team-a"]
-	if !nearly(second.Days[date].TotalUSD, 1) || !nearly(second.ByAlias["fast"][date].TotalUSD, 1) {
+	if !nearly(second.Days[date].TotalUSD, 1) || !nearly(second.ByModel["fast"][date].TotalUSD, 1) {
 		t.Fatalf("ledger shares returned snapshot: %+v", second)
 	}
 }
@@ -113,11 +111,11 @@ func TestUsageUnlimitedKeyNeverBlocked(t *testing.T) {
 	err := store.Configure(Config{
 		Enabled:   true,
 		StateFile: filepath.Join(t.TempDir(), "state.json"),
+		Models:    []ModelDefinition{tokenTestModel("fast", "codex", "gpt-5-codex", 10, 10)},
 		Keys: []KeyConfig{{
 			ID: "free", Enabled: true,
 			KeyHash: hashForUsageTest(t, "cpa_free"),
-			Models: []ModelRule{{Alias: "fast", Provider: "codex", TargetModel: "gpt-5-codex",
-				InputPricePerMillion: 10, OutputPricePerMillion: 10}},
+			Models:  modelRefs("fast"),
 		}},
 	})
 	if err != nil {
@@ -133,27 +131,22 @@ func TestUsageUnlimitedKeyNeverBlocked(t *testing.T) {
 	}
 }
 
-func TestUsageUnpricedAliasNotBilled(t *testing.T) {
-	now := time.Date(2026, 6, 29, 10, 0, 0, 0, time.UTC)
+func TestUsageUnpricedModelRejected(t *testing.T) {
 	store := NewStore()
-	store.SetClock(func() time.Time { return now })
 	err := store.Configure(Config{
 		Enabled:   true,
 		StateFile: filepath.Join(t.TempDir(), "state.json"),
+		Models: []ModelDefinition{{
+			Name: "fast", Targets: []ModelTarget{{Provider: "codex", TargetModel: "gpt-5-codex"}}, BillingMode: "tokens",
+		}},
 		Keys: []KeyConfig{{
 			ID: "cheap", Enabled: true, DailyLimitUSD: 0.01,
 			KeyHash: hashForUsageTest(t, "cpa_cheap"),
-			Models:  []ModelRule{{Alias: "fast", Provider: "codex", TargetModel: "gpt-5-codex"}}, // no prices
+			Models:  modelRefs("fast"),
 		}},
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	hdr := map[string][]string{"Authorization": {"Bearer cpa_cheap"}}
-	_ = store.RecordUsage("cheap", "fast", "gpt-5-codex", false, UsageDetail{InputTokens: 99_999_999, OutputTokens: 99_999_999})
-	d := store.Authenticate("POST", "/v1/chat/completions", hdr, nil, []byte(`{"model":"fast"}`))
-	if !d.Allowed {
-		t.Fatalf("unpriced alias should never exceed: %+v", d)
+	if err == nil {
+		t.Fatal("unpriced model was accepted")
 	}
 }
 
@@ -164,11 +157,11 @@ func TestUsageHandleBillsStreamingAndSkipsMissingReports(t *testing.T) {
 	err := store.Configure(Config{
 		Enabled:   true,
 		StateFile: filepath.Join(t.TempDir(), "state.json"),
+		Models:    []ModelDefinition{tokenTestModel("fast", "codex", "gpt-5-codex", 1, 1)},
 		Keys: []KeyConfig{{
 			ID: "streamy", Enabled: true, DailyLimitUSD: 0.01,
 			KeyHash: hashForUsageTest(t, "cpa_stream"),
-			Models: []ModelRule{{Alias: "fast", Provider: "codex", TargetModel: "gpt-5-codex",
-				InputPricePerMillion: 1, OutputPricePerMillion: 1}},
+			Models:  modelRefs("fast"),
 		}},
 	})
 	if err != nil {
@@ -189,11 +182,11 @@ func TestUsageHandleBillsStreamingAndSkipsMissingReports(t *testing.T) {
 	store2.SetClock(func() time.Time { return now })
 	if err := store2.Configure(Config{
 		Enabled: true, StateFile: filepath.Join(t.TempDir(), "state2.json"),
+		Models: []ModelDefinition{tokenTestModel("fast", "codex", "gpt-5-codex", 1, 1)},
 		Keys: []KeyConfig{{
 			ID: "streamy2", Enabled: true, DailyLimitUSD: 0.01,
 			KeyHash: hashForUsageTest(t, "cpa_stream2"),
-			Models: []ModelRule{{Alias: "fast", Provider: "codex", TargetModel: "gpt-5-codex",
-				InputPricePerMillion: 1, OutputPricePerMillion: 1}},
+			Models:  modelRefs("fast"),
 		}},
 	}); err != nil {
 		t.Fatal(err)
@@ -224,8 +217,8 @@ func TestUsageSummaryReflectsUsage(t *testing.T) {
 	if s.DailyLimitUSD != 1.0 || s.WeeklyLimitUSD != 5.0 {
 		t.Fatalf("limits = %+v", s)
 	}
-	if s.DailyResetAt.IsZero() {
-		t.Fatal("daily_reset_at should be set")
+	if s.NextAccountingBoundaryAt.IsZero() {
+		t.Fatal("next_accounting_boundary_at should be set")
 	}
 }
 
@@ -237,11 +230,11 @@ func TestUsagePersistsAcrossRestart(t *testing.T) {
 		s.SetClock(clock)
 		if err := s.Configure(Config{
 			Enabled: true, StateFile: path,
+			Models: []ModelDefinition{tokenTestModel("fast", "codex", "gpt-5-codex", 1, 0)},
 			Keys: []KeyConfig{{
 				ID: "team-a", Enabled: true, DailyLimitUSD: 1.0,
 				KeyHash: hashForUsageTest(t, "cpa_usage"),
-				Models: []ModelRule{{Alias: "fast", Provider: "codex", TargetModel: "gpt-5-codex",
-					InputPricePerMillion: 1, OutputPricePerMillion: 0}},
+				Models:  modelRefs("fast"),
 			}},
 		}); err != nil {
 			t.Fatal(err)
@@ -284,13 +277,11 @@ func TestResetUsageWindowDailyAndWeekly(t *testing.T) {
 	if err := store.Configure(Config{
 		Enabled:   true,
 		StateFile: statePath,
+		Models:    []ModelDefinition{tokenTestModel("fast", "codex", "gpt-5", 1, 1)},
 		Keys: []KeyConfig{{
 			ID: "resettable", Enabled: true,
 			KeyHash: hashForUsageTest(t, "cpa_resettable"),
-			Models: []ModelRule{{
-				Alias: "fast", Provider: "codex", TargetModel: "gpt-5",
-				InputPricePerMillion: 1, OutputPricePerMillion: 1,
-			}},
+			Models:  modelRefs("fast"),
 		}},
 	}); err != nil {
 		t.Fatal(err)
@@ -310,9 +301,9 @@ func TestResetUsageWindowDailyAndWeekly(t *testing.T) {
 	if !nearly(summary.DailyUSD, 0) || !nearly(summary.WeeklyUSD, 0) {
 		t.Fatalf("after daily reset = %+v, want daily 0 / weekly 0", summary)
 	}
-	_, aliases, ok := store.AliasUsageFor("resettable")
-	if !ok || len(aliases) != 1 || !nearly(aliases[0].Daily.TotalUSD, 0) || !nearly(aliases[0].Weekly.TotalUSD, 0) {
-		t.Fatalf("alias after daily reset = %+v, want daily 0 / weekly 0", aliases)
+	_, models, ok := store.ModelUsageFor("resettable")
+	if !ok || len(models) != 1 || !nearly(models[0].Daily.TotalUSD, 0) || !nearly(models[0].Weekly.TotalUSD, 0) {
+		t.Fatalf("model after daily reset = %+v, want daily 0 / weekly 0", models)
 	}
 
 	_ = store.RecordUsage("resettable", "fast", "gpt-5", false, UsageDetail{
@@ -329,9 +320,9 @@ func TestResetUsageWindowDailyAndWeekly(t *testing.T) {
 	if !nearly(summary.DailyUSD, 0) || !nearly(summary.WeeklyUSD, 0) {
 		t.Fatalf("after weekly reset = %+v, want daily 0 / weekly 0", summary)
 	}
-	_, aliases, _ = store.AliasUsageFor("resettable")
-	if len(aliases) != 1 || !nearly(aliases[0].Daily.TotalUSD, 0) || !nearly(aliases[0].Weekly.TotalUSD, 0) {
-		t.Fatalf("alias after weekly reset = %+v, want daily 0 / weekly 0", aliases)
+	_, models, _ = store.ModelUsageFor("resettable")
+	if len(models) != 1 || !nearly(models[0].Daily.TotalUSD, 0) || !nearly(models[0].Weekly.TotalUSD, 0) {
+		t.Fatalf("model after weekly reset = %+v, want daily 0 / weekly 0", models)
 	}
 
 	reloaded := NewStore()
@@ -353,9 +344,10 @@ func TestResetUsageWindowMonthlyClearsThirtyDays(t *testing.T) {
 	store.SetClock(func() time.Time { return now })
 	if err := store.Configure(Config{
 		Enabled: true, StateFile: statePath,
+		Models: []ModelDefinition{tokenTestModel("fast", "codex", "gpt-5", 1, 0)},
 		Keys: []KeyConfig{{
 			ID: "monthly-reset", Enabled: true, KeyHash: hashForUsageTest(t, "cpa_monthly_reset"),
-			Models: []ModelRule{{Alias: "fast", Provider: "codex", TargetModel: "gpt-5", InputPricePerMillion: 1}},
+			Models: modelRefs("fast"),
 		}},
 	}); err != nil {
 		t.Fatal(err)
@@ -378,9 +370,9 @@ func TestResetUsageWindowMonthlyClearsThirtyDays(t *testing.T) {
 	if !nearly(summary.DailyUSD, 0) || !nearly(summary.WeeklyUSD, 0) || !nearly(summary.MonthlyUSD, 0) {
 		t.Fatalf("monthly reset summary = %+v", summary)
 	}
-	_, aliases, ok := store.AliasUsageFor("monthly-reset")
-	if !ok || len(aliases) != 1 || !nearly(aliases[0].Monthly.TotalUSD, 0) {
-		t.Fatalf("monthly reset aliases = %+v", aliases)
+	_, models, ok := store.ModelUsageFor("monthly-reset")
+	if !ok || len(models) != 1 || !nearly(models[0].Monthly.TotalUSD, 0) {
+		t.Fatalf("monthly reset models = %+v", models)
 	}
 }
 
@@ -402,13 +394,11 @@ func TestResetUsageWindowRollsBackWhenPersistenceFails(t *testing.T) {
 	if err := store.Configure(Config{
 		Enabled:   true,
 		StateFile: statePath,
+		Models:    []ModelDefinition{tokenTestModel("fast", "codex", "gpt-5", 1, 1)},
 		Keys: []KeyConfig{{
 			ID: "resettable", Enabled: true,
 			KeyHash: hashForUsageTest(t, "cpa_resettable"),
-			Models: []ModelRule{{
-				Alias: "fast", Provider: "codex", TargetModel: "gpt-5",
-				InputPricePerMillion: 1, OutputPricePerMillion: 1,
-			}},
+			Models:  modelRefs("fast"),
 		}},
 	}); err != nil {
 		t.Fatal(err)
@@ -422,6 +412,9 @@ func TestResetUsageWindowRollsBackWhenPersistenceFails(t *testing.T) {
 		t.Fatal(err)
 	}
 	usagePath := filepath.Join(filepath.Dir(statePath), "cpa-key-policy-usage.json")
+	if err := os.Remove(usagePath); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.Mkdir(usagePath, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -433,9 +426,9 @@ func TestResetUsageWindowRollsBackWhenPersistenceFails(t *testing.T) {
 	if !nearly(summary.DailyUSD, 0.30) || !nearly(summary.WeeklyUSD, 0.30) {
 		t.Fatalf("usage after failed reset = %+v, want in-memory rollback to 0.30/0.30", summary)
 	}
-	_, aliases, ok := store.AliasUsageFor("resettable")
-	if !ok || len(aliases) != 1 || !nearly(aliases[0].Daily.TotalUSD, 0.30) || !nearly(aliases[0].Weekly.TotalUSD, 0.30) {
-		t.Fatalf("alias usage after failed reset = %+v, want rollback to 0.30/0.30", aliases)
+	_, models, ok := store.ModelUsageFor("resettable")
+	if !ok || len(models) != 1 || !nearly(models[0].Daily.TotalUSD, 0.30) || !nearly(models[0].Weekly.TotalUSD, 0.30) {
+		t.Fatalf("model usage after failed reset = %+v, want rollback to 0.30/0.30", models)
 	}
 	persisted, err := os.ReadFile(statePath)
 	if err != nil {
@@ -446,7 +439,7 @@ func TestResetUsageWindowRollsBackWhenPersistenceFails(t *testing.T) {
 	}
 }
 
-// newCacheStore builds a store with one key whose alias has an explicit
+// newCacheStore builds a store with one key whose model has an explicit
 // cache-read price, for cache-stat accounting tests.
 func newCacheStore(t *testing.T, now time.Time, provider string) *Store {
 	t.Helper()
@@ -455,16 +448,15 @@ func newCacheStore(t *testing.T, now time.Time, provider string) *Store {
 	if err := store.Configure(Config{
 		Enabled:   true,
 		StateFile: filepath.Join(t.TempDir(), "state.json"),
+		Models: []ModelDefinition{{
+			Name: "fast", Targets: []ModelTarget{{Provider: provider, TargetModel: "m"}}, BillingMode: "tokens",
+			InputPricePerMillion: 3, OutputPricePerMillion: 15, CacheReadPricePerMillion: 0.30,
+		}},
 		Keys: []KeyConfig{{
 			ID: "cache-key", Enabled: true,
 			KeyHash:    hashForUsageTest(t, "cpa_cache"),
 			KeyPreview: "cpa_ca...che",
-			Models: []ModelRule{{
-				Alias: "fast", Provider: provider, TargetModel: "m",
-				InputPricePerMillion:     3,
-				OutputPricePerMillion:    15,
-				CacheReadPricePerMillion: 0.30,
-			}},
+			Models:     modelRefs("fast"),
 		}},
 	}); err != nil {
 		t.Fatal(err)
@@ -503,9 +495,9 @@ func TestCacheStatsAccumulatedAndHitRate(t *testing.T) {
 	if !nearly(s.WeeklyCacheCostUSD, 0.06) || s.WeeklyCacheReadTokens != 200_000 {
 		t.Fatalf("weekly cache stats = %+v, want 0.06/200000", s)
 	}
-	_, rows, ok := store.AliasUsageFor("cache-key")
-	if !ok || len(rows) != 1 || rows[0].Alias != "fast" {
-		t.Fatalf("cache-aware mixed-case alias rows = %+v, want one canonical fast row", rows)
+	_, rows, ok := store.ModelUsageFor("cache-key")
+	if !ok || len(rows) != 1 || rows[0].Name != "fast" {
+		t.Fatalf("cache-aware mixed-case model rows = %+v, want one canonical fast row", rows)
 	}
 }
 
@@ -571,15 +563,14 @@ func TestCacheStatsPersistAcrossRestart(t *testing.T) {
 		s.SetClock(func() time.Time { return now })
 		if err := s.Configure(Config{
 			Enabled: true, StateFile: path,
+			Models: []ModelDefinition{{
+				Name: "fast", Targets: []ModelTarget{{Provider: "openai", TargetModel: "m"}}, BillingMode: "tokens",
+				InputPricePerMillion: 3, OutputPricePerMillion: 15, CacheReadPricePerMillion: 0.30,
+			}},
 			Keys: []KeyConfig{{
 				ID: "cache-key", Enabled: true,
 				KeyHash: hashForUsageTest(t, "cpa_cache"),
-				Models: []ModelRule{{
-					Alias: "fast", Provider: "openai", TargetModel: "m",
-					InputPricePerMillion:     3,
-					OutputPricePerMillion:    15,
-					CacheReadPricePerMillion: 0.30,
-				}},
+				Models:  modelRefs("fast"),
 			}},
 		}); err != nil {
 			t.Fatal(err)
@@ -600,30 +591,25 @@ func TestCacheStatsPersistAcrossRestart(t *testing.T) {
 	}
 }
 
-// newPerCallStore builds a store with one key whose alias is billed per-call at
+// newPerCallStore builds a store with one key whose model is billed per-call at
 // perCallUSD, under a daily dollar limit, for per-call billing tests.
 func newPerCallStore(t *testing.T, perCallUSD, dailyLimit float64) *Store {
 	t.Helper()
 	now := time.Date(2026, 6, 29, 10, 0, 0, 0, time.UTC)
 	store := NewStore()
 	store.SetClock(func() time.Time { return now })
+	model := perCallTestModel("fast", "codex", "gpt-5-codex", perCallUSD)
+	if perCallUSD == 0 {
+		model.Free = true
+	}
 	if err := store.Configure(Config{
 		Enabled:   true,
 		StateFile: filepath.Join(t.TempDir(), "state.json"),
+		Models:    []ModelDefinition{model},
 		Keys: []KeyConfig{{
 			ID: "percall", Enabled: true, DailyLimitUSD: dailyLimit,
 			KeyHash: hashForUsageTest(t, "cpa_percall"),
-			Models: []ModelRule{{
-				Alias:       "fast",
-				Provider:    "codex",
-				TargetModel: "gpt-5-codex",
-				BillingMode: "per_call",
-				PerCallUSD:  perCallUSD,
-				// Token prices are dormant under per_call but kept to verify they
-				// are NOT used.
-				InputPricePerMillion:  999,
-				OutputPricePerMillion: 999,
-			}},
+			Models:  modelRefs("fast"),
 		}},
 	}); err != nil {
 		t.Fatal(err)
@@ -661,18 +647,18 @@ func TestPerCallBillsFixedUSD(t *testing.T) {
 	if s.DailyCallCount != 2 {
 		t.Fatalf("daily call count = %d, want 2", s.DailyCallCount)
 	}
-	_, rows, ok := store.AliasUsageFor("percall")
-	if !ok || len(rows) != 1 || rows[0].Alias != "fast" || rows[0].Daily.CallCount != 2 {
-		t.Fatalf("per-call mixed-case alias rows = %+v, want one canonical fast row with 2 calls", rows)
+	_, rows, ok := store.ModelUsageFor("percall")
+	if !ok || len(rows) != 1 || rows[0].Name != "fast" || rows[0].Daily.CallCount != 2 {
+		t.Fatalf("per-call mixed-case model rows = %+v, want one canonical fast row with 2 calls", rows)
 	}
 }
 
-// TestTokenModeFreeAliasStillCounts: a token-mode alias whose configured
+// TestTokenModeFreeModelStillCounts: a token-mode model whose configured
 // input/output/cache prices are all 0 (priced=true but free) must still
 // record token + call counters. The usage handler previously gated ledger
 // recording on `cost > 0`, dropping free-but-priced
 // requests entirely so their usage volume / hit-rate was invisible.
-func TestTokenModeFreeAliasStillCounts(t *testing.T) {
+func TestTokenModeFreeModelStillCounts(t *testing.T) {
 	now := time.Date(2026, 7, 2, 12, 0, 0, 0, time.UTC)
 	store := NewStore()
 	store.SetClock(func() time.Time { return now })
@@ -680,14 +666,9 @@ func TestTokenModeFreeAliasStillCounts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.Configure(Config{Enabled: true, StateFile: filepath.Join(t.TempDir(), "state.json"), Keys: []KeyConfig{{
+	if err := store.Configure(Config{Enabled: true, StateFile: filepath.Join(t.TempDir(), "state.json"), Models: []ModelDefinition{freeTestModel("fast", "anthropic", "m")}, Keys: []KeyConfig{{
 		ID: "free", Enabled: true, KeyHash: hash,
-		Models: []ModelRule{{
-			Alias: "fast", Provider: "anthropic", TargetModel: "m",
-			InputPricePerMillion:     0,
-			OutputPricePerMillion:    0,
-			CacheReadPricePerMillion: 0,
-		}},
+		Models: modelRefs("fast"),
 	}}}); err != nil {
 		t.Fatal(err)
 	}
@@ -696,7 +677,7 @@ func TestTokenModeFreeAliasStillCounts(t *testing.T) {
 		InputTokens: 1_000_000, OutputTokens: 500_000, CacheReadTokens: 200_000,
 	})
 	if cost != 0 {
-		t.Fatalf("cost = %v, want 0 (free alias)", cost)
+		t.Fatalf("cost = %v, want 0 (free model)", cost)
 	}
 	sum := store.UsageSummaryFor(store.Keys()[0])
 	if sum.DailyCallCount != 1 {
@@ -719,9 +700,9 @@ func TestAllowModelsEndpointPerKey(t *testing.T) {
 	store := NewStore()
 	hashA, _ := HashKey("cpa_a")
 	hashB, _ := HashKey("cpa_b")
-	if err := store.Configure(Config{Enabled: true, StateFile: filepath.Join(t.TempDir(), "state2.json"), Keys: []KeyConfig{
-		{ID: "hidden", Enabled: true, KeyHash: hashA, Models: []ModelRule{{Alias: "fast", Provider: "codex", TargetModel: "gpt-5-codex"}}},
-		{ID: "open", Enabled: true, KeyHash: hashB, Models: []ModelRule{{Alias: "fast", Provider: "codex", TargetModel: "gpt-5-codex"}}, AllowModelsEndpoint: true},
+	if err := store.Configure(Config{Enabled: true, StateFile: filepath.Join(t.TempDir(), "state2.json"), Models: []ModelDefinition{freeTestModel("fast", "codex", "gpt-5-codex")}, Keys: []KeyConfig{
+		{ID: "hidden", Enabled: true, KeyHash: hashA, Models: modelRefs("fast")},
+		{ID: "open", Enabled: true, KeyHash: hashB, Models: modelRefs("fast"), AllowModelsEndpoint: true},
 	}}); err != nil {
 		t.Fatal(err)
 	}
@@ -773,27 +754,23 @@ func TestPerCallZeroStillCounts(t *testing.T) {
 	}
 }
 
-// TestAliasUsageBreakdown: per-alias daily/weekly windows accumulate
-// independently, configured-but-unused aliases appear as zero rows, output
-// tokens are tracked, and an alias that was billed then removed from the key's
-// config appears as a residual with InConfig=false.
-func TestAliasUsageBreakdown(t *testing.T) {
+// TestModelUsageBreakdown verifies model windows, unused configured rows, and
+// historical residuals after a model is removed from a key.
+func TestModelUsageBreakdown(t *testing.T) {
 	now := time.Date(2026, 6, 29, 10, 0, 0, 0, time.UTC)
 	statePath := filepath.Join(t.TempDir(), "state.json")
 	store := NewStore()
 	store.SetClock(func() time.Time { return now })
-	mkCfg := func(models []ModelRule) Config {
-		return Config{Enabled: true, StateFile: statePath, Keys: []KeyConfig{{
-			ID: "team-a", Enabled: true,
-			KeyHash: hashForUsageTest(t, "cpa_usage"),
-			Models:  models,
-		}}}
-	}
-	fast := ModelRule{Alias: "fast", Provider: "codex", TargetModel: "gpt-5-codex",
-		InputPricePerMillion: 1, OutputPricePerMillion: 2}
-	slow := ModelRule{Alias: "slow", Provider: "codex", TargetModel: "o4-mini",
-		InputPricePerMillion: 1, OutputPricePerMillion: 1}
-	if err := store.Configure(mkCfg([]ModelRule{fast, slow})); err != nil {
+	if err := store.Configure(Config{
+		Enabled: true, StateFile: statePath,
+		Models: []ModelDefinition{
+			tokenTestModel("fast", "codex", "gpt-5-codex", 1, 2),
+			tokenTestModel("slow", "codex", "o4-mini", 1, 1),
+		},
+		Keys: []KeyConfig{{
+			ID: "team-a", Enabled: true, KeyHash: hashForUsageTest(t, "cpa_usage"), Models: modelRefs("fast", "slow"),
+		}},
+	}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -805,145 +782,58 @@ func TestAliasUsageBreakdown(t *testing.T) {
 	_ = store.RecordUsage("team-a", "slow", "o4-mini", false, UsageDetail{
 		InputTokens: 50_000, OutputTokens: 0,
 	})
-	// Update the key to ONLY fast (mirrors the management PATCH path:
-	// the alias is removed from config but the usage ledger keeps its history).
-	// In the new architecture, keys reference global aliases by name, so we
-	// update teamA.Aliases to only reference "fast".
 	teamA := store.Keys()[0]
-	teamA.Aliases = []KeyAliasRef{{Alias: "fast"}}
-	teamA.Models = nil
+	teamA.Models = modelRefs("fast")
 	if err := store.UpsertKey(teamA, true); err != nil {
 		t.Fatal(err)
 	}
 
-	_, rows, ok := store.AliasUsageFor("team-a")
+	_, rows, ok := store.ModelUsageFor("team-a")
 	if !ok {
 		t.Fatal("key not found")
 	}
-	byAlias := map[string]AliasUsageEntry{}
-	for _, r := range rows {
-		byAlias[r.Alias] = r
+	byModel := map[string]ModelUsageEntry{}
+	for _, row := range rows {
+		byModel[row.Name] = row
 	}
 	if len(rows) != 2 {
 		t.Fatalf("row count = %d, want 2 (fast+slow residual)", len(rows))
 	}
 	// fast: configured, billed $0.40 daily & weekly, 1 call, 200K input, 100K output.
-	f := byAlias["fast"]
+	f := byModel["fast"]
 	if !f.InConfig || !nearly(f.Daily.TotalUSD, 0.40) || !nearly(f.Weekly.TotalUSD, 0.40) {
 		t.Fatalf("fast row = %+v, want in_config=true $0.40/$0.40", f)
 	}
 	if f.Daily.CallCount != 1 || f.Daily.InputTokens != 200_000 || f.Daily.OutputTokens != 100_000 {
 		t.Fatalf("fast daily counters = %+v, want 1/200000/100000", f.Daily)
 	}
-	if f.Provider != "codex" || f.TargetModel != "gpt-5-codex" {
-		t.Fatalf("fast config fields = %+v", f)
-	}
 	// slow: removed from config but has historical usage → InConfig=false, residual data.
-	s := byAlias["slow"]
+	s := byModel["slow"]
 	if s.InConfig {
 		t.Fatalf("slow should be in_config=false after removal: %+v", s)
 	}
 	if !nearly(s.Daily.TotalUSD, 0.05) || s.Daily.InputTokens != 50_000 || s.Daily.CallCount != 1 {
 		t.Fatalf("slow residual daily = %+v, want $0.05 / 50000 / 1 call", s.Daily)
 	}
-	// Sorted by alias.
-	if rows[0].Alias != "fast" || rows[1].Alias != "slow" {
-		t.Fatalf("rows not sorted by alias: %+v", rows)
+	if rows[0].Name != "fast" || rows[1].Name != "slow" {
+		t.Fatalf("rows not sorted by model: %+v", rows)
 	}
 }
 
-// TestAliasUsageUnknownKey: a missing key id returns ok=false.
-func TestAliasUsageUnknownKey(t *testing.T) {
+func TestModelUsageUnknownKey(t *testing.T) {
 	store := NewStore()
 	if err := store.Configure(Config{Enabled: true, StateFile: filepath.Join(t.TempDir(), "s.json")}); err != nil {
 		t.Fatal(err)
 	}
-	_, _, ok := store.AliasUsageFor("nope")
+	_, _, ok := store.ModelUsageFor("nope")
 	if ok {
 		t.Fatal("unknown key should return ok=false")
 	}
 }
 
-// TestAliasUsageLegacyStateMigrates verifies that a v1 aggregate state is
-// converted into natural-day buckets and persisted to the independent usage
-// file without losing the per-alias counters.
-func TestAliasUsageLegacyStateMigrates(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "state.json")
-	// Hand-write a legacy state file: by_alias is map[string]UsageWindow.
-	legacy := map[string]any{
-		"version": 1,
-		"keys": []map[string]any{{
-			"id": "team-a", "enabled": true,
-			"key_hash": hashForUsageTest(t, "cpa_usage"),
-			"models": []map[string]any{{
-				"alias": "fast", "provider": "codex", "target_model": "gpt-5-codex",
-			}},
-		}},
-		"usage": map[string]any{
-			"team-a": map[string]any{
-				"daily":  map[string]any{"total_usd": 0.80, "window_start": "2026-06-29T00:00:00Z"},
-				"weekly": map[string]any{"total_usd": 0.80, "window_start": "2026-06-29T00:00:00Z"},
-				// Legacy single-window per-alias entry.
-				"by_alias": map[string]any{
-					"fast": map[string]any{"total_usd": 0.80, "call_count": 2, "input_tokens": 800000, "window_start": "2026-06-29T00:00:00Z"},
-				},
-			},
-		},
-		"updated_at": "2026-06-29T10:00:00Z",
-	}
-	raw, _ := json.Marshal(legacy)
-	if err := os.WriteFile(path, raw, 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	now := time.Date(2026, 6, 29, 10, 0, 0, 0, time.UTC)
-	store := NewStore()
-	store.SetClock(func() time.Time { return now })
-	if err := store.Configure(Config{Enabled: true, StateFile: path}); err != nil {
-		t.Fatal(err)
-	}
-
-	_, rows, ok := store.AliasUsageFor("team-a")
-	if !ok {
-		t.Fatal("key not found after migration")
-	}
-	if len(rows) != 1 || rows[0].Alias != "fast" {
-		t.Fatalf("rows = %+v, want one fast row", rows)
-	}
-	fast := rows[0]
-	// fast is in config → InConfig=true; legacy window migrated into Daily.
-	if !fast.InConfig {
-		t.Fatalf("fast should be in_config=true: %+v", fast)
-	}
-	if !nearly(fast.Daily.TotalUSD, 0.80) || fast.Daily.CallCount != 2 || fast.Daily.InputTokens != 800_000 {
-		t.Fatalf("migrated daily = %+v, want 0.80/2/800000", fast.Daily)
-	}
-	// One natural-day bucket participates in both daily and trailing-week sums.
-	if !nearly(fast.Weekly.TotalUSD, 0.80) || fast.Weekly.CallCount != 2 {
-		t.Fatalf("migrated weekly = %+v, want 0.80/2", fast.Weekly)
-	}
-	// Persisting then reloading keeps the v2 day-bucket shape (round-trip).
-	if err := store.FlushUsage(); err != nil {
-		t.Fatal(err)
-	}
-	usage, err := LoadUsage(filepath.Join(dir, "cpa-key-policy-usage.json"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	state := usage["team-a"]
-	a, ok := state.ByAlias["fast"]["2026-06-29"]
-	if !ok {
-		t.Fatal("fast not in re-persisted by_alias")
-	}
-	if !nearly(a.TotalUSD, 0.80) || a.CallCount != 2 || a.InputTokens != 800_000 {
-		t.Fatalf("round-trip bucket = %+v", a)
-	}
-}
-
-// TestRecordUsageCanonicalAliasCaseVariants: pure case variants of a configured
-// alias must land in the single config-spelling ByAlias bucket (not three).
-func TestRecordUsageCanonicalAliasCaseVariants(t *testing.T) {
+// TestRecordUsageCanonicalModelCaseVariants ensures case variants land in one
+// bucket using the configured spelling.
+func TestRecordUsageCanonicalModelCaseVariants(t *testing.T) {
 	now := time.Date(2026, 6, 29, 10, 0, 0, 0, time.UTC)
 	statePath := filepath.Join(t.TempDir(), "state.json")
 	store := NewStore()
@@ -951,13 +841,11 @@ func TestRecordUsageCanonicalAliasCaseVariants(t *testing.T) {
 	if err := store.Configure(Config{
 		Enabled:   true,
 		StateFile: statePath,
+		Models:    []ModelDefinition{tokenTestModel("gpt-5.6-sol", "codex", "gpt-5.6", 1, 2)},
 		Keys: []KeyConfig{{
 			ID: "team-sol", Enabled: true,
 			KeyHash: hashForUsageTest(t, "cpa_sol"),
-			Models: []ModelRule{{
-				Alias: "gpt-5.6-sol", Provider: "codex", TargetModel: "gpt-5.6",
-				InputPricePerMillion: 1, OutputPricePerMillion: 2,
-			}},
+			Models:  modelRefs("gpt-5.6-sol"),
 		}},
 	}); err != nil {
 		t.Fatal(err)
@@ -974,7 +862,7 @@ func TestRecordUsageCanonicalAliasCaseVariants(t *testing.T) {
 		}
 	}
 
-	_, rows, ok := store.AliasUsageFor("team-sol")
+	_, rows, ok := store.ModelUsageFor("team-sol")
 	if !ok {
 		t.Fatal("key not found")
 	}
@@ -982,8 +870,8 @@ func TestRecordUsageCanonicalAliasCaseVariants(t *testing.T) {
 		t.Fatalf("row count = %d, want 1 canonical bucket; rows=%+v", len(rows), rows)
 	}
 	row := rows[0]
-	if row.Alias != "gpt-5.6-sol" || !row.InConfig {
-		t.Fatalf("row = %+v, want alias=gpt-5.6-sol in_config=true", row)
+	if row.Name != "gpt-5.6-sol" || !row.InConfig {
+		t.Fatalf("row = %+v, want name=gpt-5.6-sol in_config=true", row)
 	}
 	if !nearly(row.Daily.TotalUSD, 0.60) || row.Daily.CallCount != 3 {
 		t.Fatalf("daily = %+v, want $0.60 / 3 calls", row.Daily)
@@ -991,105 +879,64 @@ func TestRecordUsageCanonicalAliasCaseVariants(t *testing.T) {
 	if row.Daily.InputTokens != 300_000 || row.Daily.OutputTokens != 150_000 {
 		t.Fatalf("daily tokens = %+v, want 300000/150000", row.Daily)
 	}
-	// Key-level totals must match (no double-count at key vs alias).
+	// Key-level totals must match (no double-count at key vs model).
 	s := store.UsageSummaryFor(store.Keys()[0])
 	if !nearly(s.DailyUSD, 0.60) || s.DailyCallCount != 3 {
 		t.Fatalf("key daily = %+v, want $0.60 / 3", s)
 	}
 
-	// Unknown alias: zero cost, no forged empty ByAlias row.
+	// Unknown model: zero cost, no forged empty ByModel row.
 	unknownCost := store.RecordUsage("team-sol", "totally-unknown-model", "x", false, UsageDetail{
 		InputTokens: 1_000_000, OutputTokens: 0,
 	})
 	if unknownCost != 0 {
-		t.Fatalf("unknown alias cost = %v, want 0", unknownCost)
+		t.Fatalf("unknown model cost = %v, want 0", unknownCost)
 	}
-	_, rows2, _ := store.AliasUsageFor("team-sol")
+	_, rows2, _ := store.ModelUsageFor("team-sol")
 	if len(rows2) != 1 {
-		t.Fatalf("unknown alias created extra rows: %+v", rows2)
+		t.Fatalf("unknown model created extra rows: %+v", rows2)
 	}
-	if rows2[0].Alias != "gpt-5.6-sol" {
+	if rows2[0].Name != "gpt-5.6-sol" {
 		t.Fatalf("unexpected residual after unknown: %+v", rows2)
 	}
 }
 
-// TestAliasUsageCaseCanonicalReadOnlyMerge: historical mixed-case ByAlias
+// TestModelUsageCaseCanonicalReadOnlyMerge: historical mixed-case ByModel
 // buckets merge on read into the config spelling; state file bytes and ledger
 // entries are not mutated by the read.
-func TestAliasUsageCaseCanonicalReadOnlyMerge(t *testing.T) {
+func TestModelUsageCaseCanonicalReadOnlyMerge(t *testing.T) {
 	now := time.Date(2026, 6, 29, 10, 0, 0, 0, time.UTC)
 	statePath := filepath.Join(t.TempDir(), "state.json")
 
-	// Seed state with legacy mixed-case ByAlias keys (simulates pre-fix history).
-	// Daily: "gpt-5.6-sol" $0.20 + "Gpt-5.6-sol" $0.30 + "GPT-5.6-SOL" $0.10 = $0.60
-	seed := map[string]any{
-		"version": 1,
-		"keys": []map[string]any{{
-			"id": "team-sol", "enabled": true,
-			"key_hash": hashForUsageTest(t, "cpa_sol"),
-			"models": []map[string]any{{
-				"alias": "gpt-5.6-sol", "provider": "codex", "target_model": "gpt-5.6",
-				"input_price_per_million": 1, "output_price_per_million": 2,
-			}},
-		}},
-		"usage": map[string]any{
-			"team-sol": map[string]any{
-				"daily":  map[string]any{"total_usd": 0.60, "call_count": 3, "window_start": now.Format(time.RFC3339)},
-				"weekly": map[string]any{"total_usd": 0.60, "call_count": 3, "window_start": now.Format(time.RFC3339)},
-				"by_alias": map[string]any{
-					"gpt-5.6-sol": map[string]any{
-						"daily":  map[string]any{"total_usd": 0.20, "call_count": 1, "cache_read_tokens": 10000, "cache_cost_usd": 0.01, "input_tokens": 100000, "output_tokens": 50000, "window_start": now.Format(time.RFC3339)},
-						"weekly": map[string]any{"total_usd": 0.20, "call_count": 1, "cache_read_tokens": 10000, "cache_cost_usd": 0.01, "input_tokens": 100000, "output_tokens": 50000, "window_start": now.Format(time.RFC3339)},
-					},
-					"Gpt-5.6-sol": map[string]any{
-						"daily":  map[string]any{"total_usd": 0.30, "call_count": 1, "cache_read_tokens": 20000, "cache_cost_usd": 0.02, "input_tokens": 150000, "output_tokens": 75000, "window_start": now.Format(time.RFC3339)},
-						"weekly": map[string]any{"total_usd": 0.30, "call_count": 1, "cache_read_tokens": 20000, "cache_cost_usd": 0.02, "input_tokens": 150000, "output_tokens": 75000, "window_start": now.Format(time.RFC3339)},
-					},
-					"GPT-5.6-SOL": map[string]any{
-						"daily":  map[string]any{"total_usd": 0.10, "call_count": 1, "cache_read_tokens": 30000, "cache_cost_usd": 0.03, "input_tokens": 50000, "output_tokens": 25000, "window_start": now.Format(time.RFC3339)},
-						"weekly": map[string]any{"total_usd": 0.10, "call_count": 1, "cache_read_tokens": 30000, "cache_cost_usd": 0.03, "input_tokens": 50000, "output_tokens": 25000, "window_start": now.Format(time.RFC3339)},
-					},
-					// Truly removed residual — different name, must stay separate.
-					"old-model": map[string]any{
-						"daily":  map[string]any{"total_usd": 0.05, "call_count": 1, "input_tokens": 50000, "window_start": now.Format(time.RFC3339)},
-						"weekly": map[string]any{"total_usd": 0.05, "call_count": 1, "input_tokens": 50000, "window_start": now.Format(time.RFC3339)},
-					},
-				},
-			},
+	// Seed mixed-case historical buckets and one removed residual model.
+	datasetID := "mixed-case-dataset"
+	model := tokenTestModel("gpt-5.6-sol", "codex", "gpt-5.6", 1, 2)
+	key := KeyConfig{ID: "team-sol", Enabled: true, KeyHash: hashForUsageTest(t, "cpa_sol"), Models: modelRefs("gpt-5.6-sol")}
+	if err := SaveState(statePath, datasetID, []KeyConfig{key}, []ModelDefinition{model}, nil); err != nil {
+		t.Fatal(err)
+	}
+	date := "2026-06-29"
+	usageState := &UsageState{
+		Days: map[string]UsageBucket{date: {TotalUSD: 0.65, CallCount: 4, CacheReadTokens: 60_000, CacheCostUSD: 0.06, InputTokens: 350_000, OutputTokens: 150_000}},
+		ByModel: map[string]map[string]UsageBucket{
+			"gpt-5.6-sol": {date: {TotalUSD: 0.20, CallCount: 1, CacheReadTokens: 10_000, CacheCostUSD: 0.01, InputTokens: 100_000, OutputTokens: 50_000}},
+			"Gpt-5.6-sol": {date: {TotalUSD: 0.30, CallCount: 1, CacheReadTokens: 20_000, CacheCostUSD: 0.02, InputTokens: 150_000, OutputTokens: 75_000}},
+			"GPT-5.6-SOL": {date: {TotalUSD: 0.10, CallCount: 1, CacheReadTokens: 30_000, CacheCostUSD: 0.03, InputTokens: 50_000, OutputTokens: 25_000}},
+			"old-model":   {date: {TotalUSD: 0.05, CallCount: 1, InputTokens: 50_000}},
 		},
 	}
-	raw, err := json.Marshal(seed)
-	if err != nil {
+	usagePath := filepath.Join(filepath.Dir(statePath), "cpa-key-policy-usage.json")
+	if err := SaveUsage(usagePath, datasetID, map[string]*UsageState{"team-sol": usageState}); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(statePath, raw, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	beforeBytes, err := os.ReadFile(statePath)
+	beforeBytes, err := os.ReadFile(usagePath)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	store := NewStore()
 	store.SetClock(func() time.Time { return now })
-	if err := store.Configure(Config{
-		Enabled:   true,
-		StateFile: statePath,
-		Keys: []KeyConfig{{
-			ID: "team-sol", Enabled: true,
-			KeyHash: hashForUsageTest(t, "cpa_sol"),
-			Models: []ModelRule{{
-				Alias: "gpt-5.6-sol", Provider: "codex", TargetModel: "gpt-5.6",
-				InputPricePerMillion: 1, OutputPricePerMillion: 2,
-			}},
-		}},
-	}); err != nil {
-		t.Fatal(err)
-	}
-	// Configure performs the required v1-to-v2 migration. Compare the later
-	// read against the post-migration state file, not the legacy input bytes.
-	beforeBytes, err = os.ReadFile(statePath)
-	if err != nil {
+	if err := store.Configure(Config{Enabled: true, StateFile: statePath}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1103,19 +950,19 @@ func TestAliasUsageCaseCanonicalReadOnlyMerge(t *testing.T) {
 		}
 	}
 
-	_, rows, ok := store.AliasUsageFor("team-sol")
+	_, rows, ok := store.ModelUsageFor("team-sol")
 	if !ok {
 		t.Fatal("key not found")
 	}
-	byAlias := map[string]AliasUsageEntry{}
-	for _, r := range rows {
-		byAlias[r.Alias] = r
+	byModel := map[string]ModelUsageEntry{}
+	for _, row := range rows {
+		byModel[row.Name] = row
 	}
 	// Configured canonical + residual old-model only (3 case variants merged).
 	if len(rows) != 2 {
 		t.Fatalf("row count = %d, want 2; rows=%+v", len(rows), rows)
 	}
-	canon := byAlias["gpt-5.6-sol"]
+	canon := byModel["gpt-5.6-sol"]
 	if !canon.InConfig {
 		t.Fatalf("canonical must be in_config=true: %+v", canon)
 	}
@@ -1134,15 +981,15 @@ func TestAliasUsageCaseCanonicalReadOnlyMerge(t *testing.T) {
 	if canon.Weekly.CacheReadTokens != 60_000 || !nearly(canon.Weekly.CacheCostUSD, 0.06) {
 		t.Fatalf("canonical weekly cache counters = %+v, want 60000/$0.06", canon.Weekly)
 	}
-	residual := byAlias["old-model"]
+	residual := byModel["old-model"]
 	if residual.InConfig || !nearly(residual.Daily.TotalUSD, 0.05) {
 		t.Fatalf("residual = %+v, want in_config=false $0.05", residual)
 	}
 
-	// Key-level limits unchanged (read does not re-sum key totals from aliases).
+	// Key totals include every model bucket, including the residual.
 	s := store.UsageSummaryFor(store.Keys()[0])
-	if !nearly(s.DailyUSD, 0.60) || s.DailyCallCount != 3 {
-		t.Fatalf("key summary daily = %+v, want $0.60 / 3 (unchanged)", s)
+	if !nearly(s.DailyUSD, 0.65) || s.DailyCallCount != 4 {
+		t.Fatalf("key summary daily = %+v, want $0.65 / 4", s)
 	}
 
 	// The complete ledger still holds all historical spellings and values.
@@ -1155,15 +1002,15 @@ func TestAliasUsageCaseCanonicalReadOnlyMerge(t *testing.T) {
 		}
 	}
 	if string(beforeLedgerBytes) != string(afterLedgerBytes) {
-		t.Fatal("ledger snapshot changed by AliasUsage read")
+		t.Fatal("ledger snapshot changed by ModelUsage read")
 	}
-	// State file bytes untouched by the read (no flush/save side effect).
-	afterBytes, err := os.ReadFile(statePath)
+	// Usage file bytes are untouched by the read (no flush/save side effect).
+	afterBytes, err := os.ReadFile(usagePath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if string(beforeBytes) != string(afterBytes) {
-		t.Fatal("state file bytes changed by AliasUsage read")
+		t.Fatal("usage file bytes changed by ModelUsage read")
 	}
 }
 
@@ -1199,11 +1046,11 @@ func TestCallCountIncrementedTokenMode(t *testing.T) {
 	if err := store.Configure(Config{
 		Enabled:   true,
 		StateFile: filepath.Join(t.TempDir(), "state.json"),
+		Models:    []ModelDefinition{tokenTestModel("fast", "codex", "m", 1, 1)},
 		Keys: []KeyConfig{{
 			ID: "tok", Enabled: true,
 			KeyHash: hashForUsageTest(t, "cpa_tok"),
-			Models: []ModelRule{{Alias: "fast", Provider: "codex", TargetModel: "m",
-				InputPricePerMillion: 1, OutputPricePerMillion: 1}},
+			Models:  modelRefs("fast"),
 		}},
 	}); err != nil {
 		t.Fatal(err)

@@ -1,52 +1,58 @@
 import { useMemo, useState } from "react";
-import { Link, useNavigate, useLocation } from "react-router-dom";
+import { useLocation, useNavigate } from "react-router-dom";
 import { createKey } from "../api/keys";
-import KeyForm, { keyWriteRequestFromForm } from "../components/KeyForm";
+import KeyForm, { keyWriteRequestFromForm, type KeyFormValues } from "../components/KeyForm";
 import PlainKeyModal from "../components/PlainKeyModal";
 import { MobileFormHeader, MobileTabBar } from "../components/MobileChrome";
 import { useT } from "../i18n";
-import type { KeyPublic, ModelRule } from "../types";
+import type { KeyPublic } from "../types";
+
+interface ReturnedModelState {
+  createdModel?: string;
+  draftKey?: KeyFormValues;
+}
 
 export default function KeyNew() {
-  const nav = useNavigate();
-  const loc = useLocation();
+  const navigate = useNavigate();
+  const location = useLocation();
   const t = useT();
   const [plain, setPlain] = useState<string | null>(null);
-  const [unpricedAfterSave, setUnpricedAfterSave] = useState(0);
+
+  const returned = location.state as ReturnedModelState | null;
+  const initial = useMemo<KeyPublic | undefined>(() => {
+    if (!returned?.draftKey) return undefined;
+    const models = [...returned.draftKey.models];
+    if (returned.createdModel && !models.some((model) => model.name.toLowerCase() === returned.createdModel?.toLowerCase())) {
+      models.push({ name: returned.createdModel, daily_limit_usd: 0 });
+    }
+    return {
+      ...returned.draftKey,
+      models,
+      key_preview: "",
+      usage: {
+        daily_usd: 0,
+        weekly_usd: 0,
+        monthly_usd: 0,
+        daily_limit_usd: returned.draftKey.daily_limit_usd,
+        weekly_limit_usd: returned.draftKey.weekly_limit_usd,
+        monthly_limit_usd: returned.draftKey.monthly_limit_usd,
+      },
+    };
+  }, [returned]);
 
   const title = t("new.title");
-
-  // When the standalone model-picker page returns here with a selection,
-  // merge it into the form's initial models.
-  const picked = (loc.state as { pickedModels?: ModelRule[] } | null)?.pickedModels;
-  const initial = useMemo<KeyPublic | undefined>(
-    () => (picked ? ({ id: "", name: "", enabled: true, rpm: 0, models: picked, daily_limit_usd: 0, weekly_limit_usd: 0 } as KeyPublic) : undefined),
-    [picked],
-  );
-
   return (
     <div className="form-page">
-      <div className="fp-head mobile-hidden">
-        <h1>{title}</h1>
-      </div>
+      <div className="fp-head mobile-hidden"><h1>{title}</h1></div>
       <MobileFormHeader title={title} backTo="/keys" />
-      {unpricedAfterSave > 0 && (
-        <div className="kf-unpriced-after-save" data-testid="unpriced-after-save">
-          {t("keyForm.unpricedAfterSave", { n: unpricedAfterSave })}{" "}
-          <Link to="/mapping">{t("keyForm.unpricedGoMapping")}</Link>
-        </div>
-      )}
       <KeyForm
         initial={initial}
-        pickPath="/keys/new/models"
+        returnPath="/keys/new"
         submitLabel={t("new.create")}
-        onCancel={() => nav("/keys")}
-        onSubmit={async (v, meta) => {
-          const r = await createKey(keyWriteRequestFromForm(v));
-          if (meta.newUnpricedCount > 0) {
-            setUnpricedAfterSave(meta.newUnpricedCount);
-          }
-          setPlain(r.plain_key);
+        onCancel={() => navigate("/keys")}
+        onSubmit={async (values) => {
+          const response = await createKey(keyWriteRequestFromForm(values));
+          setPlain(response.plain_key);
         }}
       />
       <p className="fp-note mobile-hidden">{t("login.memoryNote")}</p>
@@ -56,7 +62,7 @@ export default function KeyNew() {
           title={t("plainModal.created")}
           onClose={() => {
             setPlain(null);
-            nav("/keys");
+            navigate("/keys");
           }}
         />
       )}

@@ -1,9 +1,11 @@
 package plugin
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"sort"
@@ -112,6 +114,7 @@ func (a *App) registration() Registration {
 				{Name: "state_file", Type: "string", Description: "JSON state file used for key policy changes made through the Management API."},
 				{Name: "usage_timezone", Type: "string", Description: "IANA timezone used for natural-day usage buckets. Defaults to Asia/Shanghai."},
 				{Name: "keys", Type: "array", Description: "Initial downstream key policy list. State file wins after it exists."},
+				{Name: "models", Type: "array", Description: "Public model definitions with upstream targets and global pricing."},
 			},
 		},
 		Capabilities: Capabilities{
@@ -140,15 +143,15 @@ func (a *App) authenticate(raw []byte) ([]byte, error) {
 		"key_id":          decision.KeyID,
 		"requested_model": decision.Requested,
 	}
-	if decision.Rule.Alias != "" {
-		meta["alias"] = decision.Rule.Alias
-		meta["target_provider"] = decision.Rule.Provider
-		meta["target_model"] = decision.Rule.TargetModel
-		if decision.Rule.Group != "" {
+	if decision.Route.PublicModel != "" {
+		meta["public_model"] = decision.Route.PublicModel
+		meta["target_provider"] = decision.Route.Provider
+		meta["target_model"] = decision.Route.TargetModel
+		if decision.Route.Group != "" {
 			// Group lets our Scheduler (scheduler.pick) restrict auth-file
 			// selection to a tier/plan (codex plan_type, antigravity tier).
 			// Empty = legacy "any file for the provider" behavior.
-			meta["group"] = decision.Rule.Group
+			meta["group"] = decision.Route.Group
 		}
 	}
 	return OKEnvelope(FrontendAuthResponse{
@@ -163,29 +166,29 @@ func (a *App) routeModel(raw []byte) ([]byte, error) {
 	if err := json.Unmarshal(raw, &req); err != nil {
 		return nil, err
 	}
-	rule, keyID, ok := a.store.Route(req.Headers, req.Query, req.RequestedModel)
+	route, keyID, ok := a.store.Route(req.Headers, req.Query, req.RequestedModel)
 	if !ok {
 		return OKEnvelope(ModelRouteResponse{Handled: false})
 	}
 	return OKEnvelope(ModelRouteResponse{
 		Handled:     true,
 		TargetKind:  "provider",
-		Target:      resolveProviderKey(rule.Provider, req.AvailableProviders),
-		TargetModel: rule.TargetModel,
+		Target:      resolveProviderKey(route.Provider, req.AvailableProviders),
+		TargetModel: route.TargetModel,
 		Reason:      "cpa-key-policy:" + keyID,
 	})
 }
 
-// resolveProviderKey maps a ModelRule's provider to the provider key CPA's
+// resolveProviderKey maps a routed provider to the provider key CPA's
 // auth manager uses, so HasBuiltinProvider(target) succeeds.
 //
 // OpenAI-compatibility providers are registered with auth.Provider
 // prefixed as "openai-compatible-<name>" (see synthesizer.config:
 // auth.Provider = OpenAICompatibleProviderKey(name)). The plugin's
-// ModelRule.Provider field carries the bare name (e.g. "nvidia",
+// ModelTarget.Provider carries the bare name (e.g. "nvidia",
 // "opencode"). Returning the bare name makes CPA skip the router
 // ("model router returned unavailable provider") and fall back to the
-// native path, which fails for non-native alias names like "test1".
+// native path, which fails for non-native public model names like "test1".
 //
 // We pick the key present in AvailableProviders, trying the bare name
 // first (for built-in providers like codex/claude/gemini) then the
@@ -225,11 +228,11 @@ func (a *App) interceptResponse(raw []byte) ([]byte, error) {
 		// Streaming responses are not safe to rewrite (SSE framing) — return as-is.
 		return OKEnvelope(ResponseInterceptResponse{})
 	}
-	alias, ok := a.store.ResponseAlias(req.RequestHeaders, nil, req.RequestedModel)
+	publicModel, ok := a.store.ResponseModel(req.RequestHeaders, nil, req.RequestedModel)
 	if !ok {
 		return OKEnvelope(ResponseInterceptResponse{})
 	}
-	body, changed := policy.RewriteTopLevelModel(req.Body, alias)
+	body, changed := policy.RewriteTopLevelModel(req.Body, publicModel)
 	if !changed {
 		return OKEnvelope(ResponseInterceptResponse{})
 	}
@@ -237,12 +240,12 @@ func (a *App) interceptResponse(raw []byte) ([]byte, error) {
 }
 
 // pickScheduler implements the scheduler.pick host->plugin call. When the
-// routed ModelRule had a Group (codex plan_type / antigravity tier), restrict
+// routed model target had a Group (codex plan_type / antigravity tier), restrict
 // candidate auths to those whose Attributes carry a matching identity. Any
 // Group "" or a group we can't recognize → defer to the host scheduler
 // (Handled=false), preserving legacy "any auth for the provider" behavior.
 //
-// The plugin never sees the downstream ModelRule directly here; the group was
+// The plugin never sees the resolved route directly here; the group was
 // stamped into request metadata by authenticate(), and the host forwards it as
 // Options.Metadata["group"]. We read it defensively as either string or any.
 //
@@ -457,14 +460,18 @@ func schedulerGroupFromMetadata(meta map[string]any) string {
 // streaming and non-streaming alike. This is the billing path that covers
 // streaming (the host never invokes response.intercept_after on streams).
 // Fire-and-forget: we always return an empty success envelope regardless of
-// whether we actually billed (best-effort; unknown keys/aliases cost nothing).
+// whether we actually billed (best-effort; unknown keys or models cost nothing).
 func (a *App) handleUsage(raw []byte) ([]byte, error) {
 	var req UsageHandleRequest
 	// A malformed record must never break the request path: bill nothing.
 	if err := json.Unmarshal(raw, &req); err != nil {
 		return OKEnvelope(UsageHandleResponse{})
 	}
-	_ = a.store.RecordUsage(req.APIKey, req.Alias, req.Model, req.Failed, policy.UsageDetail{
+	requestedModel := req.Alias
+	if strings.TrimSpace(requestedModel) == "" {
+		requestedModel = req.Model
+	}
+	_ = a.store.RecordUsage(req.APIKey, requestedModel, req.Model, req.Failed, policy.UsageDetail{
 		InputTokens:         req.Detail.InputTokens,
 		OutputTokens:        req.Detail.OutputTokens,
 		ReasoningTokens:     req.Detail.ReasoningTokens,
@@ -487,14 +494,14 @@ func (a *App) managementRegistration() ManagementRegistrationResponse {
 			{Method: http.MethodPost, Path: base + "/keys/rotate", Description: "Rotate one downstream CPA key by id."},
 			{Method: http.MethodPost, Path: base + "/keys/reset-rpm", Description: "Reset one downstream CPA key RPM counter by id."},
 			{Method: http.MethodPost, Path: base + "/keys/reset-usage", Description: "Reset one downstream CPA key daily, weekly, or monthly usage window by id."},
-			{Method: http.MethodGet, Path: base + "/keys/usage", Description: "Per-alias usage breakdown for one downstream CPA key by id."},
+			{Method: http.MethodGet, Path: base + "/keys/usage", Description: "Per-model usage breakdown for one downstream CPA key by id."},
 			{Method: http.MethodGet, Path: base + "/keys/history", Description: "Natural-day usage history for one downstream CPA key."},
 			{Method: http.MethodGet, Path: base + "/audit", Description: "Read append-only management audit events."},
 			{Method: http.MethodGet, Path: base + "/status", Description: "Show cpa-key-policy runtime status."},
-			{Method: http.MethodGet, Path: base + "/aliases", Description: "List the global alias mapping table."},
-			{Method: http.MethodPost, Path: base + "/aliases", Description: "Create or update a global alias mapping."},
-			{Method: http.MethodDelete, Path: base + "/aliases", Description: "Delete a global alias mapping by name."},
-			{Method: http.MethodPost, Path: base + "/aliases/import-prices", Description: "Batch-import alias token prices (dry_run supported)."},
+			{Method: http.MethodGet, Path: base + "/models", Description: "List public model definitions."},
+			{Method: http.MethodPost, Path: base + "/models", Description: "Create or update a public model definition."},
+			{Method: http.MethodDelete, Path: base + "/models", Description: "Delete a public model definition by name."},
+			{Method: http.MethodPost, Path: base + "/models/import-prices", Description: "Batch-import token prices for existing models (dry_run supported)."},
 			{Method: http.MethodGet, Path: base + "/classify-rules", Description: "List credential classification rules."},
 			{Method: http.MethodPost, Path: base + "/classify-rules", Description: "Create or update a classification rule."},
 			{Method: http.MethodDelete, Path: base + "/classify-rules", Description: "Delete a classification rule by name."},
@@ -548,14 +555,14 @@ func (a *App) handleManagement(raw []byte) ([]byte, error) {
 		return OKEnvelope(a.auditEvents(strings.TrimSpace(req.Query.Get("key_id")), intQuery(req.Query, "limit", 100)))
 	case req.Method == http.MethodGet && path == base+"/status":
 		return OKEnvelope(jsonResponse(http.StatusOK, a.store.Status()))
-	case req.Method == http.MethodGet && path == base+"/aliases":
-		return OKEnvelope(jsonResponse(http.StatusOK, map[string]any{"aliases": a.store.AliasesSnapshotWithRefs()}))
-	case req.Method == http.MethodPost && path == base+"/aliases":
-		return OKEnvelope(a.upsertAlias(req.Body))
-	case req.Method == http.MethodDelete && path == base+"/aliases":
-		return OKEnvelope(a.deleteAlias(req.Body))
-	case req.Method == http.MethodPost && path == base+"/aliases/import-prices":
-		return OKEnvelope(a.importAliasPrices(req.Body))
+	case req.Method == http.MethodGet && path == base+"/models":
+		return OKEnvelope(jsonResponse(http.StatusOK, map[string]any{"models": a.store.ModelsSnapshotWithRefs()}))
+	case req.Method == http.MethodPost && path == base+"/models":
+		return OKEnvelope(a.upsertModel(req.Body))
+	case req.Method == http.MethodDelete && path == base+"/models":
+		return OKEnvelope(a.deleteModel(req.Body))
+	case req.Method == http.MethodPost && path == base+"/models/import-prices":
+		return OKEnvelope(a.importModelPrices(req.Body))
 	case req.Method == http.MethodGet && path == base+"/classify-rules":
 		return OKEnvelope(jsonResponse(http.StatusOK, map[string]any{"rules": a.store.ClassifyRulesSnapshot()}))
 	case req.Method == http.MethodPost && path == base+"/classify-rules":
@@ -579,8 +586,7 @@ type keyWriteRequest struct {
 	Enabled             *bool                `json:"enabled,omitempty"`
 	Key                 string               `json:"key,omitempty"`
 	RPM                 *int                 `json:"rpm,omitempty"`
-	Models              []policy.ModelRule   `json:"models,omitempty"`
-	Aliases             []policy.KeyAliasRef `json:"aliases,omitempty"`
+	Models              []policy.KeyModelRef `json:"models,omitempty"`
 	DailyLimitUSD       *float64             `json:"daily_limit_usd,omitempty"`
 	WeeklyLimitUSD      *float64             `json:"weekly_limit_usd,omitempty"`
 	MonthlyLimitUSD     *float64             `json:"monthly_limit_usd,omitempty"`
@@ -593,8 +599,7 @@ type publicKey struct {
 	Enabled             bool                 `json:"enabled"`
 	KeyPreview          string               `json:"key_preview"`
 	RPM                 int                  `json:"rpm"`
-	Models              []policy.ModelRule   `json:"models"`
-	Aliases             []policy.KeyAliasRef `json:"aliases"`
+	Models              []policy.KeyModelRef `json:"models"`
 	DailyLimitUSD       float64              `json:"daily_limit_usd"`
 	WeeklyLimitUSD      float64              `json:"weekly_limit_usd"`
 	MonthlyLimitUSD     float64              `json:"monthly_limit_usd"`
@@ -606,7 +611,7 @@ type publicKey struct {
 
 func (a *App) createKey(body []byte) ManagementResponse {
 	var req keyWriteRequest
-	if err := json.Unmarshal(body, &req); err != nil {
+	if err := decodeStrictBody(body, &req); err != nil {
 		return jsonError(http.StatusBadRequest, "invalid_json", err.Error())
 	}
 	req.ID = strings.TrimSpace(req.ID)
@@ -647,7 +652,6 @@ func (a *App) createKey(body []byte) ManagementResponse {
 		KeyPreview:          policy.PreviewKey(plain),
 		RPM:                 rpm,
 		Models:              req.Models,
-		Aliases:             req.Aliases,
 		DailyLimitUSD:       applyFloat64(req.DailyLimitUSD, 0),
 		WeeklyLimitUSD:      applyFloat64(req.WeeklyLimitUSD, 0),
 		MonthlyLimitUSD:     applyFloat64(req.MonthlyLimitUSD, 0),
@@ -669,7 +673,7 @@ func (a *App) createKey(body []byte) ManagementResponse {
 
 func (a *App) patchKey(body []byte) ManagementResponse {
 	var req keyWriteRequest
-	if err := json.Unmarshal(body, &req); err != nil {
+	if err := decodeStrictBody(body, &req); err != nil {
 		return jsonError(http.StatusBadRequest, "invalid_json", err.Error())
 	}
 	id := strings.TrimSpace(req.ID)
@@ -711,9 +715,6 @@ func (a *App) patchKey(body []byte) ManagementResponse {
 	}
 	if req.Models != nil {
 		current.Models = req.Models
-	}
-	if req.Aliases != nil {
-		current.Aliases = req.Aliases
 	}
 	if strings.TrimSpace(req.Key) != "" {
 		hash, err := policy.HashKey(req.Key)
@@ -795,7 +796,7 @@ func (a *App) resetUsage(body []byte) ManagementResponse {
 	return jsonResponse(http.StatusOK, result)
 }
 
-// keyUsage returns the per-alias usage breakdown for one downstream key (the
+// keyUsage returns the per-model usage breakdown for one downstream key (the
 // key detail subpage data source). id is taken from the query string (or body),
 // matching the rotate/reset-rpm/delete convention.
 func (a *App) keyUsage(id string) ManagementResponse {
@@ -803,7 +804,7 @@ func (a *App) keyUsage(id string) ManagementResponse {
 	if id == "" {
 		return jsonError(http.StatusBadRequest, "missing_id", "id is required")
 	}
-	key, aliases, ok := a.store.AliasUsageFor(id)
+	key, models, ok := a.store.ModelUsageFor(id)
 	if !ok {
 		return jsonError(http.StatusNotFound, "not_found", "key not found")
 	}
@@ -813,7 +814,7 @@ func (a *App) keyUsage(id string) ManagementResponse {
 		"daily_limit_usd":   key.DailyLimitUSD,
 		"weekly_limit_usd":  key.WeeklyLimitUSD,
 		"monthly_limit_usd": key.MonthlyLimitUSD,
-		"aliases":           aliases,
+		"models":            models,
 	})
 }
 
@@ -897,17 +898,12 @@ func (a *App) publicKeys(keys []policy.KeyConfig) []publicKey {
 
 func (a *App) publicKeyFromConfig(key policy.KeyConfig) publicKey {
 	out := publicKey{
-		ID:         key.ID,
-		Name:       key.Name,
-		Enabled:    key.Enabled,
-		KeyPreview: key.KeyPreview,
-		RPM:        key.RPM,
-		// Ensure models/aliases always serialize as [] (never null). A nil slice
-		// would marshal to JSON null, which the UI accesses as .length and
-		// crashes on. Models is derived (resolved from Aliases × global table);
-		// Aliases is the canonical source.
-		Models:              append([]policy.ModelRule{}, key.Models...),
-		Aliases:             append([]policy.KeyAliasRef{}, key.Aliases...),
+		ID:                  key.ID,
+		Name:                key.Name,
+		Enabled:             key.Enabled,
+		KeyPreview:          key.KeyPreview,
+		RPM:                 key.RPM,
+		Models:              append([]policy.KeyModelRef{}, key.Models...),
 		DailyLimitUSD:       key.DailyLimitUSD,
 		WeeklyLimitUSD:      key.WeeklyLimitUSD,
 		MonthlyLimitUSD:     key.MonthlyLimitUSD,
@@ -964,6 +960,21 @@ func jsonError(status int, code, message string) ManagementResponse {
 		Headers:    http.Header{"Content-Type": []string{"application/json; charset=utf-8"}},
 		Body:       body,
 	}
+}
+
+func decodeStrictBody(raw []byte, target any) error {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		return err
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		if err == nil {
+			return errors.New("multiple JSON values are not allowed")
+		}
+		return err
+	}
+	return nil
 }
 
 func (a *App) Store() *policy.Store {

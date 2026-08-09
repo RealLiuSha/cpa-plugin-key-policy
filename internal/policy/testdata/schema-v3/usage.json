@@ -1,0 +1,27 @@
+{
+  "version": 3,
+  "dataset_id": "11111111111111111111111111111111",
+  "usage": {
+    "team-a": {
+      "days": {
+        "2026-08-08": {
+          "total_usd": 1.5,
+          "call_count": 2,
+          "input_tokens": 1000,
+          "output_tokens": 200
+        }
+      },
+      "by_model": {
+        "Chat": {
+          "2026-08-08": {
+            "total_usd": 1.5,
+            "call_count": 2,
+            "input_tokens": 1000,
+            "output_tokens": 200
+          }
+        }
+      }
+    }
+  },
+  "updated_at": "2026-08-08T00:00:00Z"
+}

@@ -15,56 +15,34 @@ import (
 )
 
 type Store struct {
-	mu         sync.RWMutex
-	updateMu   sync.Mutex
-	persistMu  sync.Mutex
-	enabled    bool
-	statePath  string
-	keys       map[string]*KeyConfig
-	keysByHash map[string]*KeyConfig
-	limiter    *RateLimiter
-	usage      *usageLedger
-	auditLog   *audit.Log
-	// flusher periodically persists the ledger to the independent usage file.
-	flusher *usageFlusher
-	// aliases is the global alias mapping table from config.yaml. Used to
-	// resolve KeyAliasRef → ModelRule for routing and billing.
-	aliases map[string]*AliasMapping
-	// classifyRules are user-defined credential classification rules.
-	classifyRules []ClassifyRule
-	// rrCounters tracks round-robin position per alias name (global, shared
-	// across all keys). Reset on Configure/UpsertKey when aliases change.
-	rrCounters map[string]int
-	// pendingPicks remembers the multi-target selection made at Authenticate
-	// so Route (and the group stamped into scheduler metadata) use the same
-	// target for the same request. Without this, round-robin would advance
-	// twice (auth + route) and the scheduler could filter by the wrong group.
-	// Keyed by lower(keyID)+"\0"+lower(alias); FIFO queue per key.
-	pendingPicks map[string][]pendingPick
-	// precharges pairs access-time image/video charges with later usage.handle
-	// notifications when a host starts reporting those endpoints.
-	precharges map[string][]time.Time
-	// onClassifyRulesChanged is called when classify rules change, so the
-	// plugin can clear its classify cache. Set by the plugin App.
+	mu                     sync.RWMutex
+	updateMu               sync.Mutex
+	persistMu              sync.Mutex
+	enabled                bool
+	statePath              string
+	datasetID              string
+	keys                   map[string]*KeyConfig
+	keysByHash             map[string]*KeyConfig
+	models                 map[string]*ModelDefinition
+	classifyRules          []ClassifyRule
+	limiter                *RateLimiter
+	usage                  *usageLedger
+	auditLog               *audit.Log
+	flusher                *usageFlusher
+	rrCounters             map[string]int
+	pendingPicks           map[string][]pendingPick
+	precharges             map[string][]time.Time
 	onClassifyRulesChanged func()
 }
 
-// ErrInvalidUsageResetWindow reports an unsupported administrative usage
-// reset window.
 var ErrInvalidUsageResetWindow = errors.New("invalid usage reset window")
 
-// pendingPick is one Authenticate-time target selection waiting for Route.
 type pendingPick struct {
-	rule ModelRule
-	at   time.Time
+	route ResolvedModelRoute
+	at    time.Time
 }
 
-// pendingPickTTL drops orphaned selections when the host never called Route
-// (e.g. rejected after auth). Long enough for normal request setup, short
-// enough not to pin stale groups across unrelated traffic.
 const pendingPickTTL = 30 * time.Second
-
-// pendingPickMaxQueue caps how many unconsumed picks we keep per (key,alias).
 const pendingPickMaxQueue = 32
 
 type AuthDecision struct {
@@ -73,17 +51,12 @@ type AuthDecision struct {
 	KeyID       string
 	Principal   string
 	Requested   string
-	Rule        ModelRule
+	Route       ResolvedModelRoute
 	Reason      string
 	ModelList   bool
 	RateLimited bool
 	CostLimited bool
-	// PreCharged reports that this request was billed at access time because
-	// it targets an image/video endpoint whose per_call alias CPA cannot bill
-	// via usage.handle (the XAI executor skips UsageReporter on those paths).
-	// The charge is unconditional (no failure refund), so this is a deliberate
-	// trade-off documented in the UI.
-	PreCharged bool
+	PreCharged  bool
 }
 
 func NewStore() *Store {
@@ -91,6 +64,7 @@ func NewStore() *Store {
 		enabled:      DefaultConfig().Enabled,
 		keys:         make(map[string]*KeyConfig),
 		keysByHash:   make(map[string]*KeyConfig),
+		models:       make(map[string]*ModelDefinition),
 		limiter:      NewRateLimiter(),
 		usage:        newUsageLedger(time.Now),
 		rrCounters:   make(map[string]int),
@@ -99,7 +73,6 @@ func NewStore() *Store {
 	}
 }
 
-// SetClock injects a clock for testing (limiter + usage windows).
 func (s *Store) SetClock(now func() time.Time) {
 	if now == nil {
 		return
@@ -121,70 +94,71 @@ func (s *Store) Configure(cfg Config) error {
 		return err
 	}
 
-	// Bug 2 fix: flush any in-memory changes to the *old* state path BEFORE
-	// loading the (possibly different) new state file. Without this, keys/usage
-	// changed via the management API in the last <=15s window (or any abnormal
-	// path that skipped persist) would be lost when LoadState reads a stale disk
-	// snapshot. StopUsageFlusher stops the background loop and flushes once.
 	s.StopUsageFlusher()
-
-	keys := cfg.Keys
-	var loadedUsage map[string]*UsageState
-	firstBoot := false
-	stateNeedsRewrite := false
-	clockNow := time.Now
 	s.mu.RLock()
+	clockNow := time.Now
 	if s.usage != nil {
 		clockNow = s.usage.now
 	}
 	s.mu.RUnlock()
 	usagePath := policyPersist.UsagePath(statePath)
+	if err := policyPersist.CleanupStaleTemps(statePath, clockNow()); err != nil {
+		return fmt.Errorf("cleanup state temp files: %w", err)
+	}
 	if err := policyPersist.CleanupStaleTemps(usagePath, clockNow()); err != nil {
 		return fmt.Errorf("cleanup usage temp files: %w", err)
 	}
-	if state, errLoad := LoadStateAt(statePath, clockNow(), cfg.usageLocation); errLoad == nil {
+
+	keys := cfg.Keys
+	models := cfg.Models
+	rules := cfg.ClassifyRules
+	usage := make(map[string]*UsageState)
+	datasetID := ""
+	firstBoot := false
+	state, stateErr := LoadState(statePath)
+	switch {
+	case stateErr == nil:
+		usageFile, usageErr := LoadUsage(usagePath)
+		if usageErr != nil {
+			return fmt.Errorf("load usage paired with state: %w", usageErr)
+		}
+		if state.DatasetID != usageFile.DatasetID {
+			return fmt.Errorf("state/usage dataset_id mismatch: state=%q usage=%q", state.DatasetID, usageFile.DatasetID)
+		}
 		keys = state.Keys
-		loadedUsage = state.Usage
-		stateNeedsRewrite = state.Version < usageFileVersion || state.usageMigrated
-		if persistedUsage, errUsage := LoadUsage(usagePath); errUsage == nil {
-			loadedUsage = persistedUsage
-		} else if !errors.Is(errUsage, os.ErrNotExist) {
-			return fmt.Errorf("load usage: %w", errUsage)
+		if len(models) == 0 {
+			models = state.Models
 		}
-		// If config.yaml has no global alias table, fall back to the one
-		// persisted in state (so state-only reloads resolve key alias refs).
-		stateAliases := cfg.Aliases
-		if len(stateAliases) == 0 && len(state.Aliases) > 0 {
-			stateAliases = state.Aliases
+		if len(rules) == 0 {
+			rules = state.ClassifyRules
 		}
-		stateRules := cfg.ClassifyRules
-		if len(stateRules) == 0 && len(state.ClassifyRules) > 0 {
-			stateRules = state.ClassifyRules
+		merged := Config{
+			Enabled: cfg.Enabled, StateFile: cfg.StateFile, UsageTimezone: cfg.UsageTimezone,
+			Keys: keys, Models: models, ClassifyRules: rules,
 		}
-		// Validate state keys against the global alias table. normalizeConfig
-		// also auto-migrates any state keys still using per-key Models.
-		merged := Config{Enabled: cfg.Enabled, StateFile: cfg.StateFile, UsageTimezone: cfg.UsageTimezone, Keys: keys, Aliases: stateAliases, ClassifyRules: stateRules}
-		if errNorm := normalizeConfig(&merged); errNorm != nil {
-			return fmt.Errorf("load state: %w", errNorm)
+		if err := normalizeConfig(&merged); err != nil {
+			return fmt.Errorf("load state: %w", err)
 		}
-		keys = merged.Keys
-		// Propagate the resolved alias table back to cfg for downstream use.
-		cfg.Aliases = merged.Aliases
-		cfg.ClassifyRules = merged.ClassifyRules
-	} else if !errors.Is(errLoad, os.ErrNotExist) {
-		return fmt.Errorf("load state: %w", errLoad)
-	} else {
+		keys, models, rules = merged.Keys, merged.Models, merged.ClassifyRules
+		usage = usageFile.Usage
+		datasetID = state.DatasetID
+	case errors.Is(stateErr, os.ErrNotExist):
+		if _, usageErr := os.Stat(usagePath); usageErr == nil {
+			return errors.New("usage file exists without its paired state file")
+		} else if !errors.Is(usageErr, os.ErrNotExist) {
+			return fmt.Errorf("inspect usage file: %w", usageErr)
+		}
+		datasetID, err = NewDatasetID()
+		if err != nil {
+			return err
+		}
 		firstBoot = true
+	default:
+		return fmt.Errorf("load state: %w", stateErr)
 	}
 
-	next := make(map[string]*KeyConfig, len(keys))
 	now := time.Now().UTC()
-	// Build the global alias lookup from the config (post-migration).
-	aliasLookup := make(map[string]*AliasMapping, len(cfg.Aliases))
-	for i := range cfg.Aliases {
-		aliasLookup[strings.ToLower(cfg.Aliases[i].Alias)] = &cfg.Aliases[i]
-	}
-
+	nextKeys := make(map[string]*KeyConfig, len(keys))
 	for i := range keys {
 		item := keys[i]
 		if item.CreatedAt.IsZero() {
@@ -193,40 +167,43 @@ func (s *Store) Configure(cfg Config) error {
 		if item.UpdatedAt.IsZero() {
 			item.UpdatedAt = item.CreatedAt
 		}
-		if item.LimitsChangedAt.IsZero() && (item.DailyLimitUSD > 0 || item.WeeklyLimitUSD > 0 || item.MonthlyLimitUSD > 0 || hasAliasLimit(item.Aliases)) {
+		if item.LimitsChangedAt.IsZero() && (item.DailyLimitUSD > 0 || item.WeeklyLimitUSD > 0 || item.MonthlyLimitUSD > 0 || hasModelLimit(item.Models)) {
 			item.LimitsChangedAt = item.CreatedAt
 		}
-		// If the key has Aliases refs, populate Models from the global table
-		// so all downstream code (routing, billing, usage) works
-		// unchanged. For round-robin aliases with multiple targets, we expand
-		// to one ModelRule per target (the scheduler picks based on group).
-		if len(item.Aliases) > 0 {
-			item.Models = resolveAliasRefsToModels(item.Aliases, aliasLookup)
+		keys[i] = item
+		copy := item
+		copy.Models = append([]KeyModelRef(nil), item.Models...)
+		nextKeys[item.ID] = &copy
+	}
+	nextModels := make(map[string]*ModelDefinition, len(models))
+	for i := range models {
+		copy := models[i]
+		copy.Targets = append([]ModelTarget(nil), models[i].Targets...)
+		nextModels[strings.ToLower(copy.Name)] = &copy
+	}
+
+	if firstBoot {
+		if err := SaveUsage(usagePath, datasetID, usage); err != nil {
+			return fmt.Errorf("seed usage: %w", err)
 		}
-		next[item.ID] = &item
+		if err := SaveState(statePath, datasetID, keys, models, rules); err != nil {
+			_ = os.Remove(usagePath)
+			return fmt.Errorf("seed state: %w", err)
+		}
 	}
 
 	s.mu.Lock()
-	// Stop any prior flusher before rebuilding keys/state path. (StopUsageFlusher
-	// above already handled the flush-then-stop for the old path; this guards
-	// against a flusher that started after this point in a re-entrant call.)
 	if s.flusher != nil {
 		s.flusher.stop()
 		s.flusher = nil
 	}
-	// The persisted state is authoritative during reconfigure. updateMu
-	// serializes this replacement with management mutations, so a revoked or
-	// deleted key cannot be resurrected from an older in-memory snapshot.
 	s.enabled = cfg.Enabled
 	s.statePath = statePath
-	// Store the global alias table and classify rules for routing/billing.
-	s.aliases = make(map[string]*AliasMapping, len(cfg.Aliases))
-	for i := range cfg.Aliases {
-		s.aliases[strings.ToLower(cfg.Aliases[i].Alias)] = &cfg.Aliases[i]
-	}
-	s.classifyRules = cfg.ClassifyRules
+	s.datasetID = datasetID
+	s.keys = nextKeys
+	s.models = nextModels
+	s.classifyRules = rules
 	s.auditLog = audit.New(policyPersist.AuditPath(statePath), audit.DefaultMaxBytes, audit.DefaultBackups)
-	s.keys = next
 	s.rebuildKeysByHashLocked()
 	s.rrCounters = make(map[string]int)
 	s.pendingPicks = make(map[string][]pendingPick)
@@ -234,35 +211,10 @@ func (s *Store) Configure(cfg Config) error {
 	if s.limiter == nil {
 		s.limiter = NewRateLimiter()
 	}
-	// Re-load usage into the (clock-bound) ledger for restart recovery. The
-	// clock is preserved when set via SetClock; otherwise default time.Now.
 	clockNow = s.usage.now
 	s.usage = newUsageLedgerWithLocation(clockNow, cfg.usageLocation, cfg.UsageTimezone)
-	s.usage.loadFromState(loadedUsage)
-
-	// First boot seeds the config file. Loading a v1 state writes the independent
-	// usage file before rewriting state, so a crash cannot discard legacy usage.
-	var baseKeys []KeyConfig
-	var baseUsage map[string]*UsageState
-	var baseAliases []AliasMapping
-	var baseRules []ClassifyRule
-	if firstBoot || stateNeedsRewrite {
-		baseKeys = s.keysSnapshotLocked()
-		baseUsage = s.usageSnapshotLocked()
-		baseAliases = s.aliasesSnapshotLocked()
-		baseRules = s.classifyRulesSnapshotLocked()
-	}
+	s.usage.loadFromState(usage)
 	s.mu.Unlock()
-	if stateNeedsRewrite && len(baseUsage) > 0 {
-		if errSave := SaveUsage(policyPersist.UsagePath(statePath), baseUsage); errSave != nil {
-			return fmt.Errorf("migrate usage: %w", errSave)
-		}
-	}
-	if firstBoot || stateNeedsRewrite {
-		if errSave := s.saveState(statePath, baseKeys, baseAliases, baseRules); errSave != nil {
-			return fmt.Errorf("seed state: %w", errSave)
-		}
-	}
 	return nil
 }
 
@@ -274,10 +226,8 @@ func (s *Store) Enabled() bool {
 
 func (s *Store) runtimeComponents() (*RateLimiter, *usageLedger) {
 	s.mu.RLock()
-	limiter := s.limiter
-	usage := s.usage
-	s.mu.RUnlock()
-	return limiter, usage
+	defer s.mu.RUnlock()
+	return s.limiter, s.usage
 }
 
 func (s *Store) StatePath() string {
@@ -308,7 +258,6 @@ func (s *Store) AuditEvents(keyID string, limit int) ([]audit.Event, error) {
 	return logWriter.Query(strings.TrimSpace(keyID), limit)
 }
 
-// FindByAPIKey resolves a downstream plain key to policy (copy). Returns nil when unknown.
 func (s *Store) FindByAPIKey(raw string) *KeyConfig {
 	return s.findBySecret(raw)
 }
@@ -324,14 +273,7 @@ func (s *Store) findBySecret(raw string) *KeyConfig {
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	key := s.keysByHash[strings.ToLower(strings.TrimSpace(hash))]
-	if key == nil {
-		return nil
-	}
-	copy := *key
-	copy.Models = append([]ModelRule(nil), key.Models...)
-	copy.Aliases = append([]KeyAliasRef(nil), key.Aliases...)
-	return &copy
+	return cloneKeyConfig(s.keysByHash[strings.ToLower(strings.TrimSpace(hash))])
 }
 
 func (s *Store) findBySecretWhenEnabled(raw string) (*KeyConfig, bool) {
@@ -351,22 +293,9 @@ func (s *Store) findBySecretWhenEnabled(raw string) (*KeyConfig, bool) {
 	if !s.enabled {
 		return nil, false
 	}
-	key := s.keysByHash[strings.ToLower(strings.TrimSpace(hash))]
-	if key == nil {
-		return nil, true
-	}
-	copy := *key
-	copy.Models = append([]ModelRule(nil), key.Models...)
-	copy.Aliases = append([]KeyAliasRef(nil), key.Aliases...)
-	return &copy, true
+	return cloneKeyConfig(s.keysByHash[strings.ToLower(strings.TrimSpace(hash))]), true
 }
 
-// findByID resolves a key config by its ID. The host's usage.handle call does
-// NOT carry the client's plaintext key — CPA stores the plugin auth result's
-// Principal (which THIS plugin sets to key.ID at store.go Authenticate) into
-// the request context as "userApiKey", then forwards that as the UsageRecord's
-// APIKey field. So the value we receive in usage.handle is key.ID, not the
-// secret. Matching must therefore be ID-based, not hash-based.
 func (s *Store) findByID(id string) *KeyConfig {
 	id = strings.TrimSpace(id)
 	if id == "" {
@@ -383,12 +312,15 @@ func (s *Store) findByID(id string) *KeyConfig {
 			}
 		}
 	}
+	return cloneKeyConfig(key)
+}
+
+func cloneKeyConfig(key *KeyConfig) *KeyConfig {
 	if key == nil {
 		return nil
 	}
 	copy := *key
-	copy.Models = append([]ModelRule(nil), key.Models...)
-	copy.Aliases = append([]KeyAliasRef(nil), key.Aliases...)
+	copy.Models = append([]KeyModelRef(nil), key.Models...)
 	return &copy
 }
 
@@ -405,80 +337,42 @@ func (s *Store) rebuildKeysByHashLocked() {
 			continue
 		}
 		hash := strings.ToLower(strings.TrimSpace(key.KeyHash))
-		if hash == "" {
-			continue
-		}
-		if _, exists := byHash[hash]; !exists {
-			byHash[hash] = key
+		if hash != "" {
+			if _, exists := byHash[hash]; !exists {
+				byHash[hash] = key
+			}
 		}
 	}
 	s.keysByHash = byHash
 }
 
-func (k *KeyConfig) ModelForAlias(alias string) (ModelRule, bool) {
-	alias = strings.TrimSpace(alias)
-	if alias == "" {
-		return ModelRule{}, false
+func (s *Store) modelForKey(key *KeyConfig, requested string) (ModelDefinition, bool) {
+	requested = strings.TrimSpace(requested)
+	if key == nil || requested == "" {
+		return ModelDefinition{}, false
 	}
-	for _, rule := range k.Models {
-		if strings.EqualFold(rule.Alias, alias) {
-			return rule, true
+	allowed := false
+	for _, ref := range key.Models {
+		if strings.EqualFold(ref.Name, requested) {
+			allowed = true
+			break
 		}
 	}
-	return ModelRule{}, false
+	if !allowed {
+		return ModelDefinition{}, false
+	}
+	s.mu.RLock()
+	model := s.models[strings.ToLower(requested)]
+	if model == nil {
+		s.mu.RUnlock()
+		return ModelDefinition{}, false
+	}
+	copy := *model
+	copy.Targets = append([]ModelTarget(nil), model.Targets...)
+	s.mu.RUnlock()
+	return copy, true
 }
 
-// resolveAliasRefsToModels expands a key's Alias refs into concrete ModelRule
-// entries using the global alias table. For round-robin aliases with multiple
-// targets, each target becomes a separate ModelRule (same alias, different
-// provider/model/group) — the routing layer selects one at request time. Per-key
-// price overrides on KeyAliasRef take precedence over the global alias pricing.
-func resolveAliasRefsToModels(refs []KeyAliasRef, aliases map[string]*AliasMapping) []ModelRule {
-	var out []ModelRule
-	for _, ref := range refs {
-		a, ok := aliases[strings.ToLower(ref.Alias)]
-		if !ok {
-			continue
-		}
-		for _, t := range a.Targets {
-			rule := ModelRule{
-				Alias:              a.Alias,
-				Provider:           t.Provider,
-				TargetModel:        t.TargetModel,
-				Group:              t.Group,
-				BillingMode:        a.BillingMode,
-				AliasDailyLimitUSD: ref.DailyLimitUSD,
-			}
-			// Apply per-key price overrides (nil = use global default).
-			if ref.InputPricePerMillion != nil {
-				rule.InputPricePerMillion = *ref.InputPricePerMillion
-			} else {
-				rule.InputPricePerMillion = a.InputPricePerMillion
-			}
-			if ref.OutputPricePerMillion != nil {
-				rule.OutputPricePerMillion = *ref.OutputPricePerMillion
-			} else {
-				rule.OutputPricePerMillion = a.OutputPricePerMillion
-			}
-			if ref.CacheReadPricePerMillion != nil {
-				rule.CacheReadPricePerMillion = *ref.CacheReadPricePerMillion
-			} else {
-				rule.CacheReadPricePerMillion = a.CacheReadPricePerMillion
-			}
-			if ref.PerCallUSD != nil {
-				rule.PerCallUSD = *ref.PerCallUSD
-			} else {
-				rule.PerCallUSD = a.PerCallUSD
-			}
-			out = append(out, rule)
-		}
-	}
-	return out
-}
-
-// usageSnapshotLocked returns a deep copy of the usage ledger. Caller must
-// hold s.mu (write or read) so Configure snapshots the selected state and its
-// migrated usage before publishing the rebuilt store.
 func (s *Store) usageSnapshotLocked() map[string]*UsageState {
 	if s.usage == nil {
 		return nil
@@ -486,38 +380,34 @@ func (s *Store) usageSnapshotLocked() map[string]*UsageState {
 	return s.usage.snapshot()
 }
 
-// FlushUsage persists only a dirty usage snapshot. The revision handshake
-// prevents a record that arrives during the write from being marked clean.
 func (s *Store) FlushUsage() error {
 	s.persistMu.Lock()
 	defer s.persistMu.Unlock()
 	s.mu.RLock()
 	ledger := s.usage
 	path := s.statePath
+	datasetID := s.datasetID
 	s.mu.RUnlock()
-	if path == "" || ledger == nil {
+	if path == "" || datasetID == "" || ledger == nil {
 		return nil
 	}
 	usage, revision, dirty := ledger.snapshotForFlush()
 	if !dirty {
 		return nil
 	}
-	if err := SaveUsage(policyPersist.UsagePath(path), usage); err != nil {
+	if err := SaveUsage(policyPersist.UsagePath(path), datasetID, usage); err != nil {
 		return err
 	}
 	ledger.markFlushed(revision)
 	return nil
 }
 
-func (s *Store) saveState(path string, keys []KeyConfig, aliases []AliasMapping, rules []ClassifyRule) error {
+func (s *Store) saveState(path, datasetID string, keys []KeyConfig, models []ModelDefinition, rules []ClassifyRule) error {
 	s.persistMu.Lock()
 	defer s.persistMu.Unlock()
-	return SaveState(path, keys, aliases, rules)
+	return SaveState(path, datasetID, keys, models, rules)
 }
 
-// StartUsageFlusher launches a goroutine that periodically persists the usage
-// ledger to the independent usage file. Idempotent. Returns a stop function;
-// the plugin host should call it (or FlushUsage) at reconfigure/shutdown.
 func (s *Store) StartUsageFlusher() func() {
 	s.mu.Lock()
 	if s.flusher != nil {
@@ -536,7 +426,6 @@ func (s *Store) StartUsageFlusher() func() {
 	return stop
 }
 
-// StopUsageFlusher stops the background flusher and flushes once more.
 func (s *Store) StopUsageFlusher() {
 	s.mu.Lock()
 	f := s.flusher
@@ -558,13 +447,13 @@ type usageFlusher struct {
 
 func (f *usageFlusher) loop() {
 	defer close(f.doneCh)
-	t := time.NewTicker(usageFlushInterval)
-	defer t.Stop()
+	ticker := time.NewTicker(usageFlushInterval)
+	defer ticker.Stop()
 	for {
 		select {
 		case <-f.stopCh:
 			return
-		case <-t.C:
+		case <-ticker.C:
 			_ = f.store.FlushUsage()
 		}
 	}

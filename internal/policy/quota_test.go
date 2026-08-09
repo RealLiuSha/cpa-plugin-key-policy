@@ -2,7 +2,6 @@ package policy
 
 import (
 	"bytes"
-	"encoding/json"
 	"log"
 	"os"
 	"path/filepath"
@@ -55,8 +54,8 @@ func TestBucketBoundaryIndependentOfFirstRecord(t *testing.T) {
 			t.Fatalf("%s daily usage survived natural-day boundary: %+v", id, summary)
 		}
 		wantReset := time.Date(2026, 8, 10, 0, 0, 0, 0, loc)
-		if !summary.DailyResetAt.Equal(wantReset) {
-			t.Fatalf("%s reset at %s, want %s", id, summary.DailyResetAt, wantReset)
+		if !summary.NextAccountingBoundaryAt.Equal(wantReset) {
+			t.Fatalf("%s boundary at %s, want %s", id, summary.NextAccountingBoundaryAt, wantReset)
 		}
 	}
 }
@@ -94,37 +93,38 @@ func TestRetentionEvictsBeyond35Days(t *testing.T) {
 	if _, ok := state.Days["2026-06-01"]; ok {
 		t.Fatal("36-day-old bucket was not evicted")
 	}
-	if got := len(state.ByAlias["fast"]); got != usageRetentionDays {
-		t.Fatalf("retained alias buckets = %d, want %d", got, usageRetentionDays)
+	if got := len(state.ByModel["fast"]); got != usageRetentionDays {
+		t.Fatalf("retained model buckets = %d, want %d", got, usageRetentionDays)
 	}
 }
 
-func TestAliasWindowsMatchKeyWindows(t *testing.T) {
+func TestModelWindowsMatchKeyWindows(t *testing.T) {
 	loc := mustShanghai(t)
 	start := time.Date(2026, 7, 1, 12, 0, 0, 0, loc)
 	now := start
 	ledger := newUsageLedgerWithLocation(func() time.Time { return now }, loc, "Asia/Shanghai")
-	key := KeyConfig{ID: "alias-windows", Models: []ModelRule{{Alias: "fast"}}}
+	key := KeyConfig{ID: "model-windows", Models: modelRefs("fast")}
+	models := []ModelDefinition{freeTestModel("fast", "codex", "fast")}
 	for day := 0; day < 31; day++ {
 		now = start.AddDate(0, 0, day)
 		ledger.RecordCost(key.ID, "fast", 1, 0.25, 2, 3, 4, 1)
 	}
 	summary := ledger.Summary(key.ID, quotaLimitsForKey(key))
-	rows := ledger.AliasUsage(key.ID, key.Models)
+	rows := ledger.ModelUsage(key.ID, models)
 	if len(rows) != 1 {
-		t.Fatalf("alias rows = %+v", rows)
+		t.Fatalf("model rows = %+v", rows)
 	}
 	row := rows[0]
 	if !nearly(row.Daily.TotalUSD, summary.DailyUSD) ||
 		!nearly(row.Weekly.TotalUSD, summary.WeeklyUSD) ||
 		!nearly(row.Monthly.TotalUSD, summary.MonthlyUSD) {
-		t.Fatalf("alias windows = %+v, key summary = %+v", row, summary)
+		t.Fatalf("model windows = %+v, key summary = %+v", row, summary)
 	}
 	if !nearly(row.Daily.TotalUSD, 1) || !nearly(row.Weekly.TotalUSD, 7) || !nearly(row.Monthly.TotalUSD, 30) {
-		t.Fatalf("alias rolling totals = %+v", row)
+		t.Fatalf("model rolling totals = %+v", row)
 	}
 	if row.Monthly.CallCount != 30 || row.Monthly.CacheReadTokens != 60 || !nearly(row.Monthly.CacheCostUSD, 7.5) || row.Monthly.InputTokens != 90 || row.Monthly.OutputTokens != 120 {
-		t.Fatalf("alias monthly counters = %+v", row.Monthly)
+		t.Fatalf("model monthly counters = %+v", row.Monthly)
 	}
 }
 
@@ -169,7 +169,7 @@ func TestSoftLimitIsWarningOnly(t *testing.T) {
 		{name: "daily", key: KeyConfig{ID: "warning", DailyLimitUSD: 10}},
 		{name: "weekly", key: KeyConfig{ID: "warning", WeeklyLimitUSD: 10}},
 		{name: "monthly", key: KeyConfig{ID: "warning", MonthlyLimitUSD: 10}},
-		{name: "alias", key: KeyConfig{ID: "warning", Models: []ModelRule{{Alias: "fast", AliasDailyLimitUSD: 10}}}},
+		{name: "model", key: KeyConfig{ID: "warning", Models: []KeyModelRef{{Name: "fast", DailyLimitUSD: 10}}}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			if summary := ledger.Summary(test.key.ID, quotaLimitsForKey(test.key)); !summary.SoftLimitHit {
@@ -200,9 +200,9 @@ func TestChangedLimitAppliesToAlreadyAccumulatedUsage(t *testing.T) {
 	}
 }
 
-func TestAliasDailyLimitIsIsolatedAcrossAliasesAndTargets(t *testing.T) {
+func TestModelDailyLimitIsIsolatedAcrossModelsAndTargets(t *testing.T) {
 	dir := t.TempDir()
-	hash, err := HashKey("cpa_alias_limit")
+	hash, err := HashKey("cpa_model_limit")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -211,37 +211,37 @@ func TestAliasDailyLimitIsIsolatedAcrossAliasesAndTargets(t *testing.T) {
 	store.SetClock(func() time.Time { return now })
 	if err := store.Configure(Config{
 		Enabled: true, StateFile: filepath.Join(dir, "state.json"),
-		Aliases: []AliasMapping{
-			{Alias: "fast", Targets: []AliasTarget{{Provider: "codex", TargetModel: "m1"}, {Provider: "openai", TargetModel: "m2"}}, InputPricePerMillion: 1},
-			{Alias: "slow", Targets: []AliasTarget{{Provider: "codex", TargetModel: "m3"}}, InputPricePerMillion: 1},
+		Models: []ModelDefinition{
+			{Name: "fast", Targets: []ModelTarget{{Provider: "codex", TargetModel: "m1"}, {Provider: "openai", TargetModel: "m2"}}, BillingMode: "tokens", InputPricePerMillion: 1},
+			tokenTestModel("slow", "codex", "m3", 1, 0),
 		},
-		Keys: []KeyConfig{{ID: "limited", Enabled: true, KeyHash: hash, Aliases: []KeyAliasRef{{Alias: "fast", DailyLimitUSD: 1}, {Alias: "slow"}}}},
+		Keys: []KeyConfig{{ID: "limited", Enabled: true, KeyHash: hash, Models: []KeyModelRef{{Name: "fast", DailyLimitUSD: 1}, {Name: "slow"}}}},
 	}); err != nil {
 		t.Fatal(err)
 	}
 	store.RecordUsage("limited", "fast", "m1", false, UsageDetail{InputTokens: 1_000_000})
-	headers := map[string][]string{"Authorization": {"Bearer cpa_alias_limit"}}
+	headers := map[string][]string{"Authorization": {"Bearer cpa_model_limit"}}
 	blocked := store.Authenticate("POST", "/v1/chat/completions", headers, nil, []byte(`{"model":"fast"}`))
-	if blocked.Allowed || blocked.Reason != "alias_daily_exceeded" {
-		t.Fatalf("fast alias decision = %+v", blocked)
+	if blocked.Allowed || blocked.Reason != "model_daily_exceeded" {
+		t.Fatalf("fast model decision = %+v", blocked)
 	}
 	allowed := store.Authenticate("POST", "/v1/chat/completions", headers, nil, []byte(`{"model":"slow"}`))
 	if !allowed.Allowed {
-		t.Fatalf("slow alias was affected: %+v", allowed)
+		t.Fatalf("slow model was affected: %+v", allowed)
 	}
 	key := store.Keys()[0]
-	for _, rule := range key.Models {
-		if rule.Alias == "fast" && rule.AliasDailyLimitUSD != 1 {
-			t.Fatalf("expanded target lost alias limit: %+v", rule)
+	for _, ref := range key.Models {
+		if ref.Name == "fast" && ref.DailyLimitUSD != 1 {
+			t.Fatalf("model ref lost daily limit: %+v", ref)
 		}
 	}
-	_, aliases, ok := store.AliasUsageFor(key.ID)
-	if !ok || len(aliases) != 2 {
-		t.Fatalf("alias usage rows = %+v", aliases)
+	_, models, ok := store.ModelUsageFor(key.ID)
+	if !ok || len(models) != 2 {
+		t.Fatalf("model usage rows = %+v", models)
 	}
-	for _, entry := range aliases {
-		if entry.Alias == "fast" && (!nearly(entry.Daily.TotalUSD, 1) || !nearly(entry.Weekly.TotalUSD, 1) || !nearly(entry.Monthly.TotalUSD, 1)) {
-			t.Fatalf("alias window totals diverged: %+v", entry)
+	for _, entry := range models {
+		if entry.Name == "fast" && (!nearly(entry.Daily.TotalUSD, 1) || !nearly(entry.Weekly.TotalUSD, 1) || !nearly(entry.Monthly.TotalUSD, 1)) {
+			t.Fatalf("model window totals diverged: %+v", entry)
 		}
 	}
 }
@@ -253,8 +253,8 @@ func TestLimitsChangedAtOnlyMovesWhenLimitChanges(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	key := KeyConfig{ID: "limits", Enabled: true, KeyHash: hash, DailyLimitUSD: 1, Models: []ModelRule{{Alias: "fast", Provider: "codex", TargetModel: "m"}}}
-	if err := store.Configure(Config{Enabled: true, StateFile: path, Keys: []KeyConfig{key}}); err != nil {
+	key := KeyConfig{ID: "limits", Enabled: true, KeyHash: hash, DailyLimitUSD: 1, Models: modelRefs("fast")}
+	if err := store.Configure(Config{Enabled: true, StateFile: path, Keys: []KeyConfig{key}, Models: []ModelDefinition{freeTestModel("fast", "codex", "m")}}); err != nil {
 		t.Fatal(err)
 	}
 	key = store.Keys()[0]
@@ -284,16 +284,16 @@ func TestLimitsChangedAtOnlyMovesWhenLimitChanges(t *testing.T) {
 		t.Fatalf("limit change timestamp = %s, want after %s", second, first)
 	}
 	changed = store.Keys()[0]
-	if len(changed.Aliases) != 1 {
-		t.Fatalf("aliases = %+v", changed.Aliases)
+	if len(changed.Models) != 1 {
+		t.Fatalf("models = %+v", changed.Models)
 	}
 	time.Sleep(time.Millisecond)
-	changed.Aliases[0].DailyLimitUSD = 2
+	changed.Models[0].DailyLimitUSD = 2
 	if err := store.UpsertKey(changed, true); err != nil {
 		t.Fatal(err)
 	}
 	if got := store.Keys()[0].LimitsChangedAt; !got.After(second) {
-		t.Fatalf("alias limit change timestamp = %s, want after %s", got, second)
+		t.Fatalf("model limit change timestamp = %s, want after %s", got, second)
 	}
 }
 
@@ -325,7 +325,7 @@ func TestSplitUsageFileAndDirtyFlush(t *testing.T) {
 		t.Fatal(err)
 	}
 	store := NewStore()
-	if err := store.Configure(Config{Enabled: true, StateFile: statePath, Keys: []KeyConfig{{ID: "split", Enabled: true, KeyHash: hash, Models: []ModelRule{{Alias: "fast", Provider: "codex", TargetModel: "m", BillingMode: "per_call", PerCallUSD: 1}}}}}); err != nil {
+	if err := store.Configure(Config{Enabled: true, StateFile: statePath, Keys: []KeyConfig{{ID: "split", Enabled: true, KeyHash: hash, Models: modelRefs("fast")}}, Models: []ModelDefinition{perCallTestModel("fast", "codex", "m", 1)}}); err != nil {
 		t.Fatal(err)
 	}
 	stateBeforeFlush, err := os.ReadFile(statePath)
@@ -383,7 +383,7 @@ func TestSplitUsageFileAndDirtyFlush(t *testing.T) {
 func TestTmpCleanupRemovesOnlyOldMatchingFiles(t *testing.T) {
 	dir := t.TempDir()
 	statePath := filepath.Join(dir, "state.json")
-	if err := SaveState(statePath, nil, nil, nil); err != nil {
+	if err := SaveState(statePath, "cleanup-dataset", nil, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	oldPath := filepath.Join(dir, ".state.json.tmp-old")
@@ -398,7 +398,7 @@ func TestTmpCleanupRemovesOnlyOldMatchingFiles(t *testing.T) {
 	if err := os.Chtimes(oldPath, now.Add(-2*time.Hour), now.Add(-2*time.Hour)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := LoadStateAt(statePath, now, time.UTC); err != nil {
+	if _, err := LoadState(statePath); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(oldPath); !os.IsNotExist(err) {
@@ -414,7 +414,10 @@ func TestTmpCleanupRemovesOnlyOldMatchingFiles(t *testing.T) {
 func TestConfigureCleansStaleStateAndUsageTemps(t *testing.T) {
 	dir := t.TempDir()
 	statePath := filepath.Join(dir, "state.json")
-	if err := SaveState(statePath, nil, nil, nil); err != nil {
+	if err := SaveState(statePath, "cleanup-dataset", nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveUsage(filepath.Join(dir, "cpa-key-policy-usage.json"), "cleanup-dataset", map[string]*UsageState{}); err != nil {
 		t.Fatal(err)
 	}
 	oldStateTemp := filepath.Join(dir, ".state.json.tmp-stale")
@@ -442,134 +445,6 @@ func TestConfigureCleansStaleStateAndUsageTemps(t *testing.T) {
 	}
 	if _, err := os.Stat(recentUsageTemp); err != nil {
 		t.Fatalf("recent usage temp was removed: %v", err)
-	}
-}
-
-func TestLegacyMigrationIsIdempotentAndPreservesWindowTotals(t *testing.T) {
-	loc := mustShanghai(t)
-	now := time.Date(2026, 8, 8, 12, 0, 0, 0, loc)
-	legacy := map[string]any{"rebirth": map[string]any{
-		"daily": map[string]any{
-			"total_usd": 31.10, "call_count": 2, "cache_read_tokens": 3,
-			"cache_cost_usd": 0.4, "input_tokens": 5, "output_tokens": 6,
-			"window_start": "2026-08-08T00:00:00+08:00",
-		},
-		"weekly": map[string]any{
-			"total_usd": 103.45, "call_count": 5, "cache_read_tokens": 13,
-			"cache_cost_usd": 1.4, "input_tokens": 15, "output_tokens": 16,
-			"window_start": "2026-08-01T23:59:00+08:00",
-		},
-		"by_alias": map[string]any{"days": map[string]any{
-			"daily":  map[string]any{"total_usd": 31.10, "call_count": 2, "window_start": "2026-08-08T00:00:00+08:00"},
-			"weekly": map[string]any{"total_usd": 103.45, "call_count": 5, "window_start": "2026-08-01T23:59:00+08:00"},
-		}},
-	}}
-	raw, err := json.Marshal(legacy)
-	if err != nil {
-		t.Fatal(err)
-	}
-	first, before, migrated, err := decodeUsageMap(raw, now, loc)
-	if err != nil || !migrated {
-		t.Fatalf("migration = %v %v", migrated, err)
-	}
-	if got := before["rebirth"]; !nearly(got.DailyUSD, 31.10) || !nearly(got.WeeklyUSD, 103.45) {
-		t.Fatalf("pre-migration totals = %+v", got)
-	}
-	ledger := newUsageLedgerWithLocation(func() time.Time { return now }, loc, "Asia/Shanghai")
-	ledger.loadFromState(first)
-	summary := ledger.Summary("rebirth", quotaLimits{})
-	if !nearly(summary.DailyUSD, 31.10) || !nearly(summary.WeeklyUSD, 103.45) {
-		t.Fatalf("migrated totals = %+v", summary)
-	}
-	state := first["rebirth"]
-	if got := state.Days["2026-08-08"]; got.CallCount != 2 || got.CacheReadTokens != 3 || !nearly(got.CacheCostUSD, 0.4) || got.InputTokens != 5 || got.OutputTokens != 6 {
-		t.Fatalf("daily counters = %+v", got)
-	}
-	if got := aliasBucketForDate(state, "days", "2026-08-08"); !nearly(got.TotalUSD, 31.10) {
-		t.Fatalf("legacy alias named days was misdetected: %+v", got)
-	}
-	v2Raw, err := json.Marshal(first)
-	if err != nil {
-		t.Fatal(err)
-	}
-	second, _, migratedAgain, err := decodeUsageMap(v2Raw, now, loc)
-	if err != nil || migratedAgain {
-		t.Fatalf("second migration = %v %v", migratedAgain, err)
-	}
-	firstJSON, _ := json.Marshal(first)
-	secondJSON, _ := json.Marshal(second)
-	if !bytes.Equal(firstJSON, secondJSON) {
-		t.Fatalf("idempotence mismatch:\n%s\n%s", firstJSON, secondJSON)
-	}
-}
-
-func TestLegacyMigrationPreservesEffectiveWindowTotals(t *testing.T) {
-	loc := mustShanghai(t)
-	now := time.Date(2026, 8, 8, 12, 0, 0, 0, loc)
-	tests := []struct {
-		name             string
-		dailyStart       string
-		weeklyStart      string
-		dailyUSD         float64
-		weeklyUSD        float64
-		wantDaily        float64
-		wantBeforeWeekly float64
-		wantAfterWeekly  float64
-	}{
-		{
-			name:       "past daily remains part of an active weekly window",
-			dailyStart: "2026-08-05T00:00:00+08:00", weeklyStart: "2026-08-04T00:00:00+08:00",
-			dailyUSD: 10, weeklyUSD: 50, wantDaily: 0, wantBeforeWeekly: 50, wantAfterWeekly: 50,
-		},
-		{
-			name:       "active weekly start on today minus seven is clamped into the new window",
-			dailyStart: "2026-08-08T00:00:00+08:00", weeklyStart: "2026-08-01T23:59:00+08:00",
-			dailyUSD: 10, weeklyUSD: 50, wantDaily: 10, wantBeforeWeekly: 50, wantAfterWeekly: 50,
-		},
-		{
-			name:       "inconsistent legacy weekly is raised to current daily",
-			dailyStart: "2026-08-08T00:00:00+08:00", weeklyStart: "2026-08-06T12:00:00+08:00",
-			dailyUSD: 10, weeklyUSD: 5, wantDaily: 10, wantBeforeWeekly: 5, wantAfterWeekly: 10,
-		},
-		{
-			name:       "expired weekly aggregate is not resurrected",
-			dailyStart: "2026-07-31T00:00:00+08:00", weeklyStart: "2026-08-01T11:59:00+08:00",
-			dailyUSD: 10, weeklyUSD: 50, wantDaily: 0, wantBeforeWeekly: 0, wantAfterWeekly: 0,
-		},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			legacy := map[string]any{"key": map[string]any{
-				"daily":  map[string]any{"total_usd": test.dailyUSD, "window_start": test.dailyStart},
-				"weekly": map[string]any{"total_usd": test.weeklyUSD, "window_start": test.weeklyStart},
-				"by_alias": map[string]any{"fast": map[string]any{
-					"daily":  map[string]any{"total_usd": test.dailyUSD, "window_start": test.dailyStart},
-					"weekly": map[string]any{"total_usd": test.weeklyUSD, "window_start": test.weeklyStart},
-				}},
-			}}
-			raw, err := json.Marshal(legacy)
-			if err != nil {
-				t.Fatal(err)
-			}
-			migrated, before, didMigrate, err := decodeUsageMap(raw, now, loc)
-			if err != nil || !didMigrate {
-				t.Fatalf("migration = %v %v", didMigrate, err)
-			}
-			beforeTotals := before["key"]
-			if !nearly(beforeTotals.DailyUSD, test.wantDaily) || !nearly(beforeTotals.WeeklyUSD, test.wantBeforeWeekly) || beforeTotals.MonthlyUSD != nil {
-				t.Fatalf("effective before totals = %+v, want daily=%v weekly=%v monthly=null", beforeTotals, test.wantDaily, test.wantBeforeWeekly)
-			}
-			after := SummarizeUsageStates(migrated, now, loc, loc.String())["key"]
-			if !nearly(after.DailyUSD, test.wantDaily) || !nearly(after.WeeklyUSD, test.wantAfterWeekly) || after.MonthlyUSD == nil || !nearly(*after.MonthlyUSD, test.wantAfterWeekly) {
-				t.Fatalf("migrated totals = %+v, want daily=%v weekly/monthly=%v", after, test.wantDaily, test.wantAfterWeekly)
-			}
-			aliasDays := migrated["key"].ByAlias["fast"]
-			aliasDaily := sumBuckets(aliasDays, "2026-08-08", "2026-08-08")
-			aliasWeekly := sumBuckets(aliasDays, "2026-08-02", "2026-08-08")
-			if !nearly(aliasDaily.TotalUSD, test.wantDaily) || !nearly(aliasWeekly.TotalUSD, test.wantAfterWeekly) {
-				t.Fatalf("migrated alias totals = daily %v weekly %v", aliasDaily.TotalUSD, aliasWeekly.TotalUSD)
-			}
-		})
 	}
 }
 

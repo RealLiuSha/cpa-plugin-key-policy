@@ -8,7 +8,10 @@ import KeyNew from "./pages/KeyNew";
 import KeyEdit from "./pages/KeyEdit";
 import KeyUsage from "./pages/KeyUsage";
 import ModelPick from "./pages/ModelPick";
-import Mapping, { AliasEditForm, RuleEditForm } from "./pages/Mapping";
+import Models from "./pages/Models";
+import ModelForm from "./pages/ModelForm";
+import CredentialGroups from "./pages/CredentialGroups";
+import CredentialGroupForm from "./pages/CredentialGroupForm";
 import Audit from "./pages/Audit";
 
 function useAuthTick() {
@@ -29,7 +32,8 @@ function TopNav() {
   // Active state: highlight the nav item matching the current path prefix.
   const onKeys = loc.pathname === "/keys" || loc.pathname.startsWith("/keys/");
   const onNew = loc.pathname === "/keys/new" || loc.pathname.startsWith("/keys/new/");
-  const onMapping = loc.pathname === "/mapping" || loc.pathname.startsWith("/mapping/");
+  const onModels = loc.pathname === "/models" || loc.pathname.startsWith("/models/");
+  const onCredentialGroups = loc.pathname === "/credential-groups" || loc.pathname.startsWith("/credential-groups/");
   const onAudit = loc.pathname === "/audit";
   return (
     <div className="topnav">
@@ -41,7 +45,8 @@ function TopNav() {
         <div className="topnav-actions">
           <Link to="/keys" className={"tn-link" + (onKeys && !onNew ? " active" : "")}>{t("header.keyList")}</Link>
           <Link to="/keys/new" className={"tn-link" + (onNew ? " active" : "")}>{t("header.newKey")}</Link>
-          <Link to="/mapping" className={"tn-link" + (onMapping ? " active" : "")}>{t("header.mapping")}</Link>
+          <Link to="/models" className={"tn-link" + (onModels ? " active" : "")}>{t("header.models")}</Link>
+          <Link to="/credential-groups" className={"tn-link" + (onCredentialGroups ? " active" : "")}>{t("header.credentialGroups")}</Link>
           <Link to="/audit" className={"tn-link" + (onAudit ? " active" : "")}>{t("header.audit")}</Link>
           <button
             className="btn sm"
@@ -92,14 +97,15 @@ function Shell() {
       <Routes>
         <Route path="/keys" element={<KeyList />} />
         <Route path="/keys/new" element={<KeyNew />} />
-        <Route path="/keys/new/models" element={<ModelPick />} />
         <Route path="/keys/:id/edit" element={<KeyEdit />} />
-        <Route path="/keys/:id/edit/models" element={<ModelPick />} />
-        <Route path="/mapping/pick-target" element={<ModelPick />} />
         <Route path="/keys/:id/usage" element={<KeyUsage />} />
-        <Route path="/mapping" element={<Mapping />} />
-        <Route path="/mapping/alias/:aliasName" element={<AliasEditForm />} />
-        <Route path="/mapping/rule/:ruleName" element={<RuleEditForm />} />
+        <Route path="/models" element={<Models />} />
+        <Route path="/models/new" element={<ModelForm />} />
+        <Route path="/models/pick-target" element={<ModelPick />} />
+        <Route path="/models/:name/edit" element={<ModelForm />} />
+        <Route path="/credential-groups" element={<CredentialGroups />} />
+        <Route path="/credential-groups/new" element={<CredentialGroupForm />} />
+        <Route path="/credential-groups/:name/edit" element={<CredentialGroupForm />} />
         <Route path="/audit" element={<Audit />} />
         <Route path="*" element={<Navigate to="/keys" replace />} />
       </Routes>
