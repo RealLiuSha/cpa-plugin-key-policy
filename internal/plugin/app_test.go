@@ -1036,7 +1036,7 @@ func TestUsageHandleTransportJSONSnapshot(t *testing.T) {
 
 func TestRegistrationReportsCurrentReleaseMetadata(t *testing.T) {
 	registration := NewApp().registration()
-	if registration.SchemaVersion != 2 || registration.Metadata.Version != "0.5.0" {
+	if registration.SchemaVersion != 2 || registration.Metadata.Version != "0.5.1" {
 		t.Fatalf("registration version metadata = %+v", registration)
 	}
 	if registration.Metadata.GitHubRepository != "https://github.com/RealLiuSha/cpa-plugin-key-policy" {
