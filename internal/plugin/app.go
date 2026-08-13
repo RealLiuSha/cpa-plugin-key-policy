@@ -80,8 +80,8 @@ func (a *App) configure(raw []byte) error {
 			return err
 		}
 	}
-	if req.SchemaVersion != SchemaVersion {
-		return fmt.Errorf("unsupported lifecycle schema_version %d; require %d", req.SchemaVersion, SchemaVersion)
+	if req.SchemaVersion < MinHostSchemaVersion {
+		return fmt.Errorf("unsupported lifecycle schema_version %d; require >= %d", req.SchemaVersion, MinHostSchemaVersion)
 	}
 	configYAML, err := stripHostConfigMetadata(req.ConfigYAML)
 	if err != nil {

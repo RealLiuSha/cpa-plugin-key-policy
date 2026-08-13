@@ -7,8 +7,16 @@ import (
 )
 
 const (
-	ABIVersion    uint32 = 1
+	ABIVersion uint32 = 1
+	// SchemaVersion is the lifecycle contract this plugin speaks, echoed back to the
+	// host at plugin.register so it knows how to talk to us. Staying at 2 is
+	// deliberate: schema 3 only omits OriginalRequest/RequestBody on payload stream
+	// chunks, and this plugin registers no stream chunk interceptor.
 	SchemaVersion uint32 = 2
+	// MinHostSchemaVersion is the oldest host lifecycle contract this plugin can work
+	// with. The host advertises its own ceiling, so anything at or above this is fine;
+	// requiring an exact match would make every host upgrade disable the plugin.
+	MinHostSchemaVersion uint32 = 2
 
 	MethodPluginRegister    = "plugin.register"
 	MethodPluginReconfigure = "plugin.reconfigure"
