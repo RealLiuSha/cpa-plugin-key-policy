@@ -521,7 +521,7 @@ func TestCacheStatsResetAtMidnight(t *testing.T) {
 
 	s := store.UsageSummaryFor(store.Keys()[0])
 	// Daily = day-2 only: 200K cacheRead, 0.06 cacheCost, 800K nonCache input.
-	if s.DailyCacheReadTokens != 200_000 || !nearly(s.DailyCacheCostUSD, 0.06) || s.DailyInputTokens != 800_000 {
+	if s.DailyCacheReadTokens != 200_000 || !nearly(s.DailyCacheCostUSD, 0.06) || s.DailyInputTokens != 800_000 || s.DailyCacheWriteTokens != 0 {
 		t.Fatalf("daily cache stats after midnight = %+v, want 200000/0.06/800000", s)
 	}
 	// Day-1's 500K output must NOT leak into the new daily window.
@@ -549,6 +549,71 @@ func TestCacheStatsAdditiveExcludesCreation(t *testing.T) {
 	// nonCache input = input + creation = 900K (additive bills creation at input price).
 	if s.DailyInputTokens != 900_000 {
 		t.Fatalf("daily non-cache input = %d, want 900000", s.DailyInputTokens)
+	}
+	if s.DailyCacheWriteTokens != 0 {
+		t.Fatalf("unconfigured cache-write invented tokens: %d", s.DailyCacheWriteTokens)
+	}
+}
+
+func TestCacheWriteStatsAccumulatedIndependently(t *testing.T) {
+	now := time.Date(2026, 6, 29, 10, 0, 0, 0, time.UTC)
+	store := NewStore()
+	store.SetClock(func() time.Time { return now })
+	if err := store.Configure(Config{
+		Enabled:   true,
+		StateFile: filepath.Join(t.TempDir(), "state.json"),
+		Models: []ModelDefinition{{
+			Name: "fast", Targets: []ModelTarget{{Provider: "claude", TargetModel: "m"}}, BillingMode: "tokens",
+			InputPricePerMillion: 3, OutputPricePerMillion: 15, CacheReadPricePerMillion: 0.30, CacheWritePricePerMillion: fptr(3.75),
+		}},
+		Keys: []KeyConfig{{
+			ID: "cache-key", Enabled: true,
+			KeyHash:    hashForUsageTest(t, "cpa_cache"),
+			KeyPreview: "cpa_ca...che",
+			Models:     modelRefs("fast"),
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cost := store.RecordUsage("cache-key", "fast", "m", false, UsageDetail{
+		InputTokens: 800_000, OutputTokens: 500_000, CacheReadTokens: 200_000, CacheCreationTokens: 100_000,
+	})
+	if !nearly(cost, 10.335) {
+		t.Fatalf("cost = %v, want 10.335", cost)
+	}
+	s := store.UsageSummaryFor(store.Keys()[0])
+	if s.DailyCacheWriteTokens != 100_000 || !nearly(s.DailyCacheWriteUSD, 0.375) {
+		t.Fatalf("cache-write stats = %+v", s)
+	}
+	if s.DailyInputTokens != 800_000 {
+		t.Fatalf("input tokens = %d, want 800000 after peeling writes", s.DailyInputTokens)
+	}
+}
+
+func TestCacheOnlyUsageIsBilledAndRecorded(t *testing.T) {
+	now := time.Date(2026, 6, 29, 10, 0, 0, 0, time.UTC)
+	store := NewStore()
+	store.SetClock(func() time.Time { return now })
+	if err := store.Configure(Config{
+		Enabled:   true,
+		StateFile: filepath.Join(t.TempDir(), "state.json"),
+		Models: []ModelDefinition{{
+			Name: "fast", Targets: []ModelTarget{{Provider: "claude", TargetModel: "m"}}, BillingMode: "tokens",
+			InputPricePerMillion: 3, OutputPricePerMillion: 15, CacheReadPricePerMillion: 0.30, CacheWritePricePerMillion: fptr(3.75),
+		}},
+		Keys: []KeyConfig{{ID: "cache-key", Enabled: true, KeyHash: hashForUsageTest(t, "cpa_cache"), Models: modelRefs("fast")}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	writeCost := store.RecordUsage("cache-key", "fast", "m", false, UsageDetail{CacheCreationTokens: 100_000})
+	readCost := store.RecordUsage("cache-key", "fast", "m", false, UsageDetail{CacheReadTokens: 100_000})
+	if !nearly(writeCost, 0.375) || !nearly(readCost, 0.03) {
+		t.Fatalf("cache-only costs = write %v read %v", writeCost, readCost)
+	}
+	summary := store.UsageSummaryFor(store.Keys()[0])
+	if summary.DailyCacheWriteTokens != 100_000 || summary.DailyCacheReadTokens != 100_000 || summary.DailyInputTokens != 0 {
+		t.Fatalf("cache-only usage summary = %+v", summary)
 	}
 }
 

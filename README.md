@@ -32,6 +32,8 @@ models:
     free: false
     input_price_per_million: 1
     output_price_per_million: 2
+    cache_read_price_per_million: 0.1
+    cache_write_price_per_million: 0.3
 
 keys:
   - id: team-a

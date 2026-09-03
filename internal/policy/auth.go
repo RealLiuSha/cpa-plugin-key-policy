@@ -41,10 +41,14 @@ func (s *Store) Authenticate(method, path string, headers http.Header, query map
 		decision.Route = route
 	}
 	limiter, usageLedger := s.runtimeComponents()
-	if limiter != nil && !limiter.Allow(key.ID, key.RPM) {
-		decision.RateLimited = true
-		decision.Reason = "rpm_exceeded"
-		return decision
+	if limiter != nil {
+		allowed, retryAfter := limiter.AllowWithRetryAfter(key.ID, key.RPM)
+		if !allowed {
+			decision.RateLimited = true
+			decision.Reason = "rpm_exceeded"
+			decision.RetryAfterSeconds = retryAfter
+			return decision
+		}
 	}
 	if usageLedger != nil {
 		if reason, _ := usageLedger.OverLimit(key.ID, decision.Route.PublicModel, quotaLimitsForKey(*key)); reason != "" {

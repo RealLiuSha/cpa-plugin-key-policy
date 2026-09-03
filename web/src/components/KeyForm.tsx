@@ -56,6 +56,7 @@ function priceSummary(model: ModelDefinition, translate: (key: string, variables
     input: model.input_price_per_million ?? 0,
     output: model.output_price_per_million ?? 0,
     cache: model.cache_read_price_per_million ?? 0,
+    write: model.cache_write_price_per_million ?? 0,
   });
 }
 

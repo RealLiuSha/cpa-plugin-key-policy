@@ -46,17 +46,18 @@ const pendingPickTTL = 30 * time.Second
 const pendingPickMaxQueue = 32
 
 type AuthDecision struct {
-	Known       bool
-	Allowed     bool
-	KeyID       string
-	Principal   string
-	Requested   string
-	Route       ResolvedModelRoute
-	Reason      string
-	ModelList   bool
-	RateLimited bool
-	CostLimited bool
-	PreCharged  bool
+	Known             bool
+	Allowed           bool
+	KeyID             string
+	Principal         string
+	Requested         string
+	Route             ResolvedModelRoute
+	Reason            string
+	ModelList         bool
+	RateLimited       bool
+	CostLimited       bool
+	PreCharged        bool
+	RetryAfterSeconds int
 }
 
 func NewStore() *Store {
@@ -177,6 +178,7 @@ func (s *Store) Configure(cfg Config) error {
 	for i := range models {
 		copy := models[i]
 		copy.Targets = append([]ModelTarget(nil), models[i].Targets...)
+		copy.CacheWritePricePerMillion = cloneFloat64(models[i].CacheWritePricePerMillion)
 		nextModels[strings.ToLower(copy.Name)] = &copy
 	}
 

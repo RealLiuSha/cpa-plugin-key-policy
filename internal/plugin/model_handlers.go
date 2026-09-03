@@ -9,15 +9,16 @@ import (
 )
 
 type modelUpsertRequest struct {
-	Name                     string               `json:"name"`
-	Targets                  []policy.ModelTarget `json:"targets"`
-	Dispatch                 string               `json:"dispatch"`
-	BillingMode              string               `json:"billing_mode"`
-	Free                     bool                 `json:"free"`
-	InputPricePerMillion     float64              `json:"input_price_per_million"`
-	OutputPricePerMillion    float64              `json:"output_price_per_million"`
-	CacheReadPricePerMillion float64              `json:"cache_read_price_per_million"`
-	PerCallUSD               float64              `json:"per_call_usd"`
+	Name                      string               `json:"name"`
+	Targets                   []policy.ModelTarget `json:"targets"`
+	Dispatch                  string               `json:"dispatch"`
+	BillingMode               string               `json:"billing_mode"`
+	Free                      bool                 `json:"free"`
+	InputPricePerMillion      float64              `json:"input_price_per_million"`
+	OutputPricePerMillion     float64              `json:"output_price_per_million"`
+	CacheReadPricePerMillion  float64              `json:"cache_read_price_per_million"`
+	CacheWritePricePerMillion *float64             `json:"cache_write_price_per_million,omitempty"`
+	PerCallUSD                float64              `json:"per_call_usd"`
 }
 
 func (a *App) upsertModel(raw []byte) ManagementResponse {
@@ -26,15 +27,16 @@ func (a *App) upsertModel(raw []byte) ManagementResponse {
 		return jsonError(http.StatusBadRequest, "bad_request", err.Error())
 	}
 	model := policy.ModelDefinition{
-		Name:                     req.Name,
-		Targets:                  req.Targets,
-		Dispatch:                 req.Dispatch,
-		BillingMode:              req.BillingMode,
-		Free:                     req.Free,
-		InputPricePerMillion:     req.InputPricePerMillion,
-		OutputPricePerMillion:    req.OutputPricePerMillion,
-		CacheReadPricePerMillion: req.CacheReadPricePerMillion,
-		PerCallUSD:               req.PerCallUSD,
+		Name:                      req.Name,
+		Targets:                   req.Targets,
+		Dispatch:                  req.Dispatch,
+		BillingMode:               req.BillingMode,
+		Free:                      req.Free,
+		InputPricePerMillion:      req.InputPricePerMillion,
+		OutputPricePerMillion:     req.OutputPricePerMillion,
+		CacheReadPricePerMillion:  req.CacheReadPricePerMillion,
+		CacheWritePricePerMillion: req.CacheWritePricePerMillion,
+		PerCallUSD:                req.PerCallUSD,
 	}
 	if err := a.store.UpsertModel(model); err != nil {
 		return jsonError(http.StatusBadRequest, "validation_error", err.Error())

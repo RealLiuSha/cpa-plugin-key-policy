@@ -1190,6 +1190,11 @@ td.strong { font-weight: 600; color: var(--text); }
 .chip-row .chip.more { color: var(--text); font: inherit; font-size: 11px; font-weight: 600; cursor: pointer; }
 .model-import { display: flex; flex-direction: column; gap: 10px; }
 .model-import textarea { width: 100%; font-family: var(--mono); }
+.model-import-wizard, .import-rows { display: flex; flex-direction: column; gap: 12px; }
+.import-row { display: flex; flex-direction: column; gap: 8px; padding: 12px; border: 1px solid var(--border); border-radius: var(--r-md); }
+@media (max-width: 720px) {
+  .import-row .field-row { flex-direction: column; }
+}
 .model-form section.card { display: flex; flex-direction: column; gap: 16px; }
 .model-form section.card > p { margin: 0; }
 .model-table.card.table-wrap { overflow-x: auto; }

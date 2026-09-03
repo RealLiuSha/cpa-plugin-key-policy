@@ -47,16 +47,7 @@ func (s *Store) UpsertModel(input ModelDefinition) error {
 	if err := s.saveState(path, datasetID, cfg.Keys, cfg.Models, cfg.ClassifyRules); err != nil {
 		return err
 	}
-	s.mu.Lock()
-	s.models = make(map[string]*ModelDefinition, len(cfg.Models))
-	for i := range cfg.Models {
-		copy := cfg.Models[i]
-		copy.Targets = append([]ModelTarget(nil), cfg.Models[i].Targets...)
-		s.models[strings.ToLower(copy.Name)] = &copy
-	}
-	s.rrCounters = make(map[string]int)
-	s.pendingPicks = make(map[string][]pendingPick)
-	s.mu.Unlock()
+	s.publishModels(cfg.Models, true)
 	action := "create_model"
 	if found {
 		action = "update_model"
@@ -97,10 +88,7 @@ func (s *Store) DeleteModel(name string) error {
 	if err := s.saveState(path, datasetID, keys, filtered, rules); err != nil {
 		return err
 	}
-	s.mu.Lock()
-	delete(s.models, strings.ToLower(name))
-	delete(s.rrCounters, strings.ToLower(name))
-	s.mu.Unlock()
+	s.publishModels(filtered, false)
 	s.recordAudit(audit.Event{Action: "delete_model", Changes: map[string]audit.Change{"model": {From: name, To: ""}}})
 	return nil
 }
@@ -114,14 +102,16 @@ type PriceImportMatch struct {
 }
 
 type PriceImportApplied struct {
-	Model                    string  `json:"model"`
-	OldInputPricePerMillion  float64 `json:"old_input_price_per_million"`
-	OldOutputPricePerMillion float64 `json:"old_output_price_per_million"`
-	OldCacheReadPerMillion   float64 `json:"old_cache_read_price_per_million"`
-	NewInputPricePerMillion  float64 `json:"new_input_price_per_million"`
-	NewOutputPricePerMillion float64 `json:"new_output_price_per_million"`
-	NewCacheReadPerMillion   float64 `json:"new_cache_read_price_per_million"`
-	Note                     string  `json:"note,omitempty"`
+	Model                    string   `json:"model"`
+	OldInputPricePerMillion  float64  `json:"old_input_price_per_million"`
+	OldOutputPricePerMillion float64  `json:"old_output_price_per_million"`
+	OldCacheReadPerMillion   float64  `json:"old_cache_read_price_per_million"`
+	OldCacheWritePerMillion  *float64 `json:"old_cache_write_price_per_million,omitempty"`
+	NewInputPricePerMillion  float64  `json:"new_input_price_per_million"`
+	NewOutputPricePerMillion float64  `json:"new_output_price_per_million"`
+	NewCacheReadPerMillion   float64  `json:"new_cache_read_price_per_million"`
+	NewCacheWritePerMillion  *float64 `json:"new_cache_write_price_per_million,omitempty"`
+	Note                     string   `json:"note,omitempty"`
 }
 
 type PriceImportUnchanged struct {
@@ -139,16 +129,16 @@ type PriceImportResult struct {
 	AffectedKeys []string               `json:"affected_keys"`
 }
 
-type importPricePatch struct{ input, output, cache *float64 }
+type importPricePatch struct{ input, output, cache, cacheWrite *float64 }
 
 func (patch importPricePatch) empty() bool {
-	return patch.input == nil && patch.output == nil && patch.cache == nil
+	return patch.input == nil && patch.output == nil && patch.cache == nil && patch.cacheWrite == nil
 }
 func pricePointersEqual(left, right *float64) bool {
 	return (left == nil && right == nil) || (left != nil && right != nil && *left == *right)
 }
 func importPatchesEqual(left, right importPricePatch) bool {
-	return pricePointersEqual(left.input, right.input) && pricePointersEqual(left.output, right.output) && pricePointersEqual(left.cache, right.cache)
+	return pricePointersEqual(left.input, right.input) && pricePointersEqual(left.output, right.output) && pricePointersEqual(left.cache, right.cache) && pricePointersEqual(left.cacheWrite, right.cacheWrite)
 }
 
 func (s *Store) ImportModelPrices(matches []PriceImportMatch, dryRun bool) (PriceImportResult, error) {
@@ -157,7 +147,7 @@ func (s *Store) ImportModelPrices(matches []PriceImportMatch, dryRun bool) (Pric
 	matchOrder := make([]string, 0, len(matches))
 	for _, match := range matches {
 		name := strings.ToLower(strings.TrimSpace(match.Model))
-		patch := importPricePatch{input: match.PromptPricePer1M, output: match.CompletionPricePer1M, cache: match.CacheReadPricePer1M}
+		patch := importPricePatch{input: match.PromptPricePer1M, output: match.CompletionPricePer1M, cache: match.CacheReadPricePer1M, cacheWrite: match.CacheWritePricePer1M}
 		if name == "" || patch.empty() {
 			continue
 		}
@@ -219,7 +209,7 @@ func (s *Store) ImportModelPrices(matches []PriceImportMatch, dryRun bool) (Pric
 			result.Skipped = append(result.Skipped, PriceImportSkipped{Model: model.Name, Reason: "target_price_conflict"})
 			continue
 		}
-		oldInput, oldOutput, oldCache := model.InputPricePerMillion, model.OutputPricePerMillion, model.CacheReadPricePerMillion
+		oldInput, oldOutput, oldCache, oldWrite := model.InputPricePerMillion, model.OutputPricePerMillion, model.CacheReadPricePerMillion, model.CacheWritePricePerMillion
 		if hits[0].input != nil {
 			model.InputPricePerMillion = *hits[0].input
 		}
@@ -229,13 +219,16 @@ func (s *Store) ImportModelPrices(matches []PriceImportMatch, dryRun bool) (Pric
 		if hits[0].cache != nil {
 			model.CacheReadPricePerMillion = *hits[0].cache
 		}
-		if oldInput == model.InputPricePerMillion && oldOutput == model.OutputPricePerMillion && oldCache == model.CacheReadPricePerMillion {
+		if hits[0].cacheWrite != nil {
+			model.CacheWritePricePerMillion = cloneFloat64(hits[0].cacheWrite)
+		}
+		if oldInput == model.InputPricePerMillion && oldOutput == model.OutputPricePerMillion && oldCache == model.CacheReadPricePerMillion && pricePointersEqual(oldWrite, model.CacheWritePricePerMillion) {
 			result.Unchanged = append(result.Unchanged, PriceImportUnchanged{Model: model.Name})
 			continue
 		}
 		record := PriceImportApplied{
-			Model: model.Name, OldInputPricePerMillion: oldInput, OldOutputPricePerMillion: oldOutput, OldCacheReadPerMillion: oldCache,
-			NewInputPricePerMillion: model.InputPricePerMillion, NewOutputPricePerMillion: model.OutputPricePerMillion, NewCacheReadPerMillion: model.CacheReadPricePerMillion,
+			Model: model.Name, OldInputPricePerMillion: oldInput, OldOutputPricePerMillion: oldOutput, OldCacheReadPerMillion: oldCache, OldCacheWritePerMillion: oldWrite,
+			NewInputPricePerMillion: model.InputPricePerMillion, NewOutputPricePerMillion: model.OutputPricePerMillion, NewCacheReadPerMillion: model.CacheReadPricePerMillion, NewCacheWritePerMillion: model.CacheWritePricePerMillion,
 		}
 		if model.BillingMode == "per_call" {
 			record.Note = "billing_mode is per_call; token prices remain dormant"
@@ -268,21 +261,32 @@ func (s *Store) ImportModelPrices(matches []PriceImportMatch, dryRun bool) (Pric
 	if err := s.saveState(path, datasetID, cfg.Keys, cfg.Models, cfg.ClassifyRules); err != nil {
 		return result, err
 	}
-	s.mu.Lock()
-	s.models = make(map[string]*ModelDefinition, len(cfg.Models))
-	for i := range cfg.Models {
-		copy := cfg.Models[i]
-		copy.Targets = append([]ModelTarget(nil), cfg.Models[i].Targets...)
-		s.models[strings.ToLower(copy.Name)] = &copy
-	}
-	s.mu.Unlock()
+	s.publishModels(cfg.Models, false)
 	for _, applied := range result.Applied {
-		s.recordAudit(audit.Event{Action: "update_model", Changes: map[string]audit.Change{
-			"model":                        {From: applied.Model, To: applied.Model},
-			"input_price_per_million":      {From: applied.OldInputPricePerMillion, To: applied.NewInputPricePerMillion},
-			"output_price_per_million":     {From: applied.OldOutputPricePerMillion, To: applied.NewOutputPricePerMillion},
-			"cache_read_price_per_million": {From: applied.OldCacheReadPerMillion, To: applied.NewCacheReadPerMillion},
+		s.recordAudit(audit.Event{Action: "import_update_prices", Changes: map[string]audit.Change{
+			"model":                         {From: applied.Model, To: applied.Model},
+			"input_price_per_million":       {From: applied.OldInputPricePerMillion, To: applied.NewInputPricePerMillion},
+			"output_price_per_million":      {From: applied.OldOutputPricePerMillion, To: applied.NewOutputPricePerMillion},
+			"cache_read_price_per_million":  {From: applied.OldCacheReadPerMillion, To: applied.NewCacheReadPerMillion},
+			"cache_write_price_per_million": {From: applied.OldCacheWritePerMillion, To: applied.NewCacheWritePerMillion},
 		}})
 	}
 	return result, nil
+}
+
+func (s *Store) publishModels(models []ModelDefinition, resetPicks bool) {
+	index := make(map[string]*ModelDefinition, len(models))
+	for i := range models {
+		copy := models[i]
+		copy.Targets = append([]ModelTarget(nil), models[i].Targets...)
+		copy.CacheWritePricePerMillion = cloneFloat64(models[i].CacheWritePricePerMillion)
+		index[strings.ToLower(copy.Name)] = &copy
+	}
+	s.mu.Lock()
+	s.models = index
+	s.rrCounters = make(map[string]int)
+	if resetPicks {
+		s.pendingPicks = make(map[string][]pendingPick)
+	}
+	s.mu.Unlock()
 }

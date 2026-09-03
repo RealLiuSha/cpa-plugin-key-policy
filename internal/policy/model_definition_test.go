@@ -280,7 +280,7 @@ func TestModelStatePersistence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if state.Version != 3 || state.DatasetID == "" || len(state.Models) != 1 || state.Keys[0].Models[0].Name != "Fast" {
+	if state.Version != currentStateFileVersion || state.DatasetID == "" || len(state.Models) != 1 || state.Keys[0].Models[0].Name != "Fast" {
 		t.Fatalf("persisted state = %+v", state)
 	}
 	reloaded := NewStore()

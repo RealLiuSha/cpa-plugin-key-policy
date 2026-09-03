@@ -125,6 +125,7 @@ describe("ModelForm return flow", () => {
       input_price_per_million: 1,
       output_price_per_million: 2,
       cache_read_price_per_million: 0.5,
+      cache_write_price_per_million: 1.5,
       per_call_usd: 0,
     };
     await act(async () => {

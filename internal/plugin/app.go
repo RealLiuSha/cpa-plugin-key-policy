@@ -15,10 +15,12 @@ import (
 
 	"cpa-key-policy/internal/plugin/web"
 	"cpa-key-policy/internal/policy"
+	"cpa-key-policy/internal/pricingmetadata"
 )
 
 type App struct {
 	store         *policy.Store
+	pricing       *pricingmetadata.Client
 	classifyMu    sync.RWMutex
 	classifyCache map[string][]string
 }
@@ -26,7 +28,14 @@ type App struct {
 const classifyCacheCapacity = 4096
 
 func NewApp() *App {
-	return &App{store: policy.NewStore(), classifyCache: make(map[string][]string)}
+	return &App{store: policy.NewStore(), pricing: pricingmetadata.NewClient(), classifyCache: make(map[string][]string)}
+}
+
+func (a *App) SetPricingClient(client *pricingmetadata.Client) {
+	if a == nil || client == nil {
+		return
+	}
+	a.pricing = client
 }
 
 func (a *App) HandleMethod(method string, request []byte) ([]byte, error) {
@@ -143,8 +152,11 @@ func (a *App) authenticate(raw []byte) ([]byte, error) {
 		return nil, err
 	}
 	decision := a.store.Authenticate(req.Method, req.Path, req.Headers, req.Query, req.Body)
-	if !decision.Known || !decision.Allowed {
+	if !decision.Known {
 		return OKEnvelope(FrontendAuthResponse{Authenticated: false})
+	}
+	if !decision.Allowed {
+		return OKEnvelope(FrontendAuthResponse{Authenticated: false, Rejection: frontendAuthRejection(decision)})
 	}
 	meta := map[string]string{
 		"provider":        PluginID,
@@ -167,6 +179,69 @@ func (a *App) authenticate(raw []byte) ([]byte, error) {
 		Principal:     decision.Principal,
 		Metadata:      meta,
 	})
+}
+
+func frontendAuthRejection(decision policy.AuthDecision) *FrontendAuthRejection {
+	switch decision.Reason {
+	case "key_disabled":
+		return &FrontendAuthRejection{
+			Code:         "key_disabled",
+			PolicyReason: "key_disabled",
+			Message:      "API key is disabled",
+			HTTPStatus:   http.StatusForbidden,
+		}
+	case "model_not_allowed":
+		return &FrontendAuthRejection{
+			Code:         "model_not_allowed",
+			PolicyReason: "model_not_allowed",
+			Message:      "Model is not allowed for this API key",
+			HTTPStatus:   http.StatusForbidden,
+		}
+	case "models_endpoint_disabled":
+		return &FrontendAuthRejection{
+			Code:         "models_endpoint_disabled",
+			PolicyReason: "models_endpoint_disabled",
+			Message:      "Model list access is disabled for this API key",
+			HTTPStatus:   http.StatusForbidden,
+		}
+	case "rpm_exceeded":
+		return &FrontendAuthRejection{
+			Code:              "rate_limit_exceeded",
+			PolicyReason:      "rpm_exceeded",
+			Message:           "Rate limit exceeded",
+			HTTPStatus:        http.StatusTooManyRequests,
+			RetryAfterSeconds: decision.RetryAfterSeconds,
+		}
+	case "daily_exceeded", "weekly_exceeded", "monthly_exceeded", "model_daily_exceeded":
+		return &FrontendAuthRejection{
+			Code:         "insufficient_quota",
+			PolicyReason: decision.Reason,
+			Message:      quotaRejectionMessage(decision.Reason),
+			HTTPStatus:   http.StatusTooManyRequests,
+		}
+	default:
+		return &FrontendAuthRejection{
+			Code:         "permission_denied",
+			PolicyReason: decision.Reason,
+			Message:      "Request rejected by key policy",
+			HTTPStatus:   http.StatusForbidden,
+		}
+	}
+}
+
+func quotaRejectionMessage(reason string) string {
+	switch reason {
+	case "daily_exceeded":
+		return "Daily quota exceeded"
+	case "weekly_exceeded":
+		return "Weekly quota exceeded"
+	case "monthly_exceeded":
+		return "Monthly quota exceeded"
+	case "model_daily_exceeded":
+		return "Model daily quota exceeded"
+	default:
+		return "Quota exceeded"
+	}
 }
 
 func (a *App) routeModel(raw []byte) ([]byte, error) {
@@ -510,6 +585,8 @@ func (a *App) managementRegistration() ManagementRegistrationResponse {
 			{Method: http.MethodPost, Path: base + "/models", Description: "Create or update a public model definition."},
 			{Method: http.MethodDelete, Path: base + "/models", Description: "Delete a public model definition by name."},
 			{Method: http.MethodPost, Path: base + "/models/import-prices", Description: "Batch-import token prices for existing models (dry_run supported)."},
+			{Method: http.MethodPost, Path: base + "/models/pricing-preview", Description: "Preview Models.dev prices for selected CPA models without writing state."},
+			{Method: http.MethodPost, Path: base + "/models/import", Description: "Preview or atomically apply a batch of public model imports."},
 			{Method: http.MethodGet, Path: base + "/classify-rules", Description: "List credential classification rules."},
 			{Method: http.MethodPost, Path: base + "/classify-rules", Description: "Create or update a classification rule."},
 			{Method: http.MethodDelete, Path: base + "/classify-rules", Description: "Delete a classification rule by name."},
@@ -579,6 +656,10 @@ func (a *App) handleManagement(raw []byte) ([]byte, error) {
 		return OKEnvelope(a.deleteModel(req.Body))
 	case req.Method == http.MethodPost && path == base+"/models/import-prices":
 		return OKEnvelope(a.importModelPrices(req.Body))
+	case req.Method == http.MethodPost && path == base+"/models/pricing-preview":
+		return OKEnvelope(a.previewModelPrices(req.Body))
+	case req.Method == http.MethodPost && path == base+"/models/import":
+		return OKEnvelope(a.importModels(req.Body))
 	case req.Method == http.MethodGet && path == base+"/classify-rules":
 		return OKEnvelope(jsonResponse(http.StatusOK, map[string]any{"rules": a.store.ClassifyRulesSnapshot()}))
 	case req.Method == http.MethodPost && path == base+"/classify-rules":

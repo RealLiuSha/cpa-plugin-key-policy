@@ -2,6 +2,7 @@ package policy
 
 import (
 	"bytes"
+	"encoding/json"
 	"log"
 	"os"
 	"path/filepath"
@@ -66,6 +67,11 @@ func TestManagementMutationsProduceAuditEvents(t *testing.T) {
 	if err := store.DeleteClassifyRule(rule.Name); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := store.ImportModels([]ModelImportItem{{
+		Name: "imported", Targets: []ModelTarget{{Provider: "codex", TargetModel: "m"}}, Input: 1, Output: 2,
+	}}, false); err != nil {
+		t.Fatal(err)
+	}
 	events, err := store.AuditEvents("", 100)
 	if err != nil {
 		t.Fatal(err)
@@ -76,8 +82,12 @@ func TestManagementMutationsProduceAuditEvents(t *testing.T) {
 		if event.Actor != "management-api" {
 			t.Fatalf("actor = %q", event.Actor)
 		}
+		encoded, _ := json.Marshal(event)
+		if bytes.Contains(encoded, []byte("cpa_audit")) {
+			t.Fatalf("audit leaked plaintext key: %s", encoded)
+		}
 	}
-	for _, action := range []string{"create_key", "update_key", "rotate_key", "reset_usage", "delete_key", "create_model", "update_model", "delete_model", "create_classify_rule", "update_classify_rule", "reorder_classify_rules", "delete_classify_rule"} {
+	for _, action := range []string{"create_key", "update_key", "rotate_key", "reset_usage", "delete_key", "create_model", "update_model", "delete_model", "create_classify_rule", "update_classify_rule", "reorder_classify_rules", "delete_classify_rule", "import_create_model"} {
 		if actions[action] == 0 {
 			t.Errorf("missing audit action %q: %+v", action, actions)
 		}

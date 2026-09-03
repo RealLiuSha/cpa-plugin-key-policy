@@ -72,6 +72,7 @@ func (s *Store) modelsSnapshotLocked() []ModelDefinition {
 	for _, model := range s.models {
 		copy := *model
 		copy.Targets = append([]ModelTarget(nil), model.Targets...)
+		copy.CacheWritePricePerMillion = cloneFloat64(model.CacheWritePricePerMillion)
 		models = append(models, copy)
 	}
 	sort.Slice(models, func(i, j int) bool { return strings.ToLower(models[i].Name) < strings.ToLower(models[j].Name) })

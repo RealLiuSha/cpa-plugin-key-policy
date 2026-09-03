@@ -243,14 +243,15 @@ export default function KeyUsage() {
               <th className="num">{t("keyUsage.colCalls")}</th>
               <th className="num">{t("keyUsage.colInput")}</th>
               <th className="num">{t("keyUsage.colOutput")}</th>
-              <th className="num">{t("keyUsage.colCache")}</th>
+              <th className="num">{t("keyUsage.colCacheRead")}</th>
+              <th className="num">{t("keyUsage.colCacheWrite")}</th>
               <th className="num">{t("keyUsage.colHitRate")}</th>
             </tr>
           </thead>
           <tbody>
             {models.length === 0 ? (
               <tr>
-                <td colSpan={8} className="muted keyusage-no-model">
+                <td colSpan={9} className="muted keyusage-no-model">
                   {t("keyUsage.noModel")}
                 </td>
               </tr>
@@ -270,7 +271,8 @@ export default function KeyUsage() {
                     <td className="num mono">{fmtInt(w.call_count ?? 0)}</td>
                     <td className="num mono">{fmtInt(w.input_tokens ?? 0)}</td>
                     <td className="num mono">{fmtInt(w.output_tokens ?? 0)}</td>
-                    <td className="num mono">{fmtInt(w.cache_read_tokens ?? 0)}</td>
+                    <td className="num mono">{fmtInt(w.cache_read_tokens ?? 0)} / {fmtUsd(w.cache_cost_usd ?? 0)}</td>
+                    <td className="num mono">{fmtInt(w.cache_write_tokens ?? 0)} / {fmtUsd(w.cache_write_usd ?? 0)}</td>
                     <td className="num mono">{hitRate(w)}</td>
                   </tr>
                 );
