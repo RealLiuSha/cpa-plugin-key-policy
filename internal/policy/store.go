@@ -15,6 +15,9 @@ import (
 )
 
 type Store struct {
+	// Reconfiguration must not replace a ledger while authentication or billing
+	// still holds the previous runtime. Normal requests share this read lock.
+	lifecycleMu            sync.RWMutex
 	mu                     sync.RWMutex
 	updateMu               sync.Mutex
 	persistMu              sync.Mutex
@@ -36,6 +39,8 @@ type Store struct {
 }
 
 var ErrInvalidUsageResetWindow = errors.New("invalid usage reset window")
+var ErrUsageResetChanged = errors.New("quota period or reset date changed")
+var ErrInvalidUsageResetExpectation = errors.New("expected quota period and reset date are required")
 
 type pendingPick struct {
 	route ResolvedModelRoute
@@ -46,18 +51,17 @@ const pendingPickTTL = 30 * time.Second
 const pendingPickMaxQueue = 32
 
 type AuthDecision struct {
-	Known             bool
-	Allowed           bool
-	KeyID             string
-	Principal         string
-	Requested         string
-	Route             ResolvedModelRoute
-	Reason            string
-	ModelList         bool
-	RateLimited       bool
-	CostLimited       bool
-	PreCharged        bool
-	RetryAfterSeconds int
+	Known       bool
+	Allowed     bool
+	KeyID       string
+	Principal   string
+	Requested   string
+	Route       ResolvedModelRoute
+	Reason      string
+	ModelList   bool
+	RateLimited bool
+	CostLimited bool
+	PreCharged  bool
 }
 
 func NewStore() *Store {
@@ -84,15 +88,27 @@ func (s *Store) SetClock(now func() time.Time) {
 	s.mu.Unlock()
 }
 
-func (s *Store) Configure(cfg Config) error {
+func (s *Store) Configure(cfg Config) (err error) {
 	s.updateMu.Lock()
 	defer s.updateMu.Unlock()
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+	s.mu.RLock()
+	wasFlushing := s.flusher != nil
+	s.mu.RUnlock()
+	defer func() {
+		if err != nil && wasFlushing {
+			s.StartUsageFlusher()
+		}
+	}()
 	statePath, err := ResolveStatePath(cfg.StateFile)
 	if err != nil {
 		return err
 	}
 
-	s.StopUsageFlusher()
+	if err := s.stopUsageFlusher(); err != nil {
+		return fmt.Errorf("flush usage before reconfigure: %w", err)
+	}
 	s.mu.RLock()
 	clockNow := time.Now
 	if s.usage != nil {
@@ -113,6 +129,7 @@ func (s *Store) Configure(cfg Config) error {
 	usage := make(map[string]*UsageState)
 	datasetID := ""
 	firstBoot := false
+	stateVersion, usageVersion := currentStateFileVersion, currentUsageFileVersion
 	state, stateErr := LoadState(statePath)
 	switch {
 	case stateErr == nil:
@@ -123,6 +140,7 @@ func (s *Store) Configure(cfg Config) error {
 		if state.DatasetID != usageFile.DatasetID {
 			return fmt.Errorf("state/usage dataset_id mismatch: state=%q usage=%q", state.DatasetID, usageFile.DatasetID)
 		}
+		stateVersion, usageVersion = state.Version, usageFile.Version
 		keys = state.Keys
 		models = state.Models
 		rules = state.ClassifyRules
@@ -156,7 +174,7 @@ func (s *Store) Configure(cfg Config) error {
 	cfg = effective
 	keys, models, rules = cfg.Keys, cfg.Models, cfg.ClassifyRules
 
-	now := time.Now().UTC()
+	now := clockNow().UTC()
 	nextKeys := make(map[string]*KeyConfig, len(keys))
 	for i := range keys {
 		item := keys[i]
@@ -182,6 +200,21 @@ func (s *Store) Configure(cfg Config) error {
 		nextModels[strings.ToLower(copy.Name)] = &copy
 	}
 
+	nextUsage := newUsageLedgerWithLocation(clockNow, cfg.usageLocation, cfg.UsageTimezone)
+	for id, entry := range usage {
+		if entry.Cycles != nil && entry.Cycles.Timezone != cfg.UsageTimezone {
+			return fmt.Errorf("key %q uses quota timezone %q; keep usage_timezone consistent", id, entry.Cycles.Timezone)
+		}
+	}
+	nextUsage.loadFromState(usage)
+	nextUsage.initializeCycles(keys, usageVersion < 5)
+	usage = nextUsage.snapshot()
+	cfg.Keys = keys
+	if !firstBoot {
+		if err := migrateStorage(statePath, datasetID, stateVersion, usageVersion, cfg, usage); err != nil {
+			return err
+		}
+	}
 	if firstBoot {
 		if err := SaveUsage(usagePath, datasetID, usage); err != nil {
 			return fmt.Errorf("seed usage: %w", err)
@@ -211,9 +244,7 @@ func (s *Store) Configure(cfg Config) error {
 	if s.limiter == nil {
 		s.limiter = NewRateLimiter()
 	}
-	clockNow = s.usage.now
-	s.usage = newUsageLedgerWithLocation(clockNow, cfg.usageLocation, cfg.UsageTimezone)
-	s.usage.loadFromState(usage)
+	s.usage = nextUsage
 	s.mu.Unlock()
 	return nil
 }
@@ -427,6 +458,12 @@ func (s *Store) StartUsageFlusher() func() {
 }
 
 func (s *Store) StopUsageFlusher() {
+	if err := s.stopUsageFlusher(); err != nil {
+		log.Printf("cpa-key-policy: flush usage on stop: %v", err)
+	}
+}
+
+func (s *Store) stopUsageFlusher() error {
 	s.mu.Lock()
 	f := s.flusher
 	s.flusher = nil
@@ -435,7 +472,7 @@ func (s *Store) StopUsageFlusher() {
 		f.stop()
 		<-f.doneCh
 	}
-	_ = s.FlushUsage()
+	return s.FlushUsage()
 }
 
 type usageFlusher struct {

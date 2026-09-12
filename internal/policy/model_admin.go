@@ -22,8 +22,10 @@ func (s *Store) UpsertModel(input ModelDefinition) error {
 	path, datasetID := s.statePath, s.datasetID
 	s.mu.RUnlock()
 	found := false
+	previousMultiplier := 1.0
 	for i := range models {
 		if strings.EqualFold(models[i].Name, input.Name) {
+			previousMultiplier = models[i].BillingMultiplier
 			input.Name = models[i].Name
 			models[i] = input
 			found = true
@@ -52,7 +54,13 @@ func (s *Store) UpsertModel(input ModelDefinition) error {
 	if found {
 		action = "update_model"
 	}
-	s.recordAudit(audit.Event{Action: action, Changes: map[string]audit.Change{"model": {From: canonicalName, To: canonicalName}}})
+	changes := map[string]audit.Change{"model": {From: canonicalName, To: canonicalName}}
+	for _, model := range cfg.Models {
+		if model.Name == canonicalName && model.BillingMultiplier != previousMultiplier {
+			changes["billing_multiplier"] = audit.Change{From: previousMultiplier, To: model.BillingMultiplier}
+		}
+	}
+	s.recordAudit(audit.Event{Action: action, Changes: changes})
 	return nil
 }
 

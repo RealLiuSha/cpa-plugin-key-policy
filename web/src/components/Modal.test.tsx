@@ -35,7 +35,8 @@ describe("Modal", () => {
     expect(document.activeElement).toBe(dialog);
     const close = container.querySelector<HTMLButtonElement>(".modal-close")!;
     const lastAction = [...dialog.querySelectorAll<HTMLButtonElement>("button")].at(-1)!;
-    lastAction.focus();
+    await act(async () => document.dispatchEvent(new KeyboardEvent("keydown", { key: "Tab", shiftKey: true })));
+    expect(document.activeElement).toBe(lastAction);
     await act(async () => document.dispatchEvent(new KeyboardEvent("keydown", { key: "Tab" })));
     expect(document.activeElement).toBe(close);
     await act(async () => document.dispatchEvent(new KeyboardEvent("keydown", { key: "Tab", shiftKey: true })));

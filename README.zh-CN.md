@@ -34,6 +34,7 @@ models:
     output_price_per_million: 2
     cache_read_price_per_million: 0.1
     cache_write_price_per_million: 0.3
+    billing_multiplier: 1.1
 
 keys:
   - id: team-a
@@ -50,15 +51,17 @@ keys:
 
 ## 用量与限额
 
-用量按自然日保存到 `by_model`。每个 Key 的每日日桶必须严格等于同日所有模型桶之和；今日、近 7 天和近 30 天金额都从同一组日桶派生。
+历史消费按自然日保存到 `days` / `by_model`，保留最近 35 天；每日汇总等于同日模型明细之和。额度单独保存在每个 Key 的 `cycles` 中，每个周期的模型明细是该周期已用额度的唯一来源。
 
-插件检查：
+- 日额度每天 00:00 重置，模型日额度与 Key 日额度使用同一周期。
+- 7 天、30 天额度各自按固定自然日周期重置，不再使用滚动窗口。时区沿用 `usage_timezone`（默认 `Asia/Shanghai`）。
+- 手动重置立即恢复选中周期，下次日期为操作当天加 1/7/30 天的 00:00。它不会清空其他周期或历史消费。
+- 自动重置从原到期日推进；停机、空闲、重启不改变周期节奏。查询、鉴权、记账和周期落盘使用相同规则。
+- 修改限额、停用/启用或更换 Key 不重置额度。Token 用量按宿主用量事件到达账本的时刻归属周期。
 
-- Key RPM；
-- Key 今日、近 7 天、近 30 天美元限额；
-- 单模型每日美元限额。
+管理响应的 `usage.cycles` 提供 `window`、`started_at`、`resets_at`、`reset_kind`、`used_usd`、`limit_usd` 和 `reset_after_manual_at`。`usage.status` 区分正常、预警、整体受限、部分模型受限和停用。原 `daily_usd` / `weekly_usd` / `monthly_usd` 字段现在是当前固定周期的扣费金额；历史图表继续使用 `/keys/history`。`next_accounting_boundary_at` 仅作为旧客户端的下一自然日边界兼容字段；新页面使用各周期的 `resets_at`。
 
-API 只输出 `next_accounting_boundary_at` 表示下一个自然日边界。免费模型仍统计调用与 Token，但金额始终为零。
+Token 计费模型支持 `billing_multiplier`，默认 `1`，必须为不小于 `1` 的有限数。普通输入、输出、缓存读取和缓存写入的扣费金额统一乘以倍率，实际 Token 和调用次数不变。免费模型和按次计费不受倍率影响。基础价格导入保留运营倍率；历史费用不追溯重算。倍率仅影响本插件账本，不会改写 CPA 原始 usage 或其他独立统计系统的费用。
 
 ## 管理 API 与 Web UI
 
@@ -72,7 +75,7 @@ API 只输出 `next_accounting_boundary_at` 表示下一个自然日边界。免
 | --- | --- |
 | `GET/POST/PATCH/DELETE /keys` | Key 生命周期和模型引用 |
 | `POST /keys/rotate` | 轮换 Key 密钥 |
-| `POST /keys/reset-usage` | 重置今日、近 7 天或近 30 天日桶 |
+| `POST /keys/reset-usage` | 恢复指定日 / 7 天 / 30 天周期额度，保留历史 |
 | `GET /keys/usage` | 单模型用量详情 |
 | `GET /keys/history` | 带 `by_model` 的自然日历史 |
 | `GET/POST/DELETE /models` | 公开模型定义 |
@@ -84,6 +87,8 @@ API 只输出 `next_accounting_boundary_at` 表示下一个自然日边界。免
 | `POST /classify-preview` | 预览凭证归类 |
 | `POST /catalog` | 构建当前 CPA 能力目录 |
 | `GET /audit` | 读取追加式管理审计 |
+
+重置接口兼容原 `{id, window}` 请求。新页面额外提交 `expected: {started_at, reset_after_manual_at}`；账本会在同一个锁内核对用户看到的周期和拟定日期。跨日或其他管理员已经重置时返回 `409 quota_changed`，页面刷新预览并等待再次确认，不自动重试写操作。
 
 价格导入不会创建模型、不会修改免费模型；多上游模型只有全部目标均命中且价格一致时才会应用。
 
@@ -111,9 +116,17 @@ make build-linux-amd64
 
 Linux 产物为 `dist/cpa-key-policy_linux_amd64.so`，同时生成 SHA-256 和构建信息。构建在固定的 Debian 12 Go 容器内进行，完成 ELF64/x86-64、插件入口、动态依赖和 ABI 加载检查后才输出产物。ARM64 开发机可通过 Docker 的 amd64 仿真执行。GitHub Release 本次只构建 Linux x64。
 
-新版可读取 v3、v4 数据，后续保存配置或用量时写入 v4。旧 v0.5.1 插件无法读取 v4；发布前必须按 [RELEASE.md](RELEASE.md) 准备 state/usage 配对备份与回滚步骤。
+新版读取 v3/v4/v5 数据，首次加载旧数据时在服务生效前迁移到 v5。旧滚动窗口已用额完整结转到对应新周期，首期到期为迁移日期加 1/7/30 天的 00:00。迁移不改变 Key 身份、限额、权限或模型基础价格。
 
-现有 CPA 宿主仍可读取原有鉴权响应字段，策略拒绝继续采用宿主已有的 401。结构化 403/429 与 `Retry-After` 需要宿主接收 `FrontendAuthResponse.Rejection`，本次插件独立发布不宣称宿主已具备此能力。升级不会修改已配置价格，也不会重算历史账本。
+迁移前自动将原 state/usage 字节保存在 `<state_file>.before-v5.json`（JSON 内的 `state` / `usage` 为 base64）。备份内两份数据会独立校验；回退后再次升级会先归档旧恢复点，再备份当前数据。先原子写入周期账本，再写模型配置；中断后可继续完成，不重复结转。旧插件不能读取 v5，回退必须恢复配套旧数据。详见 [RELEASE.md](RELEASE.md)。
+
+可用以下只读命令在临时副本上演练旧数据迁移、用量承接和重复加载，源目录不会被配置为运行目录：
+
+```bash
+go run ./cmd/cpa-key-policy-check --state /path/to/cpa-key-policy-state.json --timezone Asia/Shanghai
+```
+
+现有 CPA 宿主的策略拒绝沿用通用 401；已移除宿主不支持的 `Rejection` 输出。内部仍保留额度、模型权限和 RPM 等拒绝原因，管理页面可以展示具体额度状态。本版不使用异常时可能放行的请求拦截器来替代认证阶段的额度限制。
 
 ## 安全与运行说明
 

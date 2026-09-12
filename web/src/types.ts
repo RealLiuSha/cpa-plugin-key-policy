@@ -5,6 +5,7 @@ export interface ModelTarget {
 }
 
 export interface ModelDefinition {
+	 billing_multiplier?: number;
   name: string;
   targets: ModelTarget[];
   dispatch: "round-robin" | "priority";
@@ -25,6 +26,10 @@ export interface KeyModelRef {
 }
 
 export interface UsageSummary {
+	cycles?: QuotaCycle[];
+	status?: KeyStatus;
+	blocked_reason?: string;
+	limited_models?: string[];
   daily_usd: number;
   weekly_usd: number;
   monthly_usd?: number;
@@ -53,6 +58,18 @@ export interface UsageSummary {
   soft_limit_hit?: boolean;
   timezone?: string;
   limits_changed_at?: string;
+}
+
+export type KeyStatus = "normal" | "warning" | "limited" | "partial" | "disabled";
+export type QuotaWindow = "daily" | "weekly" | "monthly";
+export interface QuotaCycle {
+  window: QuotaWindow;
+  started_at: string;
+  resets_at: string;
+  reset_kind: "initial" | "migration" | "manual" | "automatic";
+  used_usd: number;
+  limit_usd: number;
+  reset_after_manual_at: string;
 }
 
 export interface KeyPublic {
@@ -120,6 +137,7 @@ export interface ModelUsageEntry {
 }
 
 export interface KeyUsageResponse {
+	usage?: UsageSummary;
   key_id: string;
   key_name: string;
   daily_limit_usd: number;

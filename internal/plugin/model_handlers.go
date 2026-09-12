@@ -9,6 +9,7 @@ import (
 )
 
 type modelUpsertRequest struct {
+	BillingMultiplier         *float64             `json:"billing_multiplier,omitempty"`
 	Name                      string               `json:"name"`
 	Targets                   []policy.ModelTarget `json:"targets"`
 	Dispatch                  string               `json:"dispatch"`
@@ -37,6 +38,21 @@ func (a *App) upsertModel(raw []byte) ManagementResponse {
 		CacheReadPricePerMillion:  req.CacheReadPricePerMillion,
 		CacheWritePricePerMillion: req.CacheWritePricePerMillion,
 		PerCallUSD:                req.PerCallUSD,
+	}
+	if req.BillingMultiplier != nil {
+		if *req.BillingMultiplier < 1 {
+			return jsonError(http.StatusBadRequest, "validation_error", "billing_multiplier must be at least 1")
+		}
+		model.BillingMultiplier = *req.BillingMultiplier
+	} else {
+		// Older management clients do not know this field. Preserve the setting
+		// instead of silently reverting an operator's multiplier on an edit.
+		for _, stored := range a.store.ModelsSnapshot() {
+			if strings.EqualFold(stored.Name, strings.TrimSpace(model.Name)) {
+				model.BillingMultiplier = stored.BillingMultiplier
+				break
+			}
+		}
 	}
 	if err := a.store.UpsertModel(model); err != nil {
 		return jsonError(http.StatusBadRequest, "validation_error", err.Error())

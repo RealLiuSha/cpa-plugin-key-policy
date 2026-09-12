@@ -89,8 +89,10 @@ func TestImportModelPricesDryRunRejectsInvalidPrices(t *testing.T) {
 }
 
 func TestImportModelPricesApplyAffectsAllKeysAndPersists(t *testing.T) {
+	priced := tokenTestModel("gpt-4o", "openai", "gpt-4o", 1, 2)
+	priced.BillingMultiplier = 1.2
 	store := configureImportStore(t,
-		[]ModelDefinition{tokenTestModel("gpt-4o", "openai", "gpt-4o", 1, 2)},
+		[]ModelDefinition{priced},
 		[]KeyConfig{{ID: "k1", Models: modelRefs("gpt-4o")}, {ID: "k2", Models: modelRefs("gpt-4o")}},
 	)
 	result, err := store.ImportModelPrices([]PriceImportMatch{{
@@ -103,6 +105,9 @@ func TestImportModelPricesApplyAffectsAllKeysAndPersists(t *testing.T) {
 		t.Fatalf("result = %+v", result)
 	}
 	model := store.ModelsSnapshot()[0]
+	if model.BillingMultiplier != 1.2 {
+		t.Fatal("price import overwrote billing multiplier")
+	}
 	if model.InputPricePerMillion != 5 || model.OutputPricePerMillion != 30 || model.CacheReadPricePerMillion != 1.25 || model.CacheWritePricePerMillion == nil || *model.CacheWritePricePerMillion != 3.75 {
 		t.Fatalf("applied model = %+v", model)
 	}

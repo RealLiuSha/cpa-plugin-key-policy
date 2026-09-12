@@ -11,6 +11,8 @@ const (
 )
 
 func (s *Store) RecordUsage(apiKeyOrID, requestedModel, targetModel string, failed bool, detail UsageDetail) float64 {
+	s.lifecycleMu.RLock()
+	defer s.lifecycleMu.RUnlock()
 	return s.recordUsage(apiKeyOrID, requestedModel, targetModel, failed, detail, true)
 }
 
@@ -70,6 +72,9 @@ func (s *Store) recordUsage(apiKeyOrID, requestedModel, targetModel string, fail
 		true,
 		detail,
 	)
+	breakdown.TotalCost *= route.BillingMultiplier
+	breakdown.CacheReadCost *= route.BillingMultiplier
+	breakdown.CacheWriteCost *= route.BillingMultiplier
 	if usageLedger != nil {
 		usageLedger.RecordCost(key.ID, publicModel, breakdown.TotalCost, breakdown.CacheReadCost, breakdown.CacheReadTokens, breakdown.CacheWriteCost, breakdown.CacheWriteTokens, breakdown.InputTokens, detail.OutputTokens, 1)
 	}

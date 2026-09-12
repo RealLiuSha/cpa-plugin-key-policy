@@ -17,10 +17,10 @@ import (
 )
 
 const (
-	currentStateFileVersion = 4
-	currentUsageFileVersion = 4
+	currentStateFileVersion = 5
+	currentUsageFileVersion = 5
 	minReadableFileVersion  = 3
-	maxReadableFileVersion  = 4
+	maxReadableFileVersion  = 5
 )
 
 type persistedState struct {
@@ -66,6 +66,10 @@ func LoadState(path string) (*State, error) {
 	if err != nil {
 		return nil, err
 	}
+	return decodeState(raw)
+}
+
+func decodeState(raw []byte) (*State, error) {
 	var header struct {
 		Version   int    `json:"version"`
 		DatasetID string `json:"dataset_id"`
@@ -102,6 +106,10 @@ func LoadUsage(path string) (*UsageFile, error) {
 	if err != nil {
 		return nil, err
 	}
+	return decodeUsage(raw)
+}
+
+func decodeUsage(raw []byte) (*UsageFile, error) {
 	var header struct {
 		Version   int    `json:"version"`
 		DatasetID string `json:"dataset_id"`
@@ -125,6 +133,13 @@ func LoadUsage(path string) (*UsageFile, error) {
 	if err := ValidateUsageStates(disk.Usage); err != nil {
 		return nil, fmt.Errorf("validate current usage: %w", err)
 	}
+	if disk.Version >= 5 {
+		for id, state := range disk.Usage {
+			if state.Cycles == nil {
+				return nil, fmt.Errorf("v5 key %q is missing quota cycles", id)
+			}
+		}
+	}
 	return &UsageFile{
 		Version:   disk.Version,
 		DatasetID: strings.TrimSpace(disk.DatasetID),
@@ -134,7 +149,7 @@ func LoadUsage(path string) (*UsageFile, error) {
 }
 
 func schemaVersionError(kind string, version int) error {
-	return fmt.Errorf("unsupported %s version %d; require version %d or %d", kind, version, minReadableFileVersion, maxReadableFileVersion)
+	return fmt.Errorf("unsupported %s version %d; require version %d through %d", kind, version, minReadableFileVersion, maxReadableFileVersion)
 }
 
 func decodeJSONStrict(raw []byte, target any) error {
@@ -192,6 +207,11 @@ func MarshalUsage(datasetID string, usage map[string]*UsageState, updatedAt time
 	if err := ValidateUsageStates(usage); err != nil {
 		return nil, err
 	}
+	for id, state := range usage {
+		if state.Cycles == nil {
+			return nil, fmt.Errorf("cannot save v5 key %q without quota cycles", id)
+		}
+	}
 	disk := persistedUsage{
 		Version: currentUsageFileVersion, DatasetID: datasetID, Usage: usage, UpdatedAt: updatedAt.UTC(),
 	}
@@ -208,6 +228,9 @@ func ValidateUsageStates(states map[string]*UsageState) error {
 		state := states[keyID]
 		if state == nil {
 			return fmt.Errorf("key %q has null usage state", keyID)
+		}
+		if err := validateUsageCycles(state.Cycles); err != nil {
+			return fmt.Errorf("key %q: %w", keyID, err)
 		}
 		if state.Days == nil {
 			state.Days = make(map[string]UsageBucket)

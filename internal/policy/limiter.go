@@ -32,13 +32,8 @@ func NewRateLimiterWithClock(now func() time.Time) *RateLimiter {
 }
 
 func (l *RateLimiter) Allow(id string, rpm int) bool {
-	allowed, _ := l.AllowWithRetryAfter(id, rpm)
-	return allowed
-}
-
-func (l *RateLimiter) AllowWithRetryAfter(id string, rpm int) (bool, int) {
 	if rpm <= 0 {
-		return true, 0
+		return true
 	}
 	now := l.now().UTC()
 	l.mu.Lock()
@@ -49,23 +44,11 @@ func (l *RateLimiter) AllowWithRetryAfter(id string, rpm int) (bool, int) {
 	}
 	if bucket.count >= rpm {
 		l.buckets[id] = bucket
-		return false, retryAfterSeconds(bucket.windowStart, now)
+		return false
 	}
 	bucket.count++
 	l.buckets[id] = bucket
-	return true, 0
-}
-
-func retryAfterSeconds(windowStart, now time.Time) int {
-	remaining := time.Minute - now.Sub(windowStart)
-	if remaining <= 0 {
-		return 1
-	}
-	seconds := int((remaining + time.Second - 1) / time.Second)
-	if seconds < 1 {
-		return 1
-	}
-	return seconds
+	return true
 }
 
 func (l *RateLimiter) Reset(id string) {

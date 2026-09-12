@@ -36,7 +36,7 @@ func TestManagementMutationsProduceAuditEvents(t *testing.T) {
 	if _, _, err := store.RotateKey(key.ID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.ResetUsageWindow(key.ID, UsageResetDaily); err != nil {
+	if _, err := store.ResetUsageWindow(key.ID, UsageResetDaily, nil); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.DeleteKey(key.ID); err != nil {

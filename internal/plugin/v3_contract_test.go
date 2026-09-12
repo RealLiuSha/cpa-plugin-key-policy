@@ -4,30 +4,16 @@ import (
 	"encoding/json"
 	"net/http"
 	"path/filepath"
-	"strings"
 	"testing"
 )
 
-func TestFrontendAuthRejectionJSONIsOptionalForOldHosts(t *testing.T) {
-	unhandled, err := json.Marshal(FrontendAuthResponse{Authenticated: false})
+func TestFrontendAuthResponseMatchesHostContract(t *testing.T) {
+	raw, err := json.Marshal(FrontendAuthResponse{Authenticated: false})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(unhandled), "Rejection") || strings.Contains(string(unhandled), "rejection") {
-		t.Fatalf("unhandled response leaked rejection field: %s", unhandled)
-	}
-	rejected, err := json.Marshal(FrontendAuthResponse{Authenticated: false, Rejection: &FrontendAuthRejection{
-		Code: "key_disabled", PolicyReason: "key_disabled", Message: "API key is disabled", HTTPStatus: http.StatusForbidden,
-	}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	var decoded map[string]any
-	if err := json.Unmarshal(rejected, &decoded); err != nil {
-		t.Fatal(err)
-	}
-	if _, ok := decoded["Rejection"]; !ok {
-		t.Fatalf("new host field missing: %s", rejected)
+	if string(raw) != `{"Authenticated":false}` {
+		t.Fatalf("unexpected auth response: %s", raw)
 	}
 }
 

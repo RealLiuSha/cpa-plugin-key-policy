@@ -459,11 +459,6 @@ td.strong { font-weight: 600; color: var(--text); }
      KeyForm pricing table re-enabled below; key-list uses mobile-hidden. */
   .card.table-wrap { display: none; }
   /* Beat .mobile-only { display:block !important } so flex gap stacks cards. */
-  .key-list-cards.mobile-only {
-    display: flex !important;
-    flex-direction: column;
-    gap: 10px;
-  }
 
   /* Desktop action rows (refresh/newKey above the table) are hidden on
      mobile — FAB + pull-to-refresh replace them. */
@@ -491,10 +486,6 @@ td.strong { font-weight: 600; color: var(--text); }
     position: relative; z-index: 20; margin-bottom: 14px;
   }
   /* Slightly larger hit targets on mobile key cards (still compact). */
-  .keycard .key-actions .btn.sm {
-    min-height: 40px;
-    padding: 10px 12px;
-  }
   .form-page form.card { margin-top: 0; }
   .key-form.card { background: transparent; border: none; box-shadow: none; padding: 0; }
   .kf-section { margin-bottom: 20px; }
@@ -549,7 +540,6 @@ td.strong { font-weight: 600; color: var(--text); }
 
 /* --- Mobile-only component classes (hidden on desktop, shown on mobile) --- */
 /* Key list mobile cards (desktop uses .key-list-table). */
-.key-list-cards { display: flex; flex-direction: column; gap: 10px; }
 
 /* Search + page summary above the table/cards. */
 .key-list-toolbar {
@@ -574,50 +564,13 @@ td.strong { font-weight: 600; color: var(--text); }
  * Desktop key list table: horizontal scroll at narrow desktop widths.
  * More-menu uses position:fixed while open, so overflow-x does not clip it.
  */
-.key-list-table.card.table-wrap {
-  overflow-x: auto;
-  border-radius: var(--r-md);
-}
-.key-list-table table {
-  table-layout: auto;
-  min-width: 960px;
-}
-.key-list-table th,
-.key-list-table td { vertical-align: middle; }
-.key-list-table thead th:first-child { border-top-left-radius: var(--r-md); }
-.key-list-table thead th:last-child { border-top-right-radius: var(--r-md); }
-.key-list-table .key-id { font-weight: 600; }
-.key-list-table .key-name { font-size: 12px; margin-top: 2px; }
-.key-list-table .key-usage-cell { white-space: nowrap; font-size: 12px; }
-.key-list-table .key-usage-cell .usage-line.over,
-.key-list-table .key-usage-cell.usage-over .usage-line.over,
-.key-usage-cell .usage-line.over,
 .usage-line.over {
   color: var(--danger);
   font-weight: 600;
 }
 /* Weekly line uses .muted; over must still win. */
-.key-usage-cell .muted.usage-line.over { color: var(--danger); }
-.keycard .kc-meta .usage-line.over { color: var(--danger); font-weight: 600; }
-.key-list-table .key-actions-cell { white-space: nowrap; }
-.key-list-table .key-actions { flex-wrap: nowrap; }
 /* Dim content cells only — never the actions cell (menu is a DOM descendant;
  * opacity on an ancestor would dim/stack-trap a position:fixed panel). */
-.key-list-table tr.row-disabled > td:not(.key-actions-cell) { opacity: 0.65; }
-.key-actions {
-  display: flex; flex-wrap: wrap; gap: 6px; align-items: center;
-}
-.key-model-chips {
-  display: flex; flex-wrap: wrap; gap: 4px; max-width: 200px;
-}
-.key-model-chips .chip,
-.kc-chips .chip {
-  font-size: 11px; padding: 2px 8px; border-radius: var(--r-sm);
-  background: var(--muted-bg); color: var(--muted);
-  border: 1px solid var(--border);
-}
-.key-model-chips .chip.more,
-.kc-chips .chip.more { color: var(--muted); font-weight: 600; }
 
 /* .tabbar: bottom sticky navigation. Hidden on desktop by the min-width
    block; shown on mobile by the max-width block below. */
@@ -665,68 +618,9 @@ td.strong { font-weight: 600; color: var(--text); }
 
 /* .keycard: one key in the mobile list (explicit edit/detail/more; no swipe).
  * Vertical spacing comes from .key-list-cards flex gap (margin stays 0). */
-.keycard {
-  background: var(--panel);
-  border: 1px solid var(--border);
-  border-radius: var(--r-md);
-  padding: 14px;
-  margin-bottom: 0;
-  cursor: default;
-  transition: border-color var(--t-fast), box-shadow var(--t-fast);
-  position: relative;
-  overflow: visible;
-}
-.keycard:hover { border-color: var(--border-hover); }
 /* Disabled: mute content only. Never opacity the whole card — that creates a
  * stacking context and dims the fixed more-menu panel (and can lose to tabbar). */
-.keycard.disabled .kc-name,
-.keycard.disabled .kc-preview,
-.keycard.disabled .kc-meta,
-.keycard.disabled .kc-chips,
-.keycard.disabled .kc-bar {
-  opacity: 0.55;
-}
-.keycard .kc-head {
-  display: flex; align-items: center; gap: 8px;
-  margin-bottom: 6px;
-}
-.keycard .kc-dot {
-  width: 8px; height: 8px; border-radius: var(--r-full); flex: none;
-  background: var(--ok);
-}
-.keycard.disabled .kc-dot { background: var(--muted); }
-.keycard.over .kc-dot { background: var(--danger); }
-.keycard .kc-name { font-weight: 600; font-size: 15px; flex: 1; }
-.keycard .kc-preview {
-  font-family: var(--mono);
-  font-size: 12px; color: var(--muted);
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-  margin-bottom: 10px;
-}
 /* ink-drop progress bar */
-.keycard .kc-bar {
-  height: 4px; border-radius: var(--r-full);
-  background: var(--muted-bg); overflow: hidden; margin-bottom: 6px;
-}
-.keycard .kc-bar > span {
-  display: block; height: 100%; border-radius: var(--r-full);
-  background: var(--accent); transition: width var(--t-fast);
-}
-.keycard.over .kc-bar > span { background: var(--danger); }
-.keycard .kc-meta {
-  display: flex; justify-content: space-between;
-  font-size: 11px; color: var(--muted);
-}
-.keycard .kc-chips {
-  display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px;
-}
-.keycard .kc-actions {
-  display: flex; flex-wrap: wrap; gap: 6px;
-  margin-top: 12px; padding-top: 12px;
-  border-top: 1px solid var(--border);
-  /* No z-index / no stacking context: fixed more-menu must paint against the
-   * root so it can sit above the tab bar (z-index 100). */
-}
 
 /* More menu: panel is position:fixed while open (inline style from JS). */
 .more-menu { position: relative; display: inline-block; }
@@ -1020,12 +914,7 @@ td.strong { font-weight: 600; color: var(--text); }
   .topnav { display: none; }
 }
 
-.usage-soft-warning {
-  box-shadow: inset 3px 0 0 #d69e2e;
-}
-
-.tag.state-warning,
-.keycard.warning .kc-dot {
+.tag.state-warning {
   color: #9a6700;
   border-color: #d69e2e;
   background: color-mix(in srgb, #d69e2e 14%, transparent);
@@ -1042,7 +931,6 @@ td.strong { font-weight: 600; color: var(--text); }
   background: var(--muted-bg);
 }
 
-.key-list-mobile-refresh,
 .usage-history-title {
   display: flex;
   align-items: center;
@@ -1056,7 +944,6 @@ td.strong { font-weight: 600; color: var(--text); }
   min-width: 150px;
 }
 
-.usage-reset-countdown,
 .kf-current-usage {
   display: block;
   margin-top: 3px;
@@ -1094,10 +981,6 @@ td.strong { font-weight: 600; color: var(--text); }
   max-width: 460px;
   white-space: normal;
   overflow-wrap: anywhere;
-}
-
-.state-indicator {
-  display: none;
 }
 
 /* ===== model and credential-group management ===== */
@@ -1177,10 +1060,7 @@ td.strong { font-weight: 600; color: var(--text); }
   padding: 2px 8px; border: 1px solid var(--border); border-radius: var(--r-full);
   background: var(--muted-bg); color: var(--muted); font-size: 11px; font-weight: 600;
 }
-.chip-row,
-.key-model-chips,
-.kc-models,
-.kc-chips { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
+.chip-row { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
 .chip-row .chip {
   display: inline-flex; align-items: center; max-width: 240px; padding: 3px 8px;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
@@ -1224,7 +1104,6 @@ td.strong { font-weight: 600; color: var(--text); }
 .rule-preview-count { margin-top: 4px; color: var(--accent); font-size: 12px; }
 .row-actions,
 .card-actions { flex-wrap: wrap; }
-.kc-models { margin-top: 8px; }
 
 @media (max-width: 640px) {
   .page-head,

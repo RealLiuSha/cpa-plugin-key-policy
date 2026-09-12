@@ -115,6 +115,7 @@ func (s *Store) ImportModels(items []ModelImportItem, dryRun bool) (ModelImportR
 				result.Skipped = append(result.Skipped, row)
 				continue
 			}
+			model.BillingMultiplier = nextModels[index].BillingMultiplier
 			nextModels[index] = model
 			row.Action = "update"
 			result.Updated = append(result.Updated, row)
