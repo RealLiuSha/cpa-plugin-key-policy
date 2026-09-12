@@ -1,10 +1,9 @@
 PLUGIN := cpa-key-policy
-PKG := ./cmd/cpa-key-policy
 DIST := dist
 WEB := web
 EMBED_INDEX := internal/plugin/web/dist/index.html
 
-.PHONY: test check-version check-model-domain web-build build-linux-amd64 build-linux-arm64 build-linux clean
+.PHONY: test check-version check-model-domain web-build build-linux-amd64 build-linux clean
 
 test:
 	go test ./...
@@ -21,14 +20,9 @@ web-build:
 	cp $(WEB)/dist/index.html $(EMBED_INDEX)
 
 build-linux-amd64: web-build
-	mkdir -p $(DIST)
-	GOOS=linux GOARCH=amd64 CGO_ENABLED=1 go build -buildvcs=false -tags cshared -buildmode=c-shared -o $(DIST)/$(PLUGIN)_linux_amd64.so $(PKG)
+	bash scripts/build-linux-amd64.sh $(DIST)/$(PLUGIN)_linux_amd64.so
 
-build-linux-arm64: web-build
-	mkdir -p $(DIST)
-	GOOS=linux GOARCH=arm64 CGO_ENABLED=1 go build -buildvcs=false -tags cshared -buildmode=c-shared -o $(DIST)/$(PLUGIN)_linux_arm64.so $(PKG)
-
-build-linux: build-linux-amd64 build-linux-arm64
+build-linux: build-linux-amd64
 
 clean:
 	rm -rf $(DIST)

@@ -1,6 +1,6 @@
 # cpa-key-policy
 
-`cpa-key-policy` 是 CLIProxyAPI 插件，用于签发下游 Key、把公开模型名路由到 CPA 实际能力，并执行 RPM 与美元限额。0.5 只提供一套当前模型领域和一套严格持久化契约。
+`cpa-key-policy` 是 CLIProxyAPI 插件，用于签发下游 Key、把公开模型名路由到 CPA 实际能力，并执行 RPM 与美元限额。0.6 增加模型导入与独立缓存写入计价。本次发布面向 Linux x64，运行基线为 Debian 12 / glibc 2.36 或更新版本；升级流程见 [RELEASE.md](RELEASE.md)。
 
 ## 模型领域
 
@@ -77,6 +77,8 @@ API 只输出 `next_accounting_boundary_at` 表示下一个自然日边界。免
 | `GET /keys/history` | 带 `by_model` 的自然日历史 |
 | `GET/POST/DELETE /models` | 公开模型定义 |
 | `POST /models/import-prices` | 预览或应用已有模型价格 |
+| `POST /models/import` | 预览或应用模型批量创建、显式覆盖 |
+| `POST /models/pricing-preview` | 获取选中模型的 Models.dev 价格 |
 | `GET/POST/DELETE /classify-rules` | 凭证分组规则 |
 | `POST /classify-rules/reorder` | 调整规则优先级 |
 | `POST /classify-preview` | 预览凭证归类 |
@@ -87,7 +89,7 @@ API 只输出 `next_accounting_boundary_at` 表示下一个自然日边界。免
 
 ## 构建与验证
 
-需要 Go 1.25 和 Node.js 20+。
+需要 Go 1.25、Node.js 20+ 和 Docker。依赖统一使用 npm 与已提交的 `web/package-lock.json`。
 
 ```bash
 cd web
@@ -107,7 +109,11 @@ make check-model-domain
 make build-linux-amd64
 ```
 
-Linux 产物为 `dist/cpa-key-policy_linux_amd64.so`。
+Linux 产物为 `dist/cpa-key-policy_linux_amd64.so`，同时生成 SHA-256 和构建信息。构建在固定的 Debian 12 Go 容器内进行，完成 ELF64/x86-64、插件入口、动态依赖和 ABI 加载检查后才输出产物。ARM64 开发机可通过 Docker 的 amd64 仿真执行。GitHub Release 本次只构建 Linux x64。
+
+新版可读取 v3、v4 数据，后续保存配置或用量时写入 v4。旧 v0.5.1 插件无法读取 v4；发布前必须按 [RELEASE.md](RELEASE.md) 准备 state/usage 配对备份与回滚步骤。
+
+现有 CPA 宿主仍可读取原有鉴权响应字段，策略拒绝继续采用宿主已有的 401。结构化 403/429 与 `Retry-After` 需要宿主接收 `FrontendAuthResponse.Rejection`，本次插件独立发布不宣称宿主已具备此能力。升级不会修改已配置价格，也不会重算历史账本。
 
 ## 安全与运行说明
 

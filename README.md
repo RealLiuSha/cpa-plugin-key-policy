@@ -1,6 +1,6 @@
 # cpa-key-policy
 
-`cpa-key-policy` is a CLIProxyAPI plugin for issuing downstream keys, routing public model names to CPA capabilities, and enforcing RPM and USD limits. Version 0.5 exposes one current model domain and one strict persistence contract.
+`cpa-key-policy` is a CLIProxyAPI plugin for issuing downstream keys, routing public model names to CPA capabilities, and enforcing RPM and USD limits. Version 0.6 adds model imports and independent cache-write pricing. This release targets Linux x64 on Debian 12 / glibc 2.36 or newer. See [release and upgrade instructions](RELEASE.md).
 
 ## Model domain
 
@@ -79,6 +79,8 @@ Important routes:
 | `GET /keys/history` | Natural-day history with `by_model` |
 | `GET/POST/DELETE /models` | Public model definitions |
 | `POST /models/import-prices` | Preview or apply existing-model prices |
+| `POST /models/import` | Preview or apply a batch of new models or explicit overwrites |
+| `POST /models/pricing-preview` | Fetch Models.dev prices for selected models |
 | `GET/POST/DELETE /classify-rules` | Credential-group rules |
 | `POST /classify-rules/reorder` | Rule priority |
 | `POST /classify-preview` | Preview credential classification |
@@ -89,7 +91,7 @@ Model price import never creates models, never changes free models, and only app
 
 ## Build and verify
 
-Prerequisites are Go 1.25 and Node.js 20+.
+Prerequisites are Go 1.25, Node.js 20+, and Docker. Use npm and the committed `web/package-lock.json` for reproducible dependencies.
 
 ```bash
 cd web
@@ -109,7 +111,11 @@ make check-model-domain
 make build-linux-amd64
 ```
 
-The Linux artifact is `dist/cpa-key-policy_linux_amd64.so`.
+The Linux artifact is `dist/cpa-key-policy_linux_amd64.so`, accompanied by a SHA-256 file and build metadata. The build runs in a pinned Debian 12 Go container, verifies ELF64/x86-64 and the plugin entry point, resolves dynamic dependencies, and loads the ABI before returning the artifact. It also works from an ARM64 development machine through Docker's amd64 emulation. GitHub releases build only Linux x64.
+
+The plugin can read v3 and v4 data, and writes v4 on subsequent configuration or usage saves. An old v0.5.1 binary cannot read v4; follow the paired-data backup and rollback procedure in [RELEASE.md](RELEASE.md).
+
+Existing CPA hosts remain compatible with the original authentication response fields and return their existing 401 for policy denials. Structured 403/429 responses and `Retry-After` require a host that consumes `FrontendAuthResponse.Rejection`; this plugin-only release does not claim that host capability. Updating the plugin changes neither configured prices nor previously recorded charges.
 
 ## Security and operational notes
 

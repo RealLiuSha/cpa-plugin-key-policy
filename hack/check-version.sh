@@ -16,7 +16,10 @@ lock_version="$(node -p "require('${repo_root}/web/package-lock.json').packages[
   exit 1
 }
 
-release_tag="${1:-${GITHUB_REF_NAME:-}}"
+release_tag="${1:-}"
+if [[ -z "${release_tag}" && "${GITHUB_REF_TYPE:-}" == "tag" ]]; then
+  release_tag="${GITHUB_REF_NAME:-}"
+fi
 if [[ -n "${release_tag}" && "${release_tag}" == v* && "${release_tag#v}" != "${plugin_version}" ]]; then
   echo "version mismatch: tag=${release_tag} plugin=${plugin_version}" >&2
   exit 1

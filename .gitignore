@@ -39,7 +39,8 @@ stitch_*.png
 nul
 .npm-cache/
 
-scripts
+/scripts/*
+!/scripts/build-linux-amd64.sh
 
 # docs
 goals

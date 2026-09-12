@@ -1,4 +1,4 @@
-# Example CLIProxyAPI snippet for cpa-key-policy v0.5.
+# Example CLIProxyAPI snippet for cpa-key-policy v0.6.
 # Replace placeholders. Never commit real keys or production paths.
 
 plugins:
