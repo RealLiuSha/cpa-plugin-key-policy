@@ -21,8 +21,10 @@ func configureImportStore(t *testing.T, models []ModelDefinition, keys []KeyConf
 }
 
 func TestModelsSnapshotWithRefs(t *testing.T) {
+	shared := tokenTestModel("shared", "openai", "gpt-4o", 1, 2)
+	shared.CacheWritePricePerMillion = fptr(3)
 	store := configureImportStore(t,
-		[]ModelDefinition{tokenTestModel("shared", "openai", "gpt-4o", 1, 2), tokenTestModel("orphan", "openai", "gpt-mini", 1, 2)},
+		[]ModelDefinition{shared, tokenTestModel("orphan", "openai", "gpt-mini", 1, 2)},
 		[]KeyConfig{{ID: "k1", Models: modelRefs("shared")}, {ID: "k2", Models: modelRefs("shared")}},
 	)
 	list := store.ModelsSnapshotWithRefs()
@@ -38,6 +40,16 @@ func TestModelsSnapshotWithRefs(t *testing.T) {
 	}
 	if byName["orphan"].RefCount != 0 || byName["orphan"].RefKeys == nil {
 		t.Fatalf("orphan refs = %+v", byName["orphan"])
+	}
+	sharedSnapshot := byName["shared"]
+	if sharedSnapshot.CacheWritePricePerMillion == nil {
+		t.Fatalf("shared cache-write price missing: %+v", sharedSnapshot)
+	}
+	*sharedSnapshot.CacheWritePricePerMillion = 99
+	for _, got := range store.ModelsSnapshotWithRefs() {
+		if got.Name == "shared" && (got.CacheWritePricePerMillion == nil || *got.CacheWritePricePerMillion != 3) {
+			t.Fatalf("snapshot mutation leaked into store: %+v", got)
+		}
 	}
 }
 
@@ -82,7 +94,7 @@ func TestImportModelPricesApplyAffectsAllKeysAndPersists(t *testing.T) {
 		[]KeyConfig{{ID: "k1", Models: modelRefs("gpt-4o")}, {ID: "k2", Models: modelRefs("gpt-4o")}},
 	)
 	result, err := store.ImportModelPrices([]PriceImportMatch{{
-		Model: "gpt-4o", PromptPricePer1M: fptr(5), CompletionPricePer1M: fptr(30), CacheReadPricePer1M: fptr(1.25),
+		Model: "gpt-4o", PromptPricePer1M: fptr(5), CompletionPricePer1M: fptr(30), CacheReadPricePer1M: fptr(1.25), CacheWritePricePer1M: fptr(3.75),
 	}}, false)
 	if err != nil {
 		t.Fatal(err)
@@ -91,15 +103,28 @@ func TestImportModelPricesApplyAffectsAllKeysAndPersists(t *testing.T) {
 		t.Fatalf("result = %+v", result)
 	}
 	model := store.ModelsSnapshot()[0]
-	if model.InputPricePerMillion != 5 || model.OutputPricePerMillion != 30 || model.CacheReadPricePerMillion != 1.25 {
+	if model.InputPricePerMillion != 5 || model.OutputPricePerMillion != 30 || model.CacheReadPricePerMillion != 1.25 || model.CacheWritePricePerMillion == nil || *model.CacheWritePricePerMillion != 3.75 {
 		t.Fatalf("applied model = %+v", model)
 	}
 	reloaded := NewStore()
 	if err := reloaded.Configure(Config{Enabled: true, StateFile: store.StatePath()}); err != nil {
 		t.Fatal(err)
 	}
-	if got := reloaded.ModelsSnapshot()[0]; got.InputPricePerMillion != 5 || got.OutputPricePerMillion != 30 {
+	if got := reloaded.ModelsSnapshot()[0]; got.InputPricePerMillion != 5 || got.OutputPricePerMillion != 30 || got.CacheWritePricePerMillion == nil || *got.CacheWritePricePerMillion != 3.75 {
 		t.Fatalf("persisted model = %+v", got)
+	}
+	events, err := store.AuditEvents("", 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, event := range events {
+		if event.Action == "import_update_prices" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("missing import_update_prices audit: %+v", events)
 	}
 }
 

@@ -24,7 +24,7 @@ func TestComputeCacheCostSubsetProvider(t *testing.T) {
 		InputTokens: 1_000_000, OutputTokens: 500_000,
 		CachedTokens: 200_000, // subset of input
 	}
-	got := ComputeCacheCost("openai", 3, 15, 0.30, true, detail)
+	got := ComputeCacheCost("openai", 3, 15, 0.30, nil, true, detail)
 	if !nearly(got, 9.96) {
 		t.Fatalf("subset cache cost = %v, want 9.96", got)
 	}
@@ -42,7 +42,7 @@ func TestComputeCacheCostAdditiveProvider(t *testing.T) {
 		CacheReadTokens:     200_000,
 		CacheCreationTokens: 100_000,
 	}
-	got := ComputeCacheCost("claude", 3, 15, 0.30, true, detail)
+	got := ComputeCacheCost("claude", 3, 15, 0.30, nil, true, detail)
 	if !nearly(got, 10.26) {
 		t.Fatalf("additive cache cost = %v, want 10.26", got)
 	}
@@ -54,7 +54,7 @@ func TestComputeCacheCostAdditiveProvider(t *testing.T) {
 // 1M input (incl 200K cached) + 500K output @ $3/$15 → 3 + 7.5 = 10.5.
 func TestComputeCacheCostNoCachePriceFallsBackToInput(t *testing.T) {
 	detail := UsageDetail{InputTokens: 1_000_000, OutputTokens: 500_000, CachedTokens: 200_000}
-	got := ComputeCacheCost("openai", 3, 15, 0, true, detail)
+	got := ComputeCacheCost("openai", 3, 15, 0, nil, true, detail)
 	if !nearly(got, 10.5) {
 		t.Fatalf("fallback cost = %v, want 10.5", got)
 	}
@@ -62,7 +62,7 @@ func TestComputeCacheCostNoCachePriceFallsBackToInput(t *testing.T) {
 	// must add them at the input price (matching pre-cache-pricing behavior).
 	// 800K input + 200K cacheRead + 500K output @ $3/$15 → 1M*3 + 0.5M*15 = 10.5.
 	detail2 := UsageDetail{InputTokens: 800_000, OutputTokens: 500_000, CacheReadTokens: 200_000}
-	got2 := ComputeCacheCost("claude", 3, 15, 0, true, detail2)
+	got2 := ComputeCacheCost("claude", 3, 15, 0, nil, true, detail2)
 	if !nearly(got2, 10.5) {
 		t.Fatalf("additive fallback cost = %v, want 10.5", got2)
 	}
@@ -72,7 +72,7 @@ func TestComputeCacheCostNoCachePriceFallsBackToInput(t *testing.T) {
 // tokens and cache configured.
 func TestComputeCacheCostUnpricedZero(t *testing.T) {
 	detail := UsageDetail{InputTokens: 1_000_000, OutputTokens: 1_000_000, CachedTokens: 500_000}
-	if c := ComputeCacheCost("openai", 3, 15, 0.3, false, detail); c != 0 {
+	if c := ComputeCacheCost("openai", 3, 15, 0.3, nil, false, detail); c != 0 {
 		t.Fatalf("unpriced cost = %v, want 0", c)
 	}
 }
@@ -84,15 +84,15 @@ func TestComputeCacheCostUnpricedZero(t *testing.T) {
 // cacheReadTokens = 200K. nonCache input billed at input price = 800K.
 func TestComputeCacheCostBreakdown(t *testing.T) {
 	detail := UsageDetail{InputTokens: 1_000_000, OutputTokens: 500_000, CachedTokens: 200_000}
-	total, cacheCost, cacheRead := ComputeCacheCostBreakdown("openai", 3, 15, 0.30, true, detail)
-	if !nearly(total, 9.96) {
-		t.Fatalf("total = %v, want 9.96", total)
+	got := ComputeCacheCostBreakdown("openai", 3, 15, 0.30, nil, true, detail)
+	if !nearly(got.TotalCost, 9.96) {
+		t.Fatalf("total = %v, want 9.96", got.TotalCost)
 	}
-	if !nearly(cacheCost, 0.06) {
-		t.Fatalf("cacheCost = %v, want 0.06", cacheCost)
+	if !nearly(got.CacheReadCost, 0.06) {
+		t.Fatalf("cacheCost = %v, want 0.06", got.CacheReadCost)
 	}
-	if cacheRead != 200_000 {
-		t.Fatalf("cacheRead = %d, want 200000", cacheRead)
+	if got.CacheReadTokens != 200_000 {
+		t.Fatalf("cacheRead = %d, want 200000", got.CacheReadTokens)
 	}
 }
 
@@ -101,15 +101,15 @@ func TestComputeCacheCostBreakdown(t *testing.T) {
 // priced) even though cacheRead is still reported for hit-rate accounting.
 func TestComputeCacheCostBreakdownNoCachePrice(t *testing.T) {
 	detail := UsageDetail{InputTokens: 1_000_000, OutputTokens: 500_000, CachedTokens: 200_000}
-	total, cacheCost, cacheRead := ComputeCacheCostBreakdown("openai", 3, 15, 0, true, detail)
-	if !nearly(total, 10.5) {
-		t.Fatalf("total = %v, want 10.5", total)
+	got := ComputeCacheCostBreakdown("openai", 3, 15, 0, nil, true, detail)
+	if !nearly(got.TotalCost, 10.5) {
+		t.Fatalf("total = %v, want 10.5", got.TotalCost)
 	}
-	if cacheCost != 0 {
-		t.Fatalf("cacheCost = %v, want 0 (no separable cache spend without a cache price)", cacheCost)
+	if got.CacheReadCost != 0 {
+		t.Fatalf("cacheCost = %v, want 0 (no separable cache spend without a cache price)", got.CacheReadCost)
 	}
-	if cacheRead != 200_000 {
-		t.Fatalf("cacheRead = %d, want 200000 (still reported for hit-rate)", cacheRead)
+	if got.CacheReadTokens != 200_000 {
+		t.Fatalf("cacheRead = %d, want 200000 (still reported for hit-rate)", got.CacheReadTokens)
 	}
 }
 
@@ -124,15 +124,55 @@ func TestComputeCacheCostBreakdownAdditive(t *testing.T) {
 		CacheReadTokens:     200_000,
 		CacheCreationTokens: 100_000,
 	}
-	total, cacheCost, cacheRead := ComputeCacheCostBreakdown("claude", 3, 15, 0.30, true, detail)
-	if !nearly(total, 10.26) {
-		t.Fatalf("total = %v, want 10.26", total)
+	got := ComputeCacheCostBreakdown("claude", 3, 15, 0.30, nil, true, detail)
+	if !nearly(got.TotalCost, 10.26) {
+		t.Fatalf("total = %v, want 10.26", got.TotalCost)
 	}
-	if !nearly(cacheCost, 0.06) {
-		t.Fatalf("cacheCost = %v, want 0.06", cacheCost)
+	if !nearly(got.CacheReadCost, 0.06) {
+		t.Fatalf("cacheCost = %v, want 0.06", got.CacheReadCost)
 	}
-	if cacheRead != 200_000 {
-		t.Fatalf("cacheRead = %d, want 200000 (creation excluded)", cacheRead)
+	if got.CacheReadTokens != 200_000 {
+		t.Fatalf("cacheRead = %d, want 200000 (creation excluded)", got.CacheReadTokens)
+	}
+	if got.CacheWriteTokens != 0 || got.CacheWriteCost != 0 {
+		t.Fatalf("unconfigured cache-write leaked into separable stats: %+v", got)
+	}
+}
+
+func TestComputeCacheCostExplicitCacheWrite(t *testing.T) {
+	detail := UsageDetail{
+		InputTokens:         800_000,
+		OutputTokens:        500_000,
+		CacheReadTokens:     200_000,
+		CacheCreationTokens: 100_000,
+	}
+	got := ComputeCacheCostBreakdown("claude", 3, 15, 0.30, fptr(3.75), true, detail)
+	if !nearly(got.TotalCost, 10.335) {
+		t.Fatalf("total = %v, want 10.335", got.TotalCost)
+	}
+	if !nearly(got.CacheWriteCost, 0.375) || got.CacheWriteTokens != 100_000 {
+		t.Fatalf("cache-write = %+v", got)
+	}
+}
+
+func TestComputeCacheCostUnconfiguredCacheWriteFallsBackToInput(t *testing.T) {
+	detail := UsageDetail{
+		InputTokens:         800_000,
+		OutputTokens:        500_000,
+		CacheReadTokens:     200_000,
+		CacheCreationTokens: 100_000,
+	}
+	got := ComputeCacheCost("claude", 3, 15, 0.30, nil, true, detail)
+	if !nearly(got, 10.26) {
+		t.Fatalf("fallback cost=%v, want 10.26", got)
+	}
+}
+
+func TestComputeCacheCostExplicitZeroCacheWriteIsFree(t *testing.T) {
+	detail := UsageDetail{CacheCreationTokens: 100_000}
+	got := ComputeCacheCostBreakdown("claude", 3, 15, 0.30, fptr(0), true, detail)
+	if got.TotalCost != 0 || got.CacheWriteCost != 0 || got.CacheWriteTokens != 100_000 || got.InputTokens != 0 {
+		t.Fatalf("explicit free cache-write breakdown = %+v", got)
 	}
 }
 

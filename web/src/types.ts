@@ -13,6 +13,7 @@ export interface ModelDefinition {
   input_price_per_million?: number;
   output_price_per_million?: number;
   cache_read_price_per_million?: number;
+  cache_write_price_per_million?: number;
   per_call_usd?: number;
   ref_count?: number;
   ref_keys?: string[];
@@ -37,6 +38,12 @@ export interface UsageSummary {
   daily_cache_read_tokens?: number;
   weekly_cache_read_tokens?: number;
   monthly_cache_read_tokens?: number;
+  daily_cache_write_usd?: number;
+  weekly_cache_write_usd?: number;
+  monthly_cache_write_usd?: number;
+  daily_cache_write_tokens?: number;
+  weekly_cache_write_tokens?: number;
+  monthly_cache_write_tokens?: number;
   daily_input_tokens?: number;
   weekly_input_tokens?: number;
   monthly_input_tokens?: number;
@@ -94,6 +101,8 @@ export interface UsageWindow {
   window_start?: string;
   cache_read_tokens?: number;
   cache_cost_usd?: number;
+  cache_write_tokens?: number;
+  cache_write_usd?: number;
   input_tokens?: number;
   output_tokens?: number;
   call_count?: number;
@@ -148,6 +157,8 @@ export interface UsageBucket {
   call_count?: number;
   cache_read_tokens?: number;
   cache_cost_usd?: number;
+  cache_write_tokens?: number;
+  cache_write_usd?: number;
   input_tokens?: number;
   output_tokens?: number;
 }
@@ -189,9 +200,11 @@ export interface PriceImportApplied {
   old_input_price_per_million: number;
   old_output_price_per_million: number;
   old_cache_read_price_per_million: number;
+  old_cache_write_price_per_million?: number;
   new_input_price_per_million: number;
   new_output_price_per_million: number;
   new_cache_read_price_per_million: number;
+  new_cache_write_price_per_million?: number;
   note?: string;
 }
 
@@ -213,6 +226,61 @@ export interface PriceImportResult {
 export interface PriceImportRequest {
   dry_run: boolean;
   matches: PriceImportMatch[];
+}
+
+export interface PricingPreviewMatch {
+  model: string;
+  matched_model: string;
+  match_type: string;
+  source: string;
+  source_url: string;
+  source_provider_id: string;
+  source_provider_name: string;
+  prompt_price_per_1m: number;
+  completion_price_per_1m: number;
+  cache_read_price_per_1m: number;
+  cache_write_price_per_1m?: number;
+}
+
+export interface PricingPreview {
+  source: string;
+  source_url: string;
+  metadata_models: number;
+  matches: PricingPreviewMatch[];
+  unmatched_models: string[];
+}
+
+export interface ModelImportItem {
+  name: string;
+  targets: ModelTarget[];
+  dispatch?: "round-robin" | "priority";
+  free?: boolean;
+  overwrite?: boolean;
+  input_price_per_million?: number;
+  output_price_per_million?: number;
+  cache_read_price_per_million?: number;
+  cache_write_price_per_million?: number;
+  missing_price?: boolean;
+  price_conflict?: boolean;
+}
+
+export interface ModelImportRow {
+  name: string;
+  action: string;
+  reason?: string;
+  affected_keys?: string[];
+  duplicate?: boolean;
+  missing_price?: boolean;
+  price_conflict?: boolean;
+}
+
+export interface ModelImportResult {
+  created: ModelImportRow[];
+  updated: ModelImportRow[];
+  skipped: ModelImportRow[];
+  conflicts: ModelImportRow[];
+  missing_price: ModelImportRow[];
+  affected_keys: string[];
 }
 
 export interface CredentialDescriptor {

@@ -54,12 +54,14 @@ func (r *ClassifyRule) Compiled() *regexp.Regexp {
 }
 
 type UsageBucket struct {
-	TotalUSD        float64 `json:"total_usd,omitempty"`
-	CallCount       int64   `json:"call_count,omitempty"`
-	CacheReadTokens int64   `json:"cache_read_tokens,omitempty"`
-	CacheCostUSD    float64 `json:"cache_cost_usd,omitempty"`
-	InputTokens     int64   `json:"input_tokens,omitempty"`
-	OutputTokens    int64   `json:"output_tokens,omitempty"`
+	TotalUSD         float64 `json:"total_usd,omitempty"`
+	CallCount        int64   `json:"call_count,omitempty"`
+	CacheReadTokens  int64   `json:"cache_read_tokens,omitempty"`
+	CacheCostUSD     float64 `json:"cache_cost_usd,omitempty"`
+	CacheWriteTokens int64   `json:"cache_write_tokens,omitempty"`
+	CacheWriteUSD    float64 `json:"cache_write_usd,omitempty"`
+	InputTokens      int64   `json:"input_tokens,omitempty"`
+	OutputTokens     int64   `json:"output_tokens,omitempty"`
 }
 
 type UsageState struct {
@@ -68,13 +70,15 @@ type UsageState struct {
 }
 
 type UsageWindow struct {
-	TotalUSD        float64   `json:"total_usd"`
-	WindowStart     time.Time `json:"window_start,omitempty"`
-	CacheReadTokens int64     `json:"cache_read_tokens,omitempty"`
-	CacheCostUSD    float64   `json:"cache_cost_usd,omitempty"`
-	InputTokens     int64     `json:"input_tokens,omitempty"`
-	OutputTokens    int64     `json:"output_tokens,omitempty"`
-	CallCount       int64     `json:"call_count,omitempty"`
+	TotalUSD         float64   `json:"total_usd"`
+	WindowStart      time.Time `json:"window_start,omitempty"`
+	CacheReadTokens  int64     `json:"cache_read_tokens,omitempty"`
+	CacheCostUSD     float64   `json:"cache_cost_usd,omitempty"`
+	CacheWriteTokens int64     `json:"cache_write_tokens,omitempty"`
+	CacheWriteUSD    float64   `json:"cache_write_usd,omitempty"`
+	InputTokens      int64     `json:"input_tokens,omitempty"`
+	OutputTokens     int64     `json:"output_tokens,omitempty"`
+	CallCount        int64     `json:"call_count,omitempty"`
 }
 
 type State struct {

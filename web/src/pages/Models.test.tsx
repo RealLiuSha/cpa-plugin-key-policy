@@ -11,11 +11,17 @@ vi.mock("../api/modelDefinitions", () => ({
   fetchModelDefinitions: vi.fn(),
   deleteModelDefinition: vi.fn(),
   importModelPrices: vi.fn(),
+  previewModelPrices: vi.fn(),
+  importModels: vi.fn(),
+}));
+vi.mock("../api/models", () => ({
+  fetchCatalog: vi.fn(),
 }));
 const { translate } = vi.hoisted(() => ({ translate: (key: string) => key }));
 vi.mock("../i18n", () => ({ useT: () => translate }));
 
-import { deleteModelDefinition, fetchModelDefinitions, importModelPrices } from "../api/modelDefinitions";
+import { deleteModelDefinition, fetchModelDefinitions, importModelPrices, previewModelPrices } from "../api/modelDefinitions";
+import { fetchCatalog } from "../api/models";
 import Models from "./Models";
 
 const models: ModelDefinition[] = [
@@ -55,6 +61,20 @@ beforeEach(() => {
   vi.mocked(fetchModelDefinitions).mockResolvedValue(models);
   vi.mocked(deleteModelDefinition).mockResolvedValue(undefined);
   vi.mocked(importModelPrices).mockResolvedValue({ applied: [], unchanged: [], skipped: [], affected_keys: [] });
+  vi.mocked(previewModelPrices).mockResolvedValue({
+    source: "Models.dev", source_url: "https://models.dev/api.json", metadata_models: 1,
+    matches: [{
+      model: "gpt-5", matched_model: "gpt-5", match_type: "index_exact", source: "Models.dev",
+      source_url: "https://models.dev/api.json", source_provider_id: "openai", source_provider_name: "OpenAI",
+      prompt_price_per_1m: 3, completion_price_per_1m: 12, cache_read_price_per_1m: 0.75, cache_write_price_per_1m: 3.75,
+    }, {
+      model: "small", matched_model: "small", match_type: "index_exact", source: "Models.dev",
+      source_url: "https://models.dev/api.json", source_provider_id: "openai", source_provider_name: "OpenAI",
+      prompt_price_per_1m: 0.15, completion_price_per_1m: 0.6, cache_read_price_per_1m: 0.075,
+    }],
+    unmatched_models: [],
+  });
+  vi.mocked(fetchCatalog).mockResolvedValue([]);
 });
 
 afterEach(() => {
@@ -90,20 +110,31 @@ describe("Models management", () => {
     expect(moreTargets.textContent).toBe("models.showLessTargets");
   });
 
-  it("previews and applies price imports, then refreshes model definitions", async () => {
+  it("previews and applies Models.dev price sync, then refreshes model definitions", async () => {
     await renderPage();
     expect(container.querySelector(".model-import")).toBeNull();
-    const openImport = [...container.querySelectorAll<HTMLButtonElement>("button")].find((button) => button.textContent === "models.importAction")!;
-    await act(async () => openImport.click());
+    const openSync = [...container.querySelectorAll<HTMLButtonElement>("button")].find((button) => button.textContent === "models.syncPrices")!;
+    await act(async () => { openSync.click(); await tick(); });
     expect(container.querySelector('[role="dialog"]')).not.toBeNull();
-    const textarea = container.querySelector<HTMLTextAreaElement>("textarea")!;
-    await act(async () => Simulate.change(textarea, { target: { value: JSON.stringify({ matches: [{ model: "gpt-5", prompt_price_per_1m: 3 }] }) } } as never));
+    const preview = [...container.querySelectorAll<HTMLButtonElement>(".model-import button")].find((button) => button.textContent === "models.pricingPreview")!;
+    await act(async () => { preview.click(); await tick(); await tick(); });
+    expect(previewModelPrices).toHaveBeenCalled();
     const buttons = [...container.querySelectorAll<HTMLButtonElement>(".model-import button")];
-    await act(async () => { buttons[0].click(); await tick(); });
-    expect(importModelPrices).toHaveBeenNthCalledWith(1, { dry_run: true, matches: [{ model: "gpt-5", prompt_price_per_1m: 3 }] });
+    const selections = container.querySelectorAll<HTMLInputElement>('.model-import input[type="checkbox"]');
+    expect(selections).toHaveLength(2);
+    await act(async () => selections[1].click());
     await act(async () => { buttons[1].click(); await tick(); });
-    expect(importModelPrices).toHaveBeenNthCalledWith(2, { dry_run: false, matches: [{ model: "gpt-5", prompt_price_per_1m: 3 }] });
-    expect(fetchModelDefinitions).toHaveBeenCalledTimes(2);
+    expect(importModelPrices).toHaveBeenNthCalledWith(1, expect.objectContaining({
+      dry_run: true,
+      matches: [expect.objectContaining({ model: "gpt-5" })],
+    }));
+    const priceInput = container.querySelector<HTMLInputElement>('.model-import input[type="number"]')!;
+    await act(async () => Simulate.change(priceInput, { target: { value: "4" } } as never));
+    expect(buttons[2].disabled).toBe(true);
+    await act(async () => { buttons[1].click(); await tick(); });
+    await act(async () => { buttons[2].click(); await tick(); });
+    expect(importModelPrices).toHaveBeenNthCalledWith(3, expect.objectContaining({ dry_run: false }));
+    expect(fetchModelDefinitions).toHaveBeenCalledTimes(3);
   });
 
   it("deletes an unreferenced model only after confirmation", async () => {

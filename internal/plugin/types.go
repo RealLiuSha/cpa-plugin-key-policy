@@ -7,8 +7,16 @@ import (
 )
 
 const (
-	ABIVersion    uint32 = 1
+	ABIVersion uint32 = 1
+	// SchemaVersion is the lifecycle contract this plugin speaks, echoed back to the
+	// host at plugin.register so it knows how to talk to us. Staying at 2 is
+	// deliberate: schema 3 only omits OriginalRequest/RequestBody on payload stream
+	// chunks, and this plugin registers no stream chunk interceptor.
 	SchemaVersion uint32 = 2
+	// MinHostSchemaVersion is the oldest host lifecycle contract this plugin can work
+	// with. The host advertises its own ceiling, so anything at or above this is fine;
+	// requiring an exact match would make every host upgrade disable the plugin.
+	MinHostSchemaVersion uint32 = 2
 
 	MethodPluginRegister    = "plugin.register"
 	MethodPluginReconfigure = "plugin.reconfigure"
@@ -43,7 +51,7 @@ const (
 const (
 	PluginID   = "cpa-key-policy"
 	PluginName = "cpa-key-policy"
-	Version    = "0.5.0"
+	Version    = "0.5.1"
 )
 
 type Envelope struct {
@@ -109,9 +117,18 @@ type FrontendAuthRequest struct {
 }
 
 type FrontendAuthResponse struct {
-	Authenticated bool              `json:"Authenticated"`
-	Principal     string            `json:"Principal,omitempty"`
-	Metadata      map[string]string `json:"Metadata,omitempty"`
+	Authenticated bool                   `json:"Authenticated"`
+	Principal     string                 `json:"Principal,omitempty"`
+	Metadata      map[string]string      `json:"Metadata,omitempty"`
+	Rejection     *FrontendAuthRejection `json:"Rejection,omitempty"`
+}
+
+type FrontendAuthRejection struct {
+	Code              string `json:"code"`
+	PolicyReason      string `json:"policy_reason,omitempty"`
+	Message           string `json:"message"`
+	HTTPStatus        int    `json:"http_status"`
+	RetryAfterSeconds int    `json:"retry_after_seconds,omitempty"`
 }
 
 type ModelRouteRequest struct {

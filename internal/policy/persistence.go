@@ -17,8 +17,10 @@ import (
 )
 
 const (
-	stateFileVersion = 3
-	usageFileVersion = 3
+	currentStateFileVersion = 4
+	currentUsageFileVersion = 4
+	minReadableFileVersion  = 3
+	maxReadableFileVersion  = 4
 )
 
 type persistedState struct {
@@ -71,7 +73,7 @@ func LoadState(path string) (*State, error) {
 	if err := json.Unmarshal(raw, &header); err != nil {
 		return nil, fmt.Errorf("decode state header: %w", err)
 	}
-	if header.Version != stateFileVersion {
+	if header.Version < minReadableFileVersion || header.Version > maxReadableFileVersion {
 		return nil, schemaVersionError("state", header.Version)
 	}
 	if strings.TrimSpace(header.DatasetID) == "" {
@@ -107,7 +109,7 @@ func LoadUsage(path string) (*UsageFile, error) {
 	if err := json.Unmarshal(raw, &header); err != nil {
 		return nil, fmt.Errorf("decode usage header: %w", err)
 	}
-	if header.Version != usageFileVersion {
+	if header.Version < minReadableFileVersion || header.Version > maxReadableFileVersion {
 		return nil, schemaVersionError("usage", header.Version)
 	}
 	if strings.TrimSpace(header.DatasetID) == "" {
@@ -132,7 +134,7 @@ func LoadUsage(path string) (*UsageFile, error) {
 }
 
 func schemaVersionError(kind string, version int) error {
-	return fmt.Errorf("unsupported %s version %d; require version %d", kind, version, stateFileVersion)
+	return fmt.Errorf("unsupported %s version %d; require version %d or %d", kind, version, minReadableFileVersion, maxReadableFileVersion)
 }
 
 func decodeJSONStrict(raw []byte, target any) error {
@@ -168,7 +170,7 @@ func MarshalState(datasetID string, keys []KeyConfig, models []ModelDefinition, 
 		return nil, err
 	}
 	state := persistedState{
-		Version: stateFileVersion, DatasetID: datasetID, Keys: cfg.Keys, Models: cfg.Models,
+		Version: currentStateFileVersion, DatasetID: datasetID, Keys: cfg.Keys, Models: cfg.Models,
 		ClassifyRules: cfg.ClassifyRules, UpdatedAt: updatedAt.UTC(),
 	}
 	return json.MarshalIndent(state, "", "  ")
@@ -191,7 +193,7 @@ func MarshalUsage(datasetID string, usage map[string]*UsageState, updatedAt time
 		return nil, err
 	}
 	disk := persistedUsage{
-		Version: usageFileVersion, DatasetID: datasetID, Usage: usage, UpdatedAt: updatedAt.UTC(),
+		Version: currentUsageFileVersion, DatasetID: datasetID, Usage: usage, UpdatedAt: updatedAt.UTC(),
 	}
 	return json.MarshalIndent(disk, "", "  ")
 }
@@ -248,6 +250,8 @@ func usageBucketsEqual(left, right UsageBucket) bool {
 		left.CallCount == right.CallCount &&
 		left.CacheReadTokens == right.CacheReadTokens &&
 		nearlyEqual(left.CacheCostUSD, right.CacheCostUSD) &&
+		left.CacheWriteTokens == right.CacheWriteTokens &&
+		nearlyEqual(left.CacheWriteUSD, right.CacheWriteUSD) &&
 		left.InputTokens == right.InputTokens &&
 		left.OutputTokens == right.OutputTokens
 }

@@ -153,6 +153,8 @@ func addUsageBucket(dst UsageBucket, src UsageBucket) UsageBucket {
 	dst.CallCount += src.CallCount
 	dst.CacheReadTokens += src.CacheReadTokens
 	dst.CacheCostUSD += src.CacheCostUSD
+	dst.CacheWriteTokens += src.CacheWriteTokens
+	dst.CacheWriteUSD += src.CacheWriteUSD
 	dst.InputTokens += src.InputTokens
 	dst.OutputTokens += src.OutputTokens
 	return dst
@@ -210,7 +212,7 @@ func (l *usageLedger) evictExpiredLocked(now time.Time) bool {
 	return changed
 }
 
-func (l *usageLedger) RecordCost(id, model string, amount, cacheCost float64, cacheReadTokens, inputTokens, outputTokens int64, callCount int64) {
+func (l *usageLedger) RecordCost(id, model string, amount, cacheCost float64, cacheReadTokens int64, cacheWriteCost float64, cacheWriteTokens, inputTokens, outputTokens int64, callCount int64) {
 	if strings.TrimSpace(id) == "" || strings.TrimSpace(model) == "" {
 		return
 	}
@@ -220,12 +222,14 @@ func (l *usageLedger) RecordCost(id, model string, amount, cacheCost float64, ca
 	state := l.entryLocked(id)
 	date := l.dateKey(now)
 	delta := UsageBucket{
-		TotalUSD:        amount,
-		CallCount:       callCount,
-		CacheReadTokens: cacheReadTokens,
-		CacheCostUSD:    cacheCost,
-		InputTokens:     inputTokens,
-		OutputTokens:    outputTokens,
+		TotalUSD:         amount,
+		CallCount:        callCount,
+		CacheReadTokens:  cacheReadTokens,
+		CacheCostUSD:     cacheCost,
+		CacheWriteTokens: cacheWriteTokens,
+		CacheWriteUSD:    cacheWriteCost,
+		InputTokens:      inputTokens,
+		OutputTokens:     outputTokens,
 	}
 	state.Days[date] = addUsageBucket(state.Days[date], delta)
 	modelDays := state.ByModel[model]
@@ -252,6 +256,12 @@ type UsageSummary struct {
 	DailyCacheReadTokens     int64     `json:"daily_cache_read_tokens,omitempty"`
 	WeeklyCacheReadTokens    int64     `json:"weekly_cache_read_tokens,omitempty"`
 	MonthlyCacheReadTokens   int64     `json:"monthly_cache_read_tokens,omitempty"`
+	DailyCacheWriteUSD       float64   `json:"daily_cache_write_usd,omitempty"`
+	WeeklyCacheWriteUSD      float64   `json:"weekly_cache_write_usd,omitempty"`
+	MonthlyCacheWriteUSD     float64   `json:"monthly_cache_write_usd,omitempty"`
+	DailyCacheWriteTokens    int64     `json:"daily_cache_write_tokens,omitempty"`
+	WeeklyCacheWriteTokens   int64     `json:"weekly_cache_write_tokens,omitempty"`
+	MonthlyCacheWriteTokens  int64     `json:"monthly_cache_write_tokens,omitempty"`
 	DailyInputTokens         int64     `json:"daily_input_tokens,omitempty"`
 	WeeklyInputTokens        int64     `json:"weekly_input_tokens,omitempty"`
 	MonthlyInputTokens       int64     `json:"monthly_input_tokens,omitempty"`
@@ -309,6 +319,12 @@ func (l *usageLedger) summaryLocked(keyID string, limits quotaLimits, now time.T
 		DailyCacheReadTokens:     daily.CacheReadTokens,
 		WeeklyCacheReadTokens:    weekly.CacheReadTokens,
 		MonthlyCacheReadTokens:   monthly.CacheReadTokens,
+		DailyCacheWriteUSD:       daily.CacheWriteUSD,
+		WeeklyCacheWriteUSD:      weekly.CacheWriteUSD,
+		MonthlyCacheWriteUSD:     monthly.CacheWriteUSD,
+		DailyCacheWriteTokens:    daily.CacheWriteTokens,
+		WeeklyCacheWriteTokens:   weekly.CacheWriteTokens,
+		MonthlyCacheWriteTokens:  monthly.CacheWriteTokens,
 		DailyInputTokens:         daily.InputTokens,
 		WeeklyInputTokens:        weekly.InputTokens,
 		MonthlyInputTokens:       monthly.InputTokens,
@@ -477,13 +493,15 @@ type ModelUsageEntry struct {
 
 func usageWindowFromBucket(bucket UsageBucket, start time.Time) UsageWindow {
 	return UsageWindow{
-		TotalUSD:        bucket.TotalUSD,
-		WindowStart:     start,
-		CacheReadTokens: bucket.CacheReadTokens,
-		CacheCostUSD:    bucket.CacheCostUSD,
-		InputTokens:     bucket.InputTokens,
-		OutputTokens:    bucket.OutputTokens,
-		CallCount:       bucket.CallCount,
+		TotalUSD:         bucket.TotalUSD,
+		WindowStart:      start,
+		CacheReadTokens:  bucket.CacheReadTokens,
+		CacheCostUSD:     bucket.CacheCostUSD,
+		CacheWriteTokens: bucket.CacheWriteTokens,
+		CacheWriteUSD:    bucket.CacheWriteUSD,
+		InputTokens:      bucket.InputTokens,
+		OutputTokens:     bucket.OutputTokens,
+		CallCount:        bucket.CallCount,
 	}
 }
 
@@ -534,6 +552,8 @@ func addUsageWindow(dst, src UsageWindow) UsageWindow {
 	dst.CallCount += src.CallCount
 	dst.CacheReadTokens += src.CacheReadTokens
 	dst.CacheCostUSD += src.CacheCostUSD
+	dst.CacheWriteTokens += src.CacheWriteTokens
+	dst.CacheWriteUSD += src.CacheWriteUSD
 	dst.InputTokens += src.InputTokens
 	dst.OutputTokens += src.OutputTokens
 	if !src.WindowStart.IsZero() && (dst.WindowStart.IsZero() || src.WindowStart.Before(dst.WindowStart)) {

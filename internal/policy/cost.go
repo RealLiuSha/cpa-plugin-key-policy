@@ -39,48 +39,44 @@ type UsageDetail struct {
 // and routed provider, and prices cache-hit input tokens at the cache-read
 // price instead of the regular input price. Provider semantics:
 //
-//   - Additive providers (Anthropic/Claude): cache-read tokens are reported
-//     OUTSIDE InputTokens, so the cache-read subset is billed at the cache price
-//     and InputTokens at the input price, summed. Cache-creation tokens are not
-//     covered by the single cache-read price and are billed at the input price
-//     (they are fresh prompt tokens that got written to the cache).
+//   - Additive providers (Anthropic/Claude): cache-read and cache-creation
+//     tokens are reported OUTSIDE InputTokens. Reads bill at cache-read, writes
+//     at cache-write, and remaining input at the input price.
 //   - Subset providers (OpenAI/Gemini/Codex/...): cache-hit tokens are already
 //     INSIDE InputTokens, so we split them out: (InputTokens - cacheHits) at the
-//     input price + cacheHits at the cache price, to avoid double-counting.
+//     input price + cacheHits at the cache-read price. Explicit cache-write
+//     prices also peel cache-creation tokens out of the remaining input.
 //
-// When cacheReadPerMillion is 0 (not configured), cache hits fall back to the
-// regular input price in both cases, preserving prior behavior. priced=false or
-// no usable tokens → 0.
+// A zero cache-read price means unconfigured and falls back to the regular
+// input price. Cache-write uses presence semantics: nil falls back to input,
+// while an explicit zero is a configured free cache-write price. priced=false
+// or no usable tokens → 0.
 //
 // cacheReadTokensOut reports the number of cache-hit input tokens billed at the
 // cache price for THIS record (for the ledger's hit-rate / cache-cost tracking).
 // It is the same CacheRead value used inside the cost formula (after clamping
 // for subset providers); 0 when the record had no cache hits or was unpriced.
-func ComputeCacheCost(provider string, inputPerMillion, outputPerMillion, cacheReadPerMillion float64, priced bool, detail UsageDetail) float64 {
-	total, _, _ := ComputeCacheCostBreakdown(provider, inputPerMillion, outputPerMillion, cacheReadPerMillion, priced, detail)
-	return total
+type CacheCostBreakdown struct {
+	TotalCost        float64
+	CacheReadCost    float64
+	CacheReadTokens  int64
+	CacheWriteCost   float64
+	CacheWriteTokens int64
+	InputTokens      int64
 }
 
-// ComputeCacheCostBreakdown is the same biller as ComputeCacheCost but also
-// returns the cache-hit breakdown used for reporting (cache spend + the cache
-// count billed at the cache price). Callers that only need the total should
-// call ComputeCacheCost; the ledger calls this to accumulate cache stats.
-//
-// Returns:
-//   - totalCost: the full dollar bill (same as ComputeCacheCost).
-//   - cacheCost: the dollar portion attributable to cache-hit input tokens
-//     (cacheRead × cachePrice / 1M). When no cache is configured (cacheRead=0)
-//     or the model is unpriced, cacheCost is 0 even if cache hits existed
-//     (because they were folded into the input-price line, not separably priced).
-//   - cacheReadTokens: the cache-hit count billed at the cache price (post-clamp).
-func ComputeCacheCostBreakdown(provider string, inputPerMillion, outputPerMillion, cacheReadPerMillion float64, priced bool, detail UsageDetail) (totalCost, cacheCost float64, cacheReadTokens int64) {
+func ComputeCacheCost(provider string, inputPerMillion, outputPerMillion, cacheReadPerMillion float64, cacheWritePerMillion *float64, priced bool, detail UsageDetail) float64 {
+	return ComputeCacheCostBreakdown(provider, inputPerMillion, outputPerMillion, cacheReadPerMillion, cacheWritePerMillion, priced, detail).TotalCost
+}
+
+func ComputeCacheCostBreakdown(provider string, inputPerMillion, outputPerMillion, cacheReadPerMillion float64, cacheWritePerMillion *float64, priced bool, detail UsageDetail) CacheCostBreakdown {
 	if !priced {
-		return 0, 0, 0
+		return CacheCostBreakdown{}
 	}
 	input := detail.InputTokens
 	output := detail.OutputTokens
-	if input == 0 && output == 0 {
-		return 0, 0, 0
+	if input <= 0 && output <= 0 && detail.CachedTokens <= 0 && detail.CacheReadTokens <= 0 && detail.CacheCreationTokens <= 0 {
+		return CacheCostBreakdown{}
 	}
 	cacheRead := detail.CacheReadTokens
 	if cacheRead == 0 {
@@ -89,40 +85,52 @@ func ComputeCacheCostBreakdown(provider string, inputPerMillion, outputPerMillio
 		// CacheReadTokens. Either way CachedTokens is the cache-hit count.
 		cacheRead = detail.CachedTokens
 	}
-	cachePrice := cacheReadPerMillion
-	if cachePrice == 0 {
-		// No cache price configured: bill everything at the regular input price.
-		// For subset providers input already includes cache hits, so this is
-		// correct as-is (no double count). For additive providers, cache reads
-		// are outside input, so we still add them at the input price to match the
-		// pre-cache-pricing total (Input + Output + CacheRead + CacheCreation).
-		cachePrice = inputPerMillion
+	cacheReadPrice := cacheReadPerMillion
+	if cacheReadPrice == 0 {
+		cacheReadPrice = inputPerMillion
+	}
+	cacheWritePrice := optionalPriceValue(cacheWritePerMillion)
+	if cacheWritePerMillion == nil {
+		cacheWritePrice = inputPerMillion
 	}
 
 	var inputTokensToBill int64
+	var cacheWriteTokens int64
 	if isCacheAdditiveProvider(provider) {
-		// Cache hits are NOT in input; bill input at input price, cache reads at
-		// the cache price, and cache-creation tokens (writes) at the input price.
-		inputTokensToBill = input + detail.CacheCreationTokens
+		inputTokensToBill = input
+		if cacheWritePerMillion == nil {
+			inputTokensToBill += detail.CacheCreationTokens
+		} else {
+			cacheWriteTokens = detail.CacheCreationTokens
+		}
 	} else {
-		// Cache hits ARE a subset of input; peel them off and reprice.
 		if cacheRead > input {
-			cacheRead = input // defensive: clamp to what's reported
+			cacheRead = input
 		}
 		inputTokensToBill = input - cacheRead
+		if cacheWritePerMillion != nil {
+			cacheWriteTokens = detail.CacheCreationTokens
+			if cacheWriteTokens > inputTokensToBill {
+				cacheWriteTokens = inputTokensToBill
+			}
+			inputTokensToBill -= cacheWriteTokens
+		}
 	}
 
-	cacheReadTokens = cacheRead
-	cost := float64(inputTokensToBill)/1_000_000*inputPerMillion +
-		float64(cacheRead)/1_000_000*cachePrice +
-		float64(output)/1_000_000*outputPerMillion
-	// cacheCost is the cache-hit line only. Report it as separably priced only
-	// when a cache price was explicitly configured (cacheReadPerMillion != 0);
-	// otherwise cache hits were folded into the input-price bill and reporting
-	// them as "cache spend" would overstate savings/mislead the dashboards.
-	var cachePortion float64
-	if cacheReadPerMillion != 0 && cacheRead > 0 {
-		cachePortion = float64(cacheRead) / 1_000_000 * cachePrice
+	breakdown := CacheCostBreakdown{
+		TotalCost: float64(inputTokensToBill)/1_000_000*inputPerMillion +
+			float64(cacheRead)/1_000_000*cacheReadPrice +
+			float64(cacheWriteTokens)/1_000_000*cacheWritePrice +
+			float64(output)/1_000_000*outputPerMillion,
+		CacheReadTokens:  cacheRead,
+		CacheWriteTokens: cacheWriteTokens,
+		InputTokens:      inputTokensToBill,
 	}
-	return cost, cachePortion, cacheReadTokens
+	if cacheReadPerMillion != 0 && cacheRead > 0 {
+		breakdown.CacheReadCost = float64(cacheRead) / 1_000_000 * cacheReadPrice
+	}
+	if cacheWritePerMillion != nil && cacheWriteTokens > 0 {
+		breakdown.CacheWriteCost = float64(cacheWriteTokens) / 1_000_000 * cacheWritePrice
+	}
+	return breakdown
 }

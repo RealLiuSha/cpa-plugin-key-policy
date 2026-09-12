@@ -53,39 +53,27 @@ func (s *Store) recordUsage(apiKeyOrID, requestedModel, targetModel string, fail
 		}
 		cost := route.PerCallUSD
 		if usageLedger != nil {
-			usageLedger.RecordCost(key.ID, publicModel, cost, 0, 0, 0, 0, 1)
+			usageLedger.RecordCost(key.ID, publicModel, cost, 0, 0, 0, 0, 0, 0, 1)
 		}
 		return cost
 	}
 
-	if detail.InputTokens <= 0 && detail.OutputTokens <= 0 {
+	if detail.InputTokens <= 0 && detail.OutputTokens <= 0 && detail.CachedTokens <= 0 && detail.CacheReadTokens <= 0 && detail.CacheCreationTokens <= 0 {
 		return 0
 	}
-	cost, cacheCost, cacheReadTokens := ComputeCacheCostBreakdown(
+	breakdown := ComputeCacheCostBreakdown(
 		route.Provider,
 		route.InputPricePerMillion,
 		route.OutputPricePerMillion,
 		route.CacheReadPricePerMillion,
+		route.CacheWritePricePerMillion,
 		true,
 		detail,
 	)
-	var nonCacheInput int64
-	if isCacheAdditiveProvider(route.Provider) {
-		nonCacheInput = detail.InputTokens + detail.CacheCreationTokens
-	} else {
-		cacheRead := detail.CacheReadTokens
-		if cacheRead == 0 {
-			cacheRead = detail.CachedTokens
-		}
-		if cacheRead > detail.InputTokens {
-			cacheRead = detail.InputTokens
-		}
-		nonCacheInput = detail.InputTokens - cacheRead
-	}
 	if usageLedger != nil {
-		usageLedger.RecordCost(key.ID, publicModel, cost, cacheCost, cacheReadTokens, nonCacheInput, detail.OutputTokens, 1)
+		usageLedger.RecordCost(key.ID, publicModel, breakdown.TotalCost, breakdown.CacheReadCost, breakdown.CacheReadTokens, breakdown.CacheWriteCost, breakdown.CacheWriteTokens, breakdown.InputTokens, detail.OutputTokens, 1)
 	}
-	return cost
+	return breakdown.TotalCost
 }
 
 func prechargeKey(keyID, model string) string {

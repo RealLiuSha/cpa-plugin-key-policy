@@ -31,9 +31,9 @@ describe("KeyUsage history and window controls", () => {
       monthly_limit_usd: 50,
       models: [{
         name: "fast", free: false, in_config: true,
-        daily: { total_usd: 1 },
-        weekly: { total_usd: 4 },
-        monthly: { total_usd: 9 },
+        daily: { total_usd: 1, cache_read_tokens: 10, cache_cost_usd: 0.01, cache_write_tokens: 4, cache_write_usd: 0.02 },
+        weekly: { total_usd: 4, cache_read_tokens: 20, cache_write_tokens: 8, cache_write_usd: 0.04 },
+        monthly: { total_usd: 9, cache_read_tokens: 30, cache_write_tokens: 12, cache_write_usd: 0.06 },
       }],
     });
     vi.mocked(fetchKeyHistory).mockResolvedValue({
@@ -69,6 +69,8 @@ describe("KeyUsage history and window controls", () => {
     await act(async () => { monthly!.click(); });
     expect(container.textContent).toContain("$9.00");
     expect(container.textContent).toContain("keyUsage.colModel");
+    expect(container.textContent).toContain("keyUsage.colCacheRead");
+    expect(container.textContent).toContain("keyUsage.colCacheWrite");
     expect(container.textContent).not.toContain("keyUsage.colProvider");
   });
 });

@@ -4,8 +4,32 @@ import (
 	"encoding/json"
 	"net/http"
 	"path/filepath"
+	"strings"
 	"testing"
 )
+
+func TestFrontendAuthRejectionJSONIsOptionalForOldHosts(t *testing.T) {
+	unhandled, err := json.Marshal(FrontendAuthResponse{Authenticated: false})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(unhandled), "Rejection") || strings.Contains(string(unhandled), "rejection") {
+		t.Fatalf("unhandled response leaked rejection field: %s", unhandled)
+	}
+	rejected, err := json.Marshal(FrontendAuthResponse{Authenticated: false, Rejection: &FrontendAuthRejection{
+		Code: "key_disabled", PolicyReason: "key_disabled", Message: "API key is disabled", HTTPStatus: http.StatusForbidden,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(rejected, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := decoded["Rejection"]; !ok {
+		t.Fatalf("new host field missing: %s", rejected)
+	}
+}
 
 func TestManagementRejectsNonReferenceKeyModelFields(t *testing.T) {
 	app := NewApp()
@@ -78,15 +102,33 @@ models:
 	}
 }
 
-func TestLifecycleRejectsNonCurrentSchema(t *testing.T) {
+func TestLifecycleAcceptsNewerHostSchema(t *testing.T) {
+	// The host sends the highest lifecycle version it supports, not one to match
+	// exactly: it honors whatever the plugin reports back at plugin.register.
+	// CPA v7.2.130 raised its ceiling to 3, which only omits request bodies on
+	// payload stream chunks this plugin never receives.
+	for _, hostSchema := range []uint32{MinHostSchemaVersion, SchemaVersion + 1, SchemaVersion + 2} {
+		app := NewApp()
+		statePath := filepath.ToSlash(filepath.Join(t.TempDir(), "state.json"))
+		raw, _ := json.Marshal(LifecycleRequest{
+			ConfigYAML:    []byte("enabled: true\nstate_file: \"" + statePath + "\"\n"),
+			SchemaVersion: hostSchema,
+		})
+		if _, err := app.HandleMethod(MethodPluginRegister, raw); err != nil {
+			t.Fatalf("host schema_version %d was rejected: %v", hostSchema, err)
+		}
+	}
+}
+
+func TestLifecycleRejectsOlderHostSchema(t *testing.T) {
 	app := NewApp()
 	statePath := filepath.ToSlash(filepath.Join(t.TempDir(), "state.json"))
 	raw, _ := json.Marshal(map[string]any{
-		"schema_version": 1,
+		"schema_version": MinHostSchemaVersion - 1,
 		"config_yaml":    []byte("enabled: true\nstate_file: \"" + statePath + "\"\n"),
 	})
 	if _, err := app.HandleMethod(MethodPluginRegister, raw); err == nil {
-		t.Fatal("schema version 1 was accepted")
+		t.Fatalf("host schema_version %d was accepted", MinHostSchemaVersion-1)
 	}
 	unknown, _ := json.Marshal(map[string]any{
 		"schema_version": SchemaVersion,

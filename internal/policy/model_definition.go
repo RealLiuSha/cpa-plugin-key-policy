@@ -6,15 +6,16 @@ import (
 )
 
 type ModelDefinition struct {
-	Name                     string        `yaml:"name" json:"name"`
-	Targets                  []ModelTarget `yaml:"targets" json:"targets"`
-	Dispatch                 string        `yaml:"dispatch,omitempty" json:"dispatch,omitempty"`
-	BillingMode              string        `yaml:"billing_mode,omitempty" json:"billing_mode,omitempty"`
-	Free                     bool          `yaml:"free" json:"free"`
-	InputPricePerMillion     float64       `yaml:"input_price_per_million,omitempty" json:"input_price_per_million,omitempty"`
-	OutputPricePerMillion    float64       `yaml:"output_price_per_million,omitempty" json:"output_price_per_million,omitempty"`
-	CacheReadPricePerMillion float64       `yaml:"cache_read_price_per_million,omitempty" json:"cache_read_price_per_million,omitempty"`
-	PerCallUSD               float64       `yaml:"per_call_usd,omitempty" json:"per_call_usd,omitempty"`
+	Name                      string        `yaml:"name" json:"name"`
+	Targets                   []ModelTarget `yaml:"targets" json:"targets"`
+	Dispatch                  string        `yaml:"dispatch,omitempty" json:"dispatch,omitempty"`
+	BillingMode               string        `yaml:"billing_mode,omitempty" json:"billing_mode,omitempty"`
+	Free                      bool          `yaml:"free" json:"free"`
+	InputPricePerMillion      float64       `yaml:"input_price_per_million,omitempty" json:"input_price_per_million,omitempty"`
+	OutputPricePerMillion     float64       `yaml:"output_price_per_million,omitempty" json:"output_price_per_million,omitempty"`
+	CacheReadPricePerMillion  float64       `yaml:"cache_read_price_per_million,omitempty" json:"cache_read_price_per_million,omitempty"`
+	CacheWritePricePerMillion *float64      `yaml:"cache_write_price_per_million,omitempty" json:"cache_write_price_per_million,omitempty"`
+	PerCallUSD                float64       `yaml:"per_call_usd,omitempty" json:"per_call_usd,omitempty"`
 }
 
 type ModelTarget struct {
@@ -29,16 +30,17 @@ type KeyModelRef struct {
 }
 
 type ResolvedModelRoute struct {
-	PublicModel              string
-	Provider                 string
-	TargetModel              string
-	Group                    string
-	BillingMode              string
-	Free                     bool
-	InputPricePerMillion     float64
-	OutputPricePerMillion    float64
-	CacheReadPricePerMillion float64
-	PerCallUSD               float64
+	PublicModel               string
+	Provider                  string
+	TargetModel               string
+	Group                     string
+	BillingMode               string
+	Free                      bool
+	InputPricePerMillion      float64
+	OutputPricePerMillion     float64
+	CacheReadPricePerMillion  float64
+	CacheWritePricePerMillion *float64
+	PerCallUSD                float64
 }
 
 func normalizeModelDefinitions(models []ModelDefinition) (map[string]*ModelDefinition, error) {
@@ -87,18 +89,18 @@ func normalizeModelDefinitions(models []ModelDefinition) (map[string]*ModelDefin
 		default:
 			return nil, fmt.Errorf("model %q billing_mode %q must be \"tokens\" or \"per_call\"", model.Name, model.BillingMode)
 		}
-		if model.InputPricePerMillion < 0 || model.OutputPricePerMillion < 0 || model.CacheReadPricePerMillion < 0 || model.PerCallUSD < 0 {
+		if model.InputPricePerMillion < 0 || model.OutputPricePerMillion < 0 || model.CacheReadPricePerMillion < 0 || optionalPriceNegative(model.CacheWritePricePerMillion) || model.PerCallUSD < 0 {
 			return nil, fmt.Errorf("model %q prices cannot be negative", model.Name)
 		}
 		if model.Free {
-			if model.InputPricePerMillion != 0 || model.OutputPricePerMillion != 0 || model.CacheReadPricePerMillion != 0 || model.PerCallUSD != 0 {
+			if model.InputPricePerMillion != 0 || model.OutputPricePerMillion != 0 || model.CacheReadPricePerMillion != 0 || optionalPriceNonZero(model.CacheWritePricePerMillion) || model.PerCallUSD != 0 {
 				return nil, fmt.Errorf("model %q is free and all price fields must be zero", model.Name)
 			}
 		} else if model.BillingMode == "per_call" {
 			if model.PerCallUSD <= 0 {
 				return nil, fmt.Errorf("model %q per_call_usd must be positive unless free is true", model.Name)
 			}
-		} else if model.InputPricePerMillion <= 0 && model.OutputPricePerMillion <= 0 && model.CacheReadPricePerMillion <= 0 {
+		} else if model.InputPricePerMillion <= 0 && model.OutputPricePerMillion <= 0 && model.CacheReadPricePerMillion <= 0 && optionalPriceValue(model.CacheWritePricePerMillion) <= 0 {
 			return nil, fmt.Errorf("model %q must have a positive token price unless free is true", model.Name)
 		}
 		index[lowerName] = model
@@ -106,17 +108,41 @@ func normalizeModelDefinitions(models []ModelDefinition) (map[string]*ModelDefin
 	return index, nil
 }
 
+func optionalPriceValue(price *float64) float64 {
+	if price == nil {
+		return 0
+	}
+	return *price
+}
+
+func optionalPriceNegative(price *float64) bool {
+	return price != nil && *price < 0
+}
+
+func optionalPriceNonZero(price *float64) bool {
+	return price != nil && *price != 0
+}
+
+func cloneFloat64(value *float64) *float64 {
+	if value == nil {
+		return nil
+	}
+	copy := *value
+	return &copy
+}
+
 func resolveModelRoute(model ModelDefinition, target ModelTarget) ResolvedModelRoute {
 	return ResolvedModelRoute{
-		PublicModel:              model.Name,
-		Provider:                 target.Provider,
-		TargetModel:              target.TargetModel,
-		Group:                    target.Group,
-		BillingMode:              model.BillingMode,
-		Free:                     model.Free,
-		InputPricePerMillion:     model.InputPricePerMillion,
-		OutputPricePerMillion:    model.OutputPricePerMillion,
-		CacheReadPricePerMillion: model.CacheReadPricePerMillion,
-		PerCallUSD:               model.PerCallUSD,
+		PublicModel:               model.Name,
+		Provider:                  target.Provider,
+		TargetModel:               target.TargetModel,
+		Group:                     target.Group,
+		BillingMode:               model.BillingMode,
+		Free:                      model.Free,
+		InputPricePerMillion:      model.InputPricePerMillion,
+		OutputPricePerMillion:     model.OutputPricePerMillion,
+		CacheReadPricePerMillion:  model.CacheReadPricePerMillion,
+		CacheWritePricePerMillion: cloneFloat64(model.CacheWritePricePerMillion),
+		PerCallUSD:                model.PerCallUSD,
 	}
 }

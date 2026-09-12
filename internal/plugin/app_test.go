@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"cpa-key-policy/internal/policy"
@@ -148,6 +149,76 @@ func TestAppModelsEndpointDenied(t *testing.T) {
 	}
 	if authResp.Authenticated {
 		t.Fatalf("auth response = %+v, want denied", authResp)
+	}
+	if authResp.Rejection == nil || authResp.Rejection.HTTPStatus != http.StatusForbidden || authResp.Rejection.Code != "models_endpoint_disabled" {
+		t.Fatalf("rejection = %+v, want models_endpoint_disabled 403", authResp.Rejection)
+	}
+}
+
+func TestAppAuthenticationUnknownKeyIsUnhandled(t *testing.T) {
+	app, _ := configureTestApp(t)
+	authReq, _ := json.Marshal(FrontendAuthRequest{
+		Method:  "POST",
+		Path:    "/v1/chat/completions",
+		Headers: http.Header{"Authorization": {"Bearer unknown"}},
+		Body:    []byte(`{"model":"fast"}`),
+	})
+	raw, err := app.HandleMethod(MethodFrontendAuthAuthenticate, authReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var env Envelope
+	if err := json.Unmarshal(raw, &env); err != nil {
+		t.Fatal(err)
+	}
+	var authResp FrontendAuthResponse
+	if err := json.Unmarshal(env.Result, &authResp); err != nil {
+		t.Fatal(err)
+	}
+	if authResp.Authenticated || authResp.Rejection != nil {
+		t.Fatalf("unknown key must remain unhandled: %+v", authResp)
+	}
+}
+
+func TestAppAuthenticationRPMExceededIncludesRetryAfter(t *testing.T) {
+	app, plain := configureTestApp(t)
+	headers := http.Header{"Authorization": {"Bearer " + plain}}
+	body := []byte(`{"model":"fast"}`)
+	for i := 0; i < 60; i++ {
+		decision := app.store.Authenticate("POST", "/v1/chat/completions", headers, nil, body)
+		if !decision.Allowed {
+			t.Fatalf("warmup request %d denied: %+v", i, decision)
+		}
+	}
+	authReq, _ := json.Marshal(FrontendAuthRequest{
+		Method:  "POST",
+		Path:    "/v1/chat/completions",
+		Headers: headers,
+		Body:    body,
+	})
+	raw, err := app.HandleMethod(MethodFrontendAuthAuthenticate, authReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var env Envelope
+	if err := json.Unmarshal(raw, &env); err != nil {
+		t.Fatal(err)
+	}
+	var authResp FrontendAuthResponse
+	if err := json.Unmarshal(env.Result, &authResp); err != nil {
+		t.Fatal(err)
+	}
+	if authResp.Authenticated || authResp.Rejection == nil {
+		t.Fatalf("auth response = %+v, want rpm rejection", authResp)
+	}
+	if authResp.Rejection.HTTPStatus != http.StatusTooManyRequests || authResp.Rejection.Code != "rate_limit_exceeded" || authResp.Rejection.PolicyReason != "rpm_exceeded" {
+		t.Fatalf("rejection = %+v", authResp.Rejection)
+	}
+	if authResp.Rejection.RetryAfterSeconds < 1 {
+		t.Fatalf("retry after = %d, want at least 1", authResp.Rejection.RetryAfterSeconds)
+	}
+	if strings.Contains(string(env.Result), plain) {
+		t.Fatal("auth rejection leaked plaintext key")
 	}
 }
 
@@ -539,6 +610,27 @@ func TestUsageHandleBills(t *testing.T) {
 	d := app.Store().Authenticate("POST", "/v1/chat/completions", hdr, nil, []byte(`{"model":"fast"}`))
 	if d.Allowed || !d.CostLimited || d.Reason != "daily_exceeded" {
 		t.Fatalf("after usage.handle billing of $1.00, next request should be daily_exceeded: %+v", d)
+	}
+	authReq, _ := json.Marshal(FrontendAuthRequest{
+		Method: "POST", Path: "/v1/chat/completions", Headers: hdr, Body: []byte(`{"model":"fast"}`),
+	})
+	raw, err = app.HandleMethod(MethodFrontendAuthAuthenticate, authReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var env Envelope
+	if err := json.Unmarshal(raw, &env); err != nil {
+		t.Fatal(err)
+	}
+	var authResp FrontendAuthResponse
+	if err := json.Unmarshal(env.Result, &authResp); err != nil {
+		t.Fatal(err)
+	}
+	if authResp.Authenticated || authResp.Rejection == nil || authResp.Rejection.Code != "insufficient_quota" || authResp.Rejection.PolicyReason != "daily_exceeded" {
+		t.Fatalf("quota rejection = %+v", authResp)
+	}
+	if authResp.Rejection.HTTPStatus != http.StatusTooManyRequests {
+		t.Fatalf("quota status = %d", authResp.Rejection.HTTPStatus)
 	}
 }
 
@@ -1036,7 +1128,7 @@ func TestUsageHandleTransportJSONSnapshot(t *testing.T) {
 
 func TestRegistrationReportsCurrentReleaseMetadata(t *testing.T) {
 	registration := NewApp().registration()
-	if registration.SchemaVersion != 2 || registration.Metadata.Version != "0.5.0" {
+	if registration.SchemaVersion != 2 || registration.Metadata.Version != "0.5.1" {
 		t.Fatalf("registration version metadata = %+v", registration)
 	}
 	if registration.Metadata.GitHubRepository != "https://github.com/RealLiuSha/cpa-plugin-key-policy" {

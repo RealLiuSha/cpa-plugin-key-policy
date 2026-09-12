@@ -2,6 +2,7 @@ import { useEffect, useId, useState } from "react";
 import { Link } from "react-router-dom";
 import { deleteModelDefinition, fetchModelDefinitions } from "../api/modelDefinitions";
 import Modal, { ConfirmDialog } from "../components/Modal";
+import ModelImportWizard from "../components/ModelImportWizard";
 import ModelPriceImport from "../components/ModelPriceImport";
 import type { ModelDefinition } from "../types";
 import { extractApiError } from "../api/error";
@@ -14,6 +15,7 @@ function priceLabel(model: ModelDefinition, translate: (key: string, variables?:
     input: model.input_price_per_million ?? 0,
     output: model.output_price_per_million ?? 0,
     cache: model.cache_read_price_per_million ?? 0,
+    write: model.cache_write_price_per_million ?? 0,
   });
 }
 
@@ -67,6 +69,7 @@ export default function Models() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [showImport, setShowImport] = useState(false);
+  const [showSync, setShowSync] = useState(false);
   const [pendingDelete, setPendingDelete] = useState<ModelDefinition | null>(null);
   const [deleting, setDeleting] = useState(false);
 
@@ -105,7 +108,8 @@ export default function Models() {
       <div className="page-head">
         <div><h1>{t("models.title")}</h1><p className="muted">{t("models.description")}</p></div>
         <div className="page-head-actions">
-          <button type="button" className="btn" onClick={() => setShowImport(true)}>{t("models.importAction")}</button>
+          <button type="button" className="btn" onClick={() => setShowImport(true)}>{t("models.importFromCpa")}</button>
+          <button type="button" className="btn" onClick={() => setShowSync(true)}>{t("models.syncPrices")}</button>
           <Link className="btn primary" to="/models/new">{t("models.new")}</Link>
         </div>
       </div>
@@ -143,7 +147,12 @@ export default function Models() {
         </>
       )}
       {showImport && (
-        <Modal title={t("models.importTitle")} closeLabel={t("models.close")} onClose={() => setShowImport(false)} wide>
+        <Modal title={t("models.importFromCpaTitle")} closeLabel={t("models.close")} onClose={() => setShowImport(false)} wide>
+          <ModelImportWizard onApplied={load} />
+        </Modal>
+      )}
+      {showSync && (
+        <Modal title={t("models.syncTitle")} closeLabel={t("models.close")} onClose={() => setShowSync(false)} wide>
           <ModelPriceImport onApplied={load} />
         </Modal>
       )}

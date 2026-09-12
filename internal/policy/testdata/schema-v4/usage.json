@@ -1,0 +1,31 @@
+{
+  "version": 4,
+  "dataset_id": "11111111111111111111111111111111",
+  "usage": {
+    "team-a": {
+      "days": {
+        "2026-08-08": {
+          "total_usd": 1.5,
+          "call_count": 2,
+          "input_tokens": 1000,
+          "output_tokens": 200,
+          "cache_write_tokens": 50,
+          "cache_write_usd": 0.015
+        }
+      },
+      "by_model": {
+        "Chat": {
+          "2026-08-08": {
+            "total_usd": 1.5,
+            "call_count": 2,
+            "input_tokens": 1000,
+            "output_tokens": 200,
+            "cache_write_tokens": 50,
+            "cache_write_usd": 0.015
+          }
+        }
+      }
+    }
+  },
+  "updated_at": "2026-08-08T00:00:00Z"
+}

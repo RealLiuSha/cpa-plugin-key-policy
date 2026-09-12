@@ -11,8 +11,39 @@ import (
 	policyPersist "cpa-key-policy/internal/policy/persist"
 )
 
-func TestManagementSchemaV3FixtureMatchesRuntimeResponses(t *testing.T) {
+func TestManagementSchemaV3FixtureLoadsWithoutInventingCacheWrite(t *testing.T) {
 	fixtureDir := filepath.Join("..", "policy", "testdata", "schema-v3")
+	stateRaw, err := os.ReadFile(filepath.Join(fixtureDir, "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	usageRaw, err := os.ReadFile(filepath.Join(fixtureDir, "usage.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	directory := t.TempDir()
+	statePath := filepath.Join(directory, "state.json")
+	if err := os.WriteFile(statePath, stateRaw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(policyPersist.UsagePath(statePath), usageRaw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	app := NewApp()
+	app.Store().SetClock(func() time.Time { return time.Date(2026, 8, 8, 12, 0, 0, 0, time.UTC) })
+	lifecycle, _ := json.Marshal(LifecycleRequest{ConfigYAML: []byte("enabled: true\nstate_file: \"" + filepath.ToSlash(statePath) + "\"\nusage_timezone: Asia/Shanghai\n"), SchemaVersion: SchemaVersion})
+	if _, err := app.HandleMethod(MethodPluginReconfigure, lifecycle); err != nil {
+		t.Fatal(err)
+	}
+	models := app.store.ModelsSnapshot()
+	if len(models) != 1 || models[0].CacheWritePricePerMillion != nil {
+		t.Fatalf("v3 models invented cache-write: %+v", models)
+	}
+}
+
+func TestManagementSchemaV4FixtureMatchesRuntimeResponses(t *testing.T) {
+	fixtureDir := filepath.Join("..", "policy", "testdata", "schema-v4")
 	stateRaw, err := os.ReadFile(filepath.Join(fixtureDir, "state.json"))
 	if err != nil {
 		t.Fatal(err)
@@ -75,6 +106,6 @@ func TestManagementSchemaV3FixtureMatchesRuntimeResponses(t *testing.T) {
 	}
 	if !reflect.DeepEqual(actual, want) {
 		actualRaw, _ := json.MarshalIndent(actual, "", "  ")
-		t.Fatalf("management v3 fixture drifted; actual response composite:\n%s", actualRaw)
+		t.Fatalf("management v4 fixture drifted; actual response composite:\n%s", actualRaw)
 	}
 }

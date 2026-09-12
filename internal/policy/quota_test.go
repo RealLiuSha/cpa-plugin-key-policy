@@ -25,9 +25,9 @@ func TestDailyNeverExceedsWeekly(t *testing.T) {
 	ledger := newUsageLedgerWithLocation(func() time.Time { return now }, loc, "Asia/Shanghai")
 	key := KeyConfig{ID: "rebirth"}
 
-	ledger.RecordCost(key.ID, "fast", 72.35, 0, 0, 0, 0, 1)
+	ledger.RecordCost(key.ID, "fast", 72.35, 0, 0, 0, 0, 0, 0, 1)
 	now = time.Date(2026, 8, 8, 0, 30, 0, 0, loc)
-	ledger.RecordCost(key.ID, "fast", 31.10, 0, 0, 0, 0, 1)
+	ledger.RecordCost(key.ID, "fast", 31.10, 0, 0, 0, 0, 0, 0, 1)
 
 	summary := ledger.Summary(key.ID, quotaLimitsForKey(key))
 	if summary.DailyUSD > summary.WeeklyUSD || summary.WeeklyUSD > summary.MonthlyUSD {
@@ -42,10 +42,10 @@ func TestBucketBoundaryIndependentOfFirstRecord(t *testing.T) {
 	loc := mustShanghai(t)
 	now := time.Date(2026, 8, 8, 0, 30, 0, 0, loc)
 	ledger := newUsageLedgerWithLocation(func() time.Time { return now }, loc, "Asia/Shanghai")
-	ledger.RecordCost("early", "fast", 1, 0, 0, 0, 0, 1)
+	ledger.RecordCost("early", "fast", 1, 0, 0, 0, 0, 0, 0, 1)
 
 	now = time.Date(2026, 8, 8, 23, 30, 0, 0, loc)
-	ledger.RecordCost("late", "fast", 1, 0, 0, 0, 0, 1)
+	ledger.RecordCost("late", "fast", 1, 0, 0, 0, 0, 0, 0, 1)
 	now = time.Date(2026, 8, 9, 0, 0, 0, 0, loc)
 
 	for _, id := range []string{"early", "late"} {
@@ -68,7 +68,7 @@ func TestWeeklyRollsOneDayAtATime(t *testing.T) {
 
 	for day := 1; day <= 8; day++ {
 		now = time.Date(2026, 8, day, 12, 0, 0, 0, loc)
-		ledger.RecordCost(key.ID, "fast", 1, 0, 0, 0, 0, 1)
+		ledger.RecordCost(key.ID, "fast", 1, 0, 0, 0, 0, 0, 0, 1)
 	}
 
 	summary := ledger.Summary(key.ID, quotaLimitsForKey(key))
@@ -83,7 +83,7 @@ func TestRetentionEvictsBeyond35Days(t *testing.T) {
 	ledger := newUsageLedgerWithLocation(func() time.Time { return now }, loc, "Asia/Shanghai")
 	for day := 0; day < 36; day++ {
 		now = time.Date(2026, 6, 1, 12, 0, 0, 0, loc).AddDate(0, 0, day)
-		ledger.RecordCost("retained", "fast", 1, 0, 0, 0, 0, 1)
+		ledger.RecordCost("retained", "fast", 1, 0, 0, 0, 0, 0, 0, 1)
 	}
 
 	state := ledger.snapshot()["retained"]
@@ -107,7 +107,7 @@ func TestModelWindowsMatchKeyWindows(t *testing.T) {
 	models := []ModelDefinition{freeTestModel("fast", "codex", "fast")}
 	for day := 0; day < 31; day++ {
 		now = start.AddDate(0, 0, day)
-		ledger.RecordCost(key.ID, "fast", 1, 0.25, 2, 3, 4, 1)
+		ledger.RecordCost(key.ID, "fast", 1, 0.25, 2, 0, 0, 3, 4, 1)
 	}
 	summary := ledger.Summary(key.ID, quotaLimitsForKey(key))
 	rows := ledger.ModelUsage(key.ID, models)
@@ -135,7 +135,7 @@ func TestQuotaCheckHardLimitReasonsAndUnlimitedDimensions(t *testing.T) {
 	key := KeyConfig{ID: "limited"}
 	for day := 0; day < 3; day++ {
 		now = time.Date(2026, 8, 6+day, 12, 0, 0, 0, loc)
-		ledger.RecordCost(key.ID, "fast", 1, 0, 0, 0, 0, 1)
+		ledger.RecordCost(key.ID, "fast", 1, 0, 0, 0, 0, 0, 0, 1)
 	}
 	for _, test := range []struct {
 		name   string
@@ -161,7 +161,7 @@ func TestSoftLimitIsWarningOnly(t *testing.T) {
 	loc := mustShanghai(t)
 	now := time.Date(2026, 8, 8, 12, 0, 0, 0, loc)
 	ledger := newUsageLedgerWithLocation(func() time.Time { return now }, loc, "Asia/Shanghai")
-	ledger.RecordCost("warning", "fast", 8, 0, 0, 0, 0, 1)
+	ledger.RecordCost("warning", "fast", 8, 0, 0, 0, 0, 0, 0, 1)
 	for _, test := range []struct {
 		name string
 		key  KeyConfig
@@ -190,7 +190,7 @@ func TestChangedLimitAppliesToAlreadyAccumulatedUsage(t *testing.T) {
 	now := time.Date(2026, 8, 8, 12, 0, 0, 0, loc)
 	ledger := newUsageLedgerWithLocation(func() time.Time { return now }, loc, "Asia/Shanghai")
 	key := KeyConfig{ID: "changed", DailyLimitUSD: 10}
-	ledger.RecordCost(key.ID, "fast", 9, 0, 0, 0, 0, 1)
+	ledger.RecordCost(key.ID, "fast", 9, 0, 0, 0, 0, 0, 0, 1)
 	if reason, _ := ledger.OverLimit(key.ID, "", quotaLimitsForKey(key)); reason != "" {
 		t.Fatalf("original limit blocked with %q", reason)
 	}
