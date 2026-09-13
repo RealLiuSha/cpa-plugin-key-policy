@@ -4,11 +4,11 @@ set -euo pipefail
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 host_field="$(printf '\141\154\151\141\163')"
 host_field_title="$(printf '\101\154\151\141\163')"
-historical_marker="$(printf '\154\145\147\141\143\171')"
-transition_marker="$(printf '\155\151\147\162\141\164')"
 reset_marker="$(printf '\162\145\163\145\164')"
 compound_symbols="${host_field_title}(Mapping|Target|Resolver|Config)|Key${host_field_title}Ref|By${host_field_title}"
-pattern="\\b${host_field}(es)?\\b|${compound_symbols}|${historical_marker}|${transition_marker}|by_${host_field}|daily_${reset_marker}_at|weekly_${reset_marker}_at"
+# V5 supports storage migration. Keep checking the removed model contracts,
+# without rejecting ordinary words used by the data migration implementation.
+pattern="\\b${host_field}(es)?\\b|${compound_symbols}|by_${host_field}|daily_${reset_marker}_at|weekly_${reset_marker}_at"
 
 matches="$({
   rg -n -i \

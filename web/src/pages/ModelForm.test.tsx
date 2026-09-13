@@ -58,6 +58,7 @@ const draftModel = {
   free: true,
   returnTo: "/keys/new",
   draftKey,
+  keyListReturnTo: "/keys?q=team&page=2",
 };
 
 describe("ModelForm return flow", () => {
@@ -90,7 +91,7 @@ describe("ModelForm return flow", () => {
     expect(upsertModelDefinition).toHaveBeenCalledWith(expect.objectContaining({ name: "fast", free: true }));
     const destination = JSON.parse(container.querySelector('[data-testid="destination"]')!.textContent ?? "{}") as { path: string; state: { createdModel: string; draftKey: typeof draftKey } };
     expect(destination.path).toBe("/keys/new");
-    expect(destination.state).toEqual({ createdModel: "fast", draftKey });
+    expect(destination.state).toEqual({ createdModel: "fast", draftKey, keyListReturnTo: "/keys?q=team&page=2" });
   });
 
   it("cancel returns to the key form without creating a model", async () => {
@@ -109,7 +110,7 @@ describe("ModelForm return flow", () => {
     await act(async () => cancel.click());
     expect(upsertModelDefinition).not.toHaveBeenCalled();
     const destination = JSON.parse(container.querySelector('[data-testid="destination"]')!.textContent ?? "{}") as { state: { draftKey: typeof draftKey } };
-    expect(destination.state).toEqual({ draftKey });
+    expect(destination.state).toEqual({ draftKey, keyListReturnTo: "/keys?q=team&page=2" });
   });
 
   it("submits a custom multi-target model with the selected dispatch and global prices", async () => {
@@ -145,6 +146,11 @@ describe("ModelForm return flow", () => {
     expect(container.textContent).toContain("models.priceHint");
     expect(container.textContent).toContain("codex / gpt");
     expect(container.textContent).toContain("xai · plus / grok");
+    const multiplier = container.querySelector<HTMLInputElement>(".model-multiplier input")!;
+    await act(async () => Simulate.change(multiplier, { target: { value: "" } } as never));
+    expect(multiplier.value).toBe("");
+    await act(async () => Simulate.change(multiplier, { target: { value: "1.125" } } as never));
+    expect(multiplier.value).toBe("1.125");
     await act(async () => {
       container.querySelector("form")!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
       await tick();
@@ -152,6 +158,7 @@ describe("ModelForm return flow", () => {
     expect(upsertModelDefinition).toHaveBeenCalledWith({
       ...multiTargetDraft,
       dispatch: "priority",
+      billing_multiplier: 1.125,
     });
   });
 });

@@ -2,10 +2,12 @@ package policy
 
 import (
 	"fmt"
+	"math"
 	"strings"
 )
 
 type ModelDefinition struct {
+	BillingMultiplier         float64       `yaml:"billing_multiplier,omitempty" json:"billing_multiplier"`
 	Name                      string        `yaml:"name" json:"name"`
 	Targets                   []ModelTarget `yaml:"targets" json:"targets"`
 	Dispatch                  string        `yaml:"dispatch,omitempty" json:"dispatch,omitempty"`
@@ -30,6 +32,7 @@ type KeyModelRef struct {
 }
 
 type ResolvedModelRoute struct {
+	BillingMultiplier         float64
 	PublicModel               string
 	Provider                  string
 	TargetModel               string
@@ -47,6 +50,12 @@ func normalizeModelDefinitions(models []ModelDefinition) (map[string]*ModelDefin
 	index := make(map[string]*ModelDefinition, len(models))
 	for i := range models {
 		model := &models[i]
+		if model.BillingMultiplier == 0 {
+			model.BillingMultiplier = 1
+		}
+		if model.BillingMultiplier < 1 || math.IsNaN(model.BillingMultiplier) || math.IsInf(model.BillingMultiplier, 0) {
+			return nil, fmt.Errorf("model %q billing_multiplier must be finite and at least 1", model.Name)
+		}
 		model.Name = strings.TrimSpace(model.Name)
 		if model.Name == "" {
 			return nil, fmt.Errorf("model entry %d: name is required", i)
@@ -133,6 +142,7 @@ func cloneFloat64(value *float64) *float64 {
 
 func resolveModelRoute(model ModelDefinition, target ModelTarget) ResolvedModelRoute {
 	return ResolvedModelRoute{
+		BillingMultiplier:         model.BillingMultiplier,
 		PublicModel:               model.Name,
 		Provider:                  target.Provider,
 		TargetModel:               target.TargetModel,

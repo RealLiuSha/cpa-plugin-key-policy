@@ -1,3 +1,4 @@
+import { modelPriceSummary } from "../components/modelPricing";
 import { useEffect, useId, useState } from "react";
 import { Link } from "react-router-dom";
 import { deleteModelDefinition, fetchModelDefinitions } from "../api/modelDefinitions";
@@ -8,16 +9,6 @@ import type { ModelDefinition } from "../types";
 import { extractApiError } from "../api/error";
 import { useT } from "../i18n";
 
-function priceLabel(model: ModelDefinition, translate: (key: string, variables?: Record<string, string | number>) => string): string {
-  if (model.free) return translate("models.free");
-  if (model.billing_mode === "per_call") return translate("models.pricePerCallSummary", { price: model.per_call_usd ?? 0 });
-  return translate("models.priceTokenSummary", {
-    input: model.input_price_per_million ?? 0,
-    output: model.output_price_per_million ?? 0,
-    cache: model.cache_read_price_per_million ?? 0,
-    write: model.cache_write_price_per_million ?? 0,
-  });
-}
 
 type Translate = (key: string, variables?: Record<string, string | number>) => string;
 
@@ -125,7 +116,7 @@ export default function Models() {
                 <tr key={model.name}>
                   <td><strong>{model.name}</strong></td>
                   <td><span className="badge">{model.dispatch === "priority" ? t("models.priority") : t("models.roundRobin")}</span></td>
-                  <td className="mono model-price">{priceLabel(model, t)}</td>
+                  <td className="mono model-price">{modelPriceSummary(model, t)}</td>
                   <td><TargetChips model={model} translate={t} /></td>
                   <td>{model.ref_count ? t("models.refs", { count: model.ref_count }) : t("models.unreferenced")}</td>
                   <td><ModelActions model={model} translate={t} onDelete={setPendingDelete} /></td>
@@ -137,7 +128,7 @@ export default function Models() {
             {models.map((model) => (
               <article className="card model-card" key={model.name}>
                 <div className="model-card-head"><h2>{model.name}</h2><span className="badge">{model.dispatch === "priority" ? t("models.priority") : t("models.roundRobin")}</span></div>
-                <p className="mono model-price">{priceLabel(model, t)}</p>
+                <p className="mono model-price">{modelPriceSummary(model, t)}</p>
                 <TargetChips model={model} translate={t} />
                 <p className="muted">{model.ref_count ? t("models.refs", { count: model.ref_count }) : t("models.unreferenced")}</p>
                 <ModelActions model={model} translate={t} onDelete={setPendingDelete} />

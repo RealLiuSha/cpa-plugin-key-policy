@@ -1,6 +1,10 @@
+import KeyActionDialog, { type KeyAction } from "../components/KeyActionDialog";
+import QuotaResetDialog from "../components/QuotaResetDialog";
+import { extractApiError } from "../api/error";
+import { keyListReturnPath } from "../navigation";
 import { useEffect, useMemo, useState } from "react";
 import { useLocation, useNavigate, useParams } from "react-router-dom";
-import { deleteKey, listKeys, patchKey, rotateKey } from "../api/keys";
+import { listKeys, patchKey } from "../api/keys";
 import KeyForm, { keyWriteRequestFromForm, type KeyFormValues } from "../components/KeyForm";
 import KeyMoreMenu, { type KeyMoreMenuItem } from "../components/KeyMoreMenu";
 import { MobileFormHeader, MobileTabBar } from "../components/MobileChrome";
@@ -8,7 +12,7 @@ import PlainKeyModal from "../components/PlainKeyModal";
 import { useT } from "../i18n";
 import type { KeyPublic } from "../types";
 
-const EDIT_RESET_ITEMS: KeyMoreMenuItem[] = ["daily", "weekly", "monthly", "rpm"];
+const EDIT_RESET_ITEMS: KeyMoreMenuItem[] = ["rpm"];
 
 interface ReturnedModelState {
   createdModel?: string;
@@ -19,26 +23,33 @@ export default function KeyEdit() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
   const location = useLocation();
+  const backTo = keyListReturnPath(location.state);
   const t = useT();
   const [key, setKey] = useState<KeyPublic | null>(null);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
   const [plain, setPlain] = useState<string | null>(null);
   const [plainTitle, setPlainTitle] = useState("");
+  const [pendingAction, setPendingAction] = useState<KeyAction | null>(null);
+  const [showReset, setShowReset] = useState(false);
 
   useEffect(() => {
+    let alive = true;
     void (async () => {
       setLoading(true);
+      setError("");
       try {
         const all = await listKeys();
+        if (!alive) return;
         const found = all.find((candidate) => candidate.id === decodeURIComponent(id ?? ""));
         if (found) setKey(found); else setError(t("keys.notFound"));
       } catch (reason) {
-        setError((reason as Error).message ?? t("keys.loadFailed"));
+        if (alive) setError(extractApiError(reason, t("keys.loadFailed")));
       } finally {
-        setLoading(false);
+        if (alive) setLoading(false);
       }
     })();
+    return () => { alive = false; };
   }, [id, t]);
 
   const returned = location.state as ReturnedModelState | null;
@@ -55,26 +66,10 @@ export default function KeyEdit() {
   if (loading) return <div className="muted">{t("keys.loading")}</div>;
   if (error || !key || !initial) return <div className="error">{error || t("edit.notFound")}</div>;
 
-  const onRotate = async () => {
-    if (!confirm(t("keys.rotateConfirm", { id: key.id }))) return;
-    try {
-      const response = await rotateKey(key.id);
-      setPlain(response.plain_key);
-      setPlainTitle(t("keys.rotated"));
-    } catch (reason) {
-      alert((reason as Error).message ?? t("keys.rotateFailed"));
-    }
+  const refreshUsage = async () => {
+    const refreshed = (await listKeys()).find((candidate) => candidate.id === key.id);
+    if (refreshed) setKey(refreshed);
   };
-  const onDelete = async () => {
-    if (!confirm(t("keys.deleteConfirm", { id: key.id }))) return;
-    try {
-      await deleteKey(key.id);
-      navigate("/keys");
-    } catch (reason) {
-      alert((reason as Error).message ?? t("keys.deleteFailed"));
-    }
-  };
-  const resetMenuProps = { keyId: key.id, items: EDIT_RESET_ITEMS, summaryLabel: t("keys.reset") };
   const title = t("edit.title", { id: key.id });
 
   return (
@@ -82,28 +77,39 @@ export default function KeyEdit() {
       <div className="fp-head mobile-hidden">
         <h1>{t("edit.hTitle")}</h1>
         <div className="fp-actions">
-          <KeyMoreMenu {...resetMenuProps} />
-          <button className="btn sm" onClick={() => void onRotate()}>{t("keys.resetKey")}</button>
-          <button className="btn sm" onClick={() => navigate("/keys")}>{t("keyForm.cancel")}</button>
+          <button className="btn sm" onClick={() => navigate(backTo)}>{t("keyForm.cancel")}</button>
         </div>
       </div>
       <div className="fp-idline mobile-hidden">{key.id}<span className="fp-name">{key.name}</span></div>
-      <MobileFormHeader title={title} backTo="/keys" />
-      <div className="mobile-only mobile-key-reset"><KeyMoreMenu {...resetMenuProps} /></div>
+      <MobileFormHeader title={title} backTo={backTo} />
+      <div className="key-edit-operations">
+        <button className="btn sm" onClick={() => setShowReset(true)}>{t("quota.resetTitle")}</button>
+        <button className="btn sm" onClick={() => setPendingAction("rotate")}>{t("keys.resetKey")}</button>
+        <KeyMoreMenu keyId={key.id} items={EDIT_RESET_ITEMS} onResetComplete={refreshUsage} />
+      </div>
       <KeyForm
         initial={initial}
         idReadOnly
         showCurrentUsage
         returnPath={`/keys/${encodeURIComponent(key.id)}/edit`}
+        keyListReturnTo={backTo}
         submitLabel={t("edit.save")}
-        onCancel={() => navigate("/keys")}
+        onCancel={() => navigate(backTo)}
         dangerLabel={t("keys.delete")}
-        onDanger={() => void onDelete()}
+        onDanger={() => setPendingAction("delete")}
         onSubmit={async (values) => {
           await patchKey(keyWriteRequestFromForm(values));
-          navigate("/keys");
+          navigate(backTo);
         }}
       />
+      {showReset && <QuotaResetDialog keyId={key.id} onClose={() => setShowReset(false)} onComplete={refreshUsage} />}
+      {pendingAction && <KeyActionDialog keyId={key.id} action={pendingAction} onClose={() => setPendingAction(null)} onComplete={(result) => {
+        if (result) {
+          setKey(result.key);
+          setPlain(result.plain_key);
+          setPlainTitle(t("keys.rotated"));
+        } else navigate(backTo);
+      }} />}
       {plain && <PlainKeyModal plainKey={plain} title={plainTitle} onClose={() => setPlain(null)} />}
       <MobileTabBar active="keys" />
     </div>

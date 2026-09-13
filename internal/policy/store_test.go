@@ -83,9 +83,6 @@ func TestStoreAuthenticateRateLimits(t *testing.T) {
 	if !decision.RateLimited || decision.Allowed {
 		t.Fatalf("decision = %+v, want rate limited", decision)
 	}
-	if decision.RetryAfterSeconds < 1 {
-		t.Fatalf("retry after = %d, want at least 1", decision.RetryAfterSeconds)
-	}
 }
 
 // perCallImageStore builds a store with one per_call-billed image model, used

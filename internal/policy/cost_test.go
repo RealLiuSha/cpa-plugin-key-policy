@@ -184,10 +184,12 @@ func TestRecordUsageBillsFromParsedTokens(t *testing.T) {
 	now := time.Date(2026, 6, 29, 10, 0, 0, 0, time.UTC)
 	store := NewStore()
 	store.SetClock(func() time.Time { return now })
+	model := tokenTestModel("fast", "codex", "gpt-5-codex", 1, 1)
+	model.BillingMultiplier = 1.1
 	if err := store.Configure(Config{
 		Enabled:   true,
 		StateFile: filepath.Join(t.TempDir(), "state.json"),
-		Models:    []ModelDefinition{tokenTestModel("fast", "codex", "gpt-5-codex", 1, 1)},
+		Models:    []ModelDefinition{model},
 		Keys: []KeyConfig{{
 			ID: "streamy", Enabled: true, DailyLimitUSD: 1.00,
 			KeyHash: hashForUsageTest(t, "cpa_stream"),
@@ -202,8 +204,12 @@ func TestRecordUsageBillsFromParsedTokens(t *testing.T) {
 	cost := store.RecordUsage("cpa_stream", "fast", "gpt-5-codex", false, UsageDetail{
 		InputTokens: 1_000_000, OutputTokens: 0, TotalTokens: 1_000_000,
 	})
-	if !nearly(cost, 1.0) {
-		t.Fatalf("cost = %v, want 1.0", cost)
+	if !nearly(cost, 1.1) {
+		t.Fatalf("cost = %v, want 1.1", cost)
+	}
+	_, history, _ := store.UsageHistoryFor("streamy", 1)
+	if len(history) != 1 || history[0].InputTokens != 1_000_000 || !nearly(history[0].TotalUSD, 1.1) {
+		t.Fatalf("multiplier changed tokens or missed history: %+v", history)
 	}
 	d := store.Authenticate("POST", "/v1/chat/completions", hdr, nil, []byte(`{"model":"fast"}`))
 	if d.Allowed || !d.CostLimited || d.Reason != "daily_exceeded" {

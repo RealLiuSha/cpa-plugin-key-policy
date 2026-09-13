@@ -51,9 +51,21 @@ export async function resetRPM(id: string): Promise<void> {
 
 export type UsageResetWindow = "daily" | "weekly" | "monthly";
 
-export async function resetUsage(id: string, window: UsageResetWindow): Promise<void> {
+export interface UsageResetResult {
+  id: string;
+  window: UsageResetWindow;
+  next_accounting_boundary_at: string;
+}
+
+export interface UsageResetExpectation {
+  started_at: string;
+  reset_after_manual_at: string;
+}
+
+export async function resetUsage(id: string, window: UsageResetWindow, expected?: UsageResetExpectation): Promise<UsageResetResult> {
   const c = apiClient();
-  await c.post(pluginPath("/keys/reset-usage"), { id, window });
+  const { data } = await c.post<UsageResetResult>(pluginPath("/keys/reset-usage"), { id, window, ...(expected ? { expected } : {}) });
+  return data;
 }
 
 // fetchKeyUsage returns the per-model usage breakdown for one key.

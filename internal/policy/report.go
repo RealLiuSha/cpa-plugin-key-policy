@@ -154,14 +154,11 @@ func (s *Store) UsageSummaryFor(key KeyConfig) UsageSummary {
 			MonthlyLimitUSD: key.MonthlyLimitUSD, LimitsChangedAt: key.LimitsChangedAt,
 		}
 	}
-	return usage.Summary(key.ID, quotaLimitsForKey(key))
-}
-
-func (s *Store) ResetUsage(id string) {
-	_, usage := s.runtimeComponents()
-	if usage != nil {
-		usage.resetUsage(id)
+	summary := usage.Summary(key.ID, quotaLimitsForKey(key))
+	if !key.Enabled {
+		summary.Status = "disabled"
 	}
+	return summary
 }
 
 func (s *Store) ModelUsageFor(keyID string) (KeyConfig, []ModelUsageEntry, bool) {

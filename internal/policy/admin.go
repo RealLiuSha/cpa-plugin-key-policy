@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-	"time"
 
 	"cpa-key-policy/internal/policy/audit"
 	policyPersist "cpa-key-policy/internal/policy/persist"
@@ -38,7 +37,7 @@ func (s *Store) applyKeyMutation(input KeyConfig, persist bool) (*KeyConfig, Key
 	path, datasetID := s.statePath, s.datasetID
 	s.mu.RUnlock()
 
-	now := time.Now().UTC()
+	now := s.billingNow().UTC()
 	var previous *KeyConfig
 	found := false
 	for i := range keys {
@@ -102,6 +101,10 @@ func (s *Store) applyKeyMutation(input KeyConfig, persist bool) (*KeyConfig, Key
 	s.rebuildKeysByHashLocked()
 	s.clearPendingPicksForKeyLocked(input.ID)
 	s.mu.Unlock()
+	_, ledger := s.runtimeComponents()
+	if ledger != nil {
+		ledger.initializeCycles([]KeyConfig{input}, false)
+	}
 	return previous, input, nil
 }
 
@@ -202,7 +205,7 @@ func (s *Store) DeleteKey(id string) error {
 		limiter.Reset(id)
 	}
 	if usageLedger != nil {
-		usageLedger.resetUsage(id)
+		usageLedger.removeKeyUsage(id)
 	}
 	s.recordAudit(audit.Event{Action: "delete_key", KeyID: id})
 	return nil
@@ -246,7 +249,7 @@ func (s *Store) ResetRPM(id string) error {
 	return nil
 }
 
-func (s *Store) ResetUsageWindow(id string, window UsageResetWindow) (UsageResetResult, error) {
+func (s *Store) ResetUsageWindow(id string, window UsageResetWindow, expected *UsageResetExpectation) (UsageResetResult, error) {
 	s.updateMu.Lock()
 	defer s.updateMu.Unlock()
 	id = strings.TrimSpace(id)
@@ -255,6 +258,9 @@ func (s *Store) ResetUsageWindow(id string, window UsageResetWindow) (UsageReset
 	}
 	if window != UsageResetDaily && window != UsageResetWeekly && window != UsageResetMonthly {
 		return UsageResetResult{}, fmt.Errorf("%w: %q", ErrInvalidUsageResetWindow, window)
+	}
+	if expected != nil && (expected.StartedAt.IsZero() || expected.ResetAfterManualAt.IsZero()) {
+		return UsageResetResult{}, ErrInvalidUsageResetExpectation
 	}
 	s.mu.RLock()
 	_, exists := s.keys[id]
@@ -267,13 +273,19 @@ func (s *Store) ResetUsageWindow(id string, window UsageResetWindow) (UsageReset
 		return UsageResetResult{KeyID: id, Window: window}, nil
 	}
 	s.persistMu.Lock()
-	result, err := usage.resetWindowAndPersist(id, window, func(snapshot map[string]*UsageState) error {
+	result, err := usage.resetWindowAndPersist(id, window, expected, func(snapshot map[string]*UsageState) error {
 		return SaveUsage(policyPersist.UsagePath(path), datasetID, snapshot)
 	})
 	s.persistMu.Unlock()
 	if err != nil {
 		return UsageResetResult{}, fmt.Errorf("persist usage reset: %w", err)
 	}
-	s.recordAudit(audit.Event{Action: "reset_usage", KeyID: id, Changes: map[string]audit.Change{"window": {From: "", To: string(window)}}})
+	s.recordAudit(audit.Event{Action: "reset_usage", KeyID: id, Changes: map[string]audit.Change{
+		"window":        {From: "", To: string(window)},
+		"daily_usd":     {From: result.BeforeDailyUSD, To: result.AfterDailyUSD},
+		"weekly_usd":    {From: result.BeforeWeeklyUSD, To: result.AfterWeeklyUSD},
+		"monthly_usd":   {From: result.BeforeMonthlyUSD, To: result.AfterMonthlyUSD},
+		"next_reset_at": {To: result.NextAccountingBoundaryAt},
+	}})
 	return result, nil
 }

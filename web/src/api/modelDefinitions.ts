@@ -20,6 +20,7 @@ export async function upsertModelDefinition(model: ModelDefinition): Promise<Mod
     dispatch: model.dispatch,
     billing_mode: model.billing_mode,
     free: model.free,
+    billing_multiplier: model.billing_multiplier ?? 1,
     input_price_per_million: model.input_price_per_million,
     output_price_per_million: model.output_price_per_million,
     cache_read_price_per_million: model.cache_read_price_per_million,

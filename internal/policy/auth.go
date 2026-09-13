@@ -7,6 +7,8 @@ import (
 )
 
 func (s *Store) Authenticate(method, path string, headers http.Header, query map[string][]string, body []byte) AuthDecision {
+	s.lifecycleMu.RLock()
+	defer s.lifecycleMu.RUnlock()
 	rawKey := ExtractAPIKey(headers, query)
 	key, enabled := s.findBySecretWhenEnabled(rawKey)
 	if !enabled {
@@ -42,11 +44,10 @@ func (s *Store) Authenticate(method, path string, headers http.Header, query map
 	}
 	limiter, usageLedger := s.runtimeComponents()
 	if limiter != nil {
-		allowed, retryAfter := limiter.AllowWithRetryAfter(key.ID, key.RPM)
+		allowed := limiter.Allow(key.ID, key.RPM)
 		if !allowed {
 			decision.RateLimited = true
 			decision.Reason = "rpm_exceeded"
-			decision.RetryAfterSeconds = retryAfter
 			return decision
 		}
 	}

@@ -156,7 +156,7 @@ func (a *App) authenticate(raw []byte) ([]byte, error) {
 		return OKEnvelope(FrontendAuthResponse{Authenticated: false})
 	}
 	if !decision.Allowed {
-		return OKEnvelope(FrontendAuthResponse{Authenticated: false, Rejection: frontendAuthRejection(decision)})
+		return OKEnvelope(FrontendAuthResponse{Authenticated: false})
 	}
 	meta := map[string]string{
 		"provider":        PluginID,
@@ -179,69 +179,6 @@ func (a *App) authenticate(raw []byte) ([]byte, error) {
 		Principal:     decision.Principal,
 		Metadata:      meta,
 	})
-}
-
-func frontendAuthRejection(decision policy.AuthDecision) *FrontendAuthRejection {
-	switch decision.Reason {
-	case "key_disabled":
-		return &FrontendAuthRejection{
-			Code:         "key_disabled",
-			PolicyReason: "key_disabled",
-			Message:      "API key is disabled",
-			HTTPStatus:   http.StatusForbidden,
-		}
-	case "model_not_allowed":
-		return &FrontendAuthRejection{
-			Code:         "model_not_allowed",
-			PolicyReason: "model_not_allowed",
-			Message:      "Model is not allowed for this API key",
-			HTTPStatus:   http.StatusForbidden,
-		}
-	case "models_endpoint_disabled":
-		return &FrontendAuthRejection{
-			Code:         "models_endpoint_disabled",
-			PolicyReason: "models_endpoint_disabled",
-			Message:      "Model list access is disabled for this API key",
-			HTTPStatus:   http.StatusForbidden,
-		}
-	case "rpm_exceeded":
-		return &FrontendAuthRejection{
-			Code:              "rate_limit_exceeded",
-			PolicyReason:      "rpm_exceeded",
-			Message:           "Rate limit exceeded",
-			HTTPStatus:        http.StatusTooManyRequests,
-			RetryAfterSeconds: decision.RetryAfterSeconds,
-		}
-	case "daily_exceeded", "weekly_exceeded", "monthly_exceeded", "model_daily_exceeded":
-		return &FrontendAuthRejection{
-			Code:         "insufficient_quota",
-			PolicyReason: decision.Reason,
-			Message:      quotaRejectionMessage(decision.Reason),
-			HTTPStatus:   http.StatusTooManyRequests,
-		}
-	default:
-		return &FrontendAuthRejection{
-			Code:         "permission_denied",
-			PolicyReason: decision.Reason,
-			Message:      "Request rejected by key policy",
-			HTTPStatus:   http.StatusForbidden,
-		}
-	}
-}
-
-func quotaRejectionMessage(reason string) string {
-	switch reason {
-	case "daily_exceeded":
-		return "Daily quota exceeded"
-	case "weekly_exceeded":
-		return "Weekly quota exceeded"
-	case "monthly_exceeded":
-		return "Monthly quota exceeded"
-	case "model_daily_exceeded":
-		return "Model daily quota exceeded"
-	default:
-		return "Quota exceeded"
-	}
 }
 
 func (a *App) routeModel(raw []byte) ([]byte, error) {
@@ -868,8 +805,9 @@ func (a *App) resetRPM(id string) ManagementResponse {
 
 func (a *App) resetUsage(body []byte) ManagementResponse {
 	var req struct {
-		ID     string                  `json:"id"`
-		Window policy.UsageResetWindow `json:"window"`
+		ID       string                        `json:"id"`
+		Window   policy.UsageResetWindow       `json:"window"`
+		Expected *policy.UsageResetExpectation `json:"expected,omitempty"`
 	}
 	if err := json.Unmarshal(body, &req); err != nil {
 		return jsonError(http.StatusBadRequest, "invalid_json", err.Error())
@@ -878,13 +816,17 @@ func (a *App) resetUsage(body []byte) ManagementResponse {
 	if req.ID == "" {
 		return jsonError(http.StatusBadRequest, "missing_id", "id is required")
 	}
-	result, err := a.store.ResetUsageWindow(req.ID, req.Window)
+	result, err := a.store.ResetUsageWindow(req.ID, req.Window, req.Expected)
 	if err != nil {
 		switch {
 		case errors.Is(err, policy.ErrUnknownKey):
 			return jsonError(http.StatusNotFound, "not_found", "key not found")
 		case errors.Is(err, policy.ErrInvalidUsageResetWindow):
 			return jsonError(http.StatusBadRequest, "invalid_window", "window must be daily, weekly, or monthly")
+		case errors.Is(err, policy.ErrInvalidUsageResetExpectation):
+			return jsonError(http.StatusBadRequest, "invalid_expectation", err.Error())
+		case errors.Is(err, policy.ErrUsageResetChanged):
+			return jsonError(http.StatusConflict, "quota_changed", "Quota period changed; refresh and confirm the new reset date")
 		default:
 			return jsonError(http.StatusInternalServerError, "reset_failed", err.Error())
 		}
@@ -910,6 +852,7 @@ func (a *App) keyUsage(id string) ManagementResponse {
 		"weekly_limit_usd":  key.WeeklyLimitUSD,
 		"monthly_limit_usd": key.MonthlyLimitUSD,
 		"models":            models,
+		"usage":             a.store.UsageSummaryFor(key),
 	})
 }
 

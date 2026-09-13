@@ -48,20 +48,20 @@ describe("translate", () => {
     expect(translate("keys.more")).toBe("更多");
     expect(translate("keys.reset")).toBe("重置");
     expect(translate("keys.resetRpm")).toBe("重置 RPM");
-    expect(translate("keys.resetKey")).toBe("重置密钥");
+    expect(translate("keys.resetKey")).toBe("更换 Key");
     expect(translate("keys.colAvailableModels")).toBe("可用模型");
     _resetLocale("en");
     expect(translate("keys.more")).toBe("More");
     expect(translate("keys.reset")).toBe("Reset");
     expect(translate("keys.resetRpm")).toBe("Reset RPM");
-    expect(translate("keys.resetKey")).toBe("Reset key");
+    expect(translate("keys.resetKey")).toBe("Replace Key");
     expect(translate("keys.colAvailableModels")).toBe("Available models");
     _resetLocale("zh-TW");
     expect(translate("keys.more")).toBe("更多");
-    expect(translate("keys.resetKey")).toBe("重設金鑰");
+    expect(translate("keys.resetKey")).toBe("更換 Key");
     _resetLocale("ru");
     expect(translate("keys.more")).toBe("Ещё");
-    expect(translate("keys.resetKey")).toBe("Сбросить ключ");
+    expect(translate("keys.resetKey")).toBe("Заменить ключ");
   });
 
   it("provides usage-accounting and audit copy in all four locales", () => {

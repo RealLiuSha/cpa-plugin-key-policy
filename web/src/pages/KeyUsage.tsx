@@ -1,5 +1,7 @@
+import { keyListReturnPath } from "../navigation";
+import QuotaUsage from "../components/QuotaUsage";
 import { useEffect, useState } from "react";
-import { Link, useParams } from "react-router-dom";
+import { Link, useLocation, useParams } from "react-router-dom";
 import { fetchKeyHistory, fetchKeyUsage } from "../api/keys";
 import { extractApiError } from "../api/error";
 import type { KeyHistoryResponse, KeyUsageResponse, ModelUsageEntry, UsageWindow } from "../types";
@@ -7,8 +9,7 @@ import { useT } from "../i18n";
 import { MobileTabBar } from "../components/MobileChrome";
 
 // Window switch for the per-model breakdown table: each model row has its own
-// daily, trailing-7-day and trailing-30-day windows, and the user toggles which
-// one all rows show at once. Mirrors the KeyList natural-day framing.
+// daily, 7-day and 30-day quota periods; the selected period applies to all rows.
 type Window = "daily" | "weekly" | "monthly";
 
 function fmtUsd(n: number): string {
@@ -88,6 +89,7 @@ export function UsageHistoryChart({ history, dailyLimit }: { history: KeyHistory
 
 export default function KeyUsage() {
   const { id } = useParams<{ id: string }>();
+  const backTo = keyListReturnPath(useLocation().state);
   const t = useT();
   const [data, setData] = useState<KeyUsageResponse | null>(null);
   const [error, setError] = useState("");
@@ -159,7 +161,7 @@ export default function KeyUsage() {
       {/* Header: back · key id (mono) · name · three-window toggle */}
       <div className="keyusage-header">
         <div className="keyusage-idline">
-          <Link to="/keys">
+          <Link to={backTo}>
             <button className="btn sm">{t("keyUsage.back")}</button>
           </Link>
           <span className="mono keyusage-id">{data.key_id}</span>
@@ -199,6 +201,7 @@ export default function KeyUsage() {
         </div>
       </div>
 
+      {data.usage && <section className="card quota-detail"><h2>{t("quota.currentPeriods")}</h2><QuotaUsage usage={data.usage} all /></section>}
       <UsageHistoryChart history={history} dailyLimit={data.daily_limit_usd} />
 
       {/* Desktop: hero summary + per-model table. */}

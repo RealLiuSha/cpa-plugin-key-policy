@@ -1,4 +1,4 @@
-# Example CLIProxyAPI snippet for cpa-key-policy v0.5.
+# Example CLIProxyAPI snippet for cpa-key-policy v0.6.
 # Replace placeholders. Never commit real keys or production paths.
 
 plugins:
@@ -24,6 +24,7 @@ plugins:
           dispatch: "round-robin"
           billing_mode: "tokens"
           free: false
+          billing_multiplier: 1
           input_price_per_million: 1
           output_price_per_million: 2
           cache_read_price_per_million: 0.1

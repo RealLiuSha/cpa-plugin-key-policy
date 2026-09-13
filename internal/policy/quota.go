@@ -34,9 +34,8 @@ type UsageResetResult struct {
 	NextAccountingBoundaryAt time.Time        `json:"next_accounting_boundary_at"`
 }
 
-// usageLedger owns the in-memory accounting time series. All persisted
-// counters are natural-day buckets; daily, trailing-7-day and trailing-30-day
-// windows are derived through the same sum path.
+// usageLedger owns quota cycles and retained daily consumption history.
+// Resets only touch cycles; accounting history survives manual and automatic resets.
 type usageLedger struct {
 	mu              sync.Mutex
 	now             func() time.Time
@@ -101,6 +100,7 @@ func cloneUsageState(state *UsageState) *UsageState {
 	clone := &UsageState{
 		Days:    make(map[string]UsageBucket, len(state.Days)),
 		ByModel: make(map[string]map[string]UsageBucket, len(state.ByModel)),
+		Cycles:  cloneUsageCycles(state.Cycles),
 	}
 	for date, bucket := range state.Days {
 		clone.Days[date] = bucket
@@ -184,7 +184,7 @@ func (l *usageLedger) evictExpiredLocked(now time.Time) bool {
 	l.lastEvictedDate = currentDate
 	oldest := l.dateKeyOffset(now, -(usageRetentionDays - 1))
 	changed := false
-	for id, state := range l.entries {
+	for _, state := range l.entries {
 		if state == nil {
 			continue
 		}
@@ -205,9 +205,7 @@ func (l *usageLedger) evictExpiredLocked(now time.Time) bool {
 				delete(state.ByModel, model)
 			}
 		}
-		if len(state.Days) == 0 && len(state.ByModel) == 0 {
-			delete(l.entries, id)
-		}
+
 	}
 	return changed
 }
@@ -216,10 +214,10 @@ func (l *usageLedger) RecordCost(id, model string, amount, cacheCost float64, ca
 	if strings.TrimSpace(id) == "" || strings.TrimSpace(model) == "" {
 		return
 	}
-	now := l.now()
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	state := l.entryLocked(id)
+	now := l.now()
+	state := l.currentEntryLocked(id, now)
 	date := l.dateKey(now)
 	delta := UsageBucket{
 		TotalUSD:         amount,
@@ -230,6 +228,10 @@ func (l *usageLedger) RecordCost(id, model string, amount, cacheCost float64, ca
 		CacheWriteUSD:    cacheWriteCost,
 		InputTokens:      inputTokens,
 		OutputTokens:     outputTokens,
+	}
+	for _, window := range quotaWindows {
+		cycle := state.Cycles.cycle(window)
+		cycle.ByModel[model] = addUsageBucket(cycle.ByModel[model], delta)
 	}
 	state.Days[date] = addUsageBucket(state.Days[date], delta)
 	modelDays := state.ByModel[model]
@@ -243,34 +245,38 @@ func (l *usageLedger) RecordCost(id, model string, amount, cacheCost float64, ca
 }
 
 type UsageSummary struct {
-	DailyUSD                 float64   `json:"daily_usd"`
-	WeeklyUSD                float64   `json:"weekly_usd"`
-	MonthlyUSD               float64   `json:"monthly_usd"`
-	DailyLimitUSD            float64   `json:"daily_limit_usd"`
-	WeeklyLimitUSD           float64   `json:"weekly_limit_usd"`
-	MonthlyLimitUSD          float64   `json:"monthly_limit_usd"`
-	NextAccountingBoundaryAt time.Time `json:"next_accounting_boundary_at"`
-	DailyCacheCostUSD        float64   `json:"daily_cache_cost_usd,omitempty"`
-	WeeklyCacheCostUSD       float64   `json:"weekly_cache_cost_usd,omitempty"`
-	MonthlyCacheCostUSD      float64   `json:"monthly_cache_cost_usd,omitempty"`
-	DailyCacheReadTokens     int64     `json:"daily_cache_read_tokens,omitempty"`
-	WeeklyCacheReadTokens    int64     `json:"weekly_cache_read_tokens,omitempty"`
-	MonthlyCacheReadTokens   int64     `json:"monthly_cache_read_tokens,omitempty"`
-	DailyCacheWriteUSD       float64   `json:"daily_cache_write_usd,omitempty"`
-	WeeklyCacheWriteUSD      float64   `json:"weekly_cache_write_usd,omitempty"`
-	MonthlyCacheWriteUSD     float64   `json:"monthly_cache_write_usd,omitempty"`
-	DailyCacheWriteTokens    int64     `json:"daily_cache_write_tokens,omitempty"`
-	WeeklyCacheWriteTokens   int64     `json:"weekly_cache_write_tokens,omitempty"`
-	MonthlyCacheWriteTokens  int64     `json:"monthly_cache_write_tokens,omitempty"`
-	DailyInputTokens         int64     `json:"daily_input_tokens,omitempty"`
-	WeeklyInputTokens        int64     `json:"weekly_input_tokens,omitempty"`
-	MonthlyInputTokens       int64     `json:"monthly_input_tokens,omitempty"`
-	DailyCallCount           int64     `json:"daily_call_count,omitempty"`
-	WeeklyCallCount          int64     `json:"weekly_call_count,omitempty"`
-	MonthlyCallCount         int64     `json:"monthly_call_count,omitempty"`
-	SoftLimitHit             bool      `json:"soft_limit_hit"`
-	Timezone                 string    `json:"timezone"`
-	LimitsChangedAt          time.Time `json:"limits_changed_at,omitempty"`
+	Cycles                   []QuotaCycleSummary `json:"cycles"`
+	Status                   string              `json:"status"`
+	BlockedReason            string              `json:"blocked_reason,omitempty"`
+	LimitedModels            []string            `json:"limited_models"`
+	DailyUSD                 float64             `json:"daily_usd"`
+	WeeklyUSD                float64             `json:"weekly_usd"`
+	MonthlyUSD               float64             `json:"monthly_usd"`
+	DailyLimitUSD            float64             `json:"daily_limit_usd"`
+	WeeklyLimitUSD           float64             `json:"weekly_limit_usd"`
+	MonthlyLimitUSD          float64             `json:"monthly_limit_usd"`
+	NextAccountingBoundaryAt time.Time           `json:"next_accounting_boundary_at"`
+	DailyCacheCostUSD        float64             `json:"daily_cache_cost_usd,omitempty"`
+	WeeklyCacheCostUSD       float64             `json:"weekly_cache_cost_usd,omitempty"`
+	MonthlyCacheCostUSD      float64             `json:"monthly_cache_cost_usd,omitempty"`
+	DailyCacheReadTokens     int64               `json:"daily_cache_read_tokens,omitempty"`
+	WeeklyCacheReadTokens    int64               `json:"weekly_cache_read_tokens,omitempty"`
+	MonthlyCacheReadTokens   int64               `json:"monthly_cache_read_tokens,omitempty"`
+	DailyCacheWriteUSD       float64             `json:"daily_cache_write_usd,omitempty"`
+	WeeklyCacheWriteUSD      float64             `json:"weekly_cache_write_usd,omitempty"`
+	MonthlyCacheWriteUSD     float64             `json:"monthly_cache_write_usd,omitempty"`
+	DailyCacheWriteTokens    int64               `json:"daily_cache_write_tokens,omitempty"`
+	WeeklyCacheWriteTokens   int64               `json:"weekly_cache_write_tokens,omitempty"`
+	MonthlyCacheWriteTokens  int64               `json:"monthly_cache_write_tokens,omitempty"`
+	DailyInputTokens         int64               `json:"daily_input_tokens,omitempty"`
+	WeeklyInputTokens        int64               `json:"weekly_input_tokens,omitempty"`
+	MonthlyInputTokens       int64               `json:"monthly_input_tokens,omitempty"`
+	DailyCallCount           int64               `json:"daily_call_count,omitempty"`
+	WeeklyCallCount          int64               `json:"weekly_call_count,omitempty"`
+	MonthlyCallCount         int64               `json:"monthly_call_count,omitempty"`
+	SoftLimitHit             bool                `json:"soft_limit_hit"`
+	Timezone                 string              `json:"timezone"`
+	LimitsChangedAt          time.Time           `json:"limits_changed_at,omitempty"`
 }
 
 type modelQuotaLimit struct {
@@ -293,10 +299,10 @@ func (l *usageLedger) windowBucketsLocked(state *UsageState, now time.Time) (Usa
 	if state == nil {
 		return UsageBucket{}, UsageBucket{}, UsageBucket{}
 	}
-	today := l.dateKey(now)
-	return sumBuckets(state.Days, today, today),
-		sumBuckets(state.Days, l.dateKeyOffset(now, -6), today),
-		sumBuckets(state.Days, l.dateKeyOffset(now, -29), today)
+	if l.advanceCyclesLocked(state, now) {
+		l.markDirtyLocked()
+	}
+	return cycleTotal(&state.Cycles.Daily), cycleTotal(&state.Cycles.Weekly), cycleTotal(&state.Cycles.Monthly)
 }
 
 func limitWarning(used, limit float64) bool {
@@ -304,7 +310,8 @@ func limitWarning(used, limit float64) bool {
 }
 
 func (l *usageLedger) summaryLocked(keyID string, limits quotaLimits, now time.Time) UsageSummary {
-	daily, weekly, monthly := l.windowBucketsLocked(l.entries[keyID], now)
+	state := l.currentEntryLocked(keyID, now)
+	daily, weekly, monthly := l.windowBucketsLocked(state, now)
 	summary := UsageSummary{
 		DailyUSD:                 daily.TotalUSD,
 		WeeklyUSD:                weekly.TotalUSD,
@@ -334,24 +341,50 @@ func (l *usageLedger) summaryLocked(keyID string, limits quotaLimits, now time.T
 		Timezone:                 l.timezone,
 		LimitsChangedAt:          limits.LimitsChangedAt,
 	}
-	summary.SoftLimitHit = limitWarning(summary.DailyUSD, limits.DailyUSD) ||
-		limitWarning(summary.WeeklyUSD, limits.WeeklyUSD) ||
-		limitWarning(summary.MonthlyUSD, limits.MonthlyUSD)
-	if state := l.entries[keyID]; state != nil {
-		for _, model := range limits.Models {
-			if limitWarning(modelBucketForDate(state, model.Name, l.dateKey(now)).TotalUSD, model.DailyUSD) {
-				summary.SoftLimitHit = true
-				break
-			}
+	summary.Status = "normal"
+	summary.LimitedModels = []string{}
+	limitsByWindow := []float64{limits.DailyUSD, limits.WeeklyUSD, limits.MonthlyUSD}
+	summary.NextAccountingBoundaryAt = state.Cycles.Daily.ResetsAt
+	for i, window := range quotaWindows {
+		cycle := state.Cycles.cycle(window)
+		used, limit := cycleTotal(cycle).TotalUSD, limitsByWindow[i]
+		summary.Cycles = append(summary.Cycles, QuotaCycleSummary{
+			Window: window, StartedAt: cycle.StartedAt, ResetsAt: cycle.ResetsAt, ResetKind: cycle.ResetKind,
+			UsedUSD: used, LimitUSD: limit, ResetAfterManualAt: l.startOfDay(now).AddDate(0, 0, window.days()),
+		})
+		if limitWarning(used, limit) {
+			summary.SoftLimitHit = true
+		}
+		if limit > 0 && used >= limit && summary.BlockedReason == "" {
+			summary.BlockedReason = string(window) + "_exceeded"
 		}
 	}
+	for _, model := range limits.Models {
+		used := cycleModelBucket(&state.Cycles.Daily, model.Name).TotalUSD
+		if limitWarning(used, model.DailyUSD) {
+			summary.SoftLimitHit = true
+		}
+		if model.DailyUSD > 0 && used >= model.DailyUSD {
+			summary.LimitedModels = append(summary.LimitedModels, model.Name)
+		}
+	}
+	sort.Strings(summary.LimitedModels)
+	switch {
+	case summary.BlockedReason != "":
+		summary.Status = "limited"
+	case len(summary.LimitedModels) > 0:
+		summary.Status = "partial"
+	case summary.SoftLimitHit:
+		summary.Status = "warning"
+	}
+
 	return summary
 }
 
 func (l *usageLedger) Summary(keyID string, limits quotaLimits) UsageSummary {
-	now := l.now()
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	now := l.now()
 	if l.evictExpiredLocked(now) {
 		l.markDirtyLocked()
 	}
@@ -372,41 +405,23 @@ func (l *usageLedger) OverLimit(keyID, requestedModel string, limits quotaLimits
 	if limits.DailyUSD <= 0 && limits.WeeklyUSD <= 0 && limits.MonthlyUSD <= 0 && modelLimit <= 0 {
 		return "", UsageSummary{}
 	}
-	now := l.now()
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	now := l.now()
 	if l.evictExpiredLocked(now) {
 		l.markDirtyLocked()
 	}
 	summary := l.summaryLocked(keyID, limits, now)
-	if limits.DailyUSD > 0 && summary.DailyUSD >= limits.DailyUSD {
-		return "daily_exceeded", summary
+	if summary.BlockedReason != "" {
+		return summary.BlockedReason, summary
 	}
-	if limits.WeeklyUSD > 0 && summary.WeeklyUSD >= limits.WeeklyUSD {
-		return "weekly_exceeded", summary
-	}
-	if limits.MonthlyUSD > 0 && summary.MonthlyUSD >= limits.MonthlyUSD {
-		return "monthly_exceeded", summary
-	}
-	if modelLimit > 0 {
-		if state := l.entries[keyID]; state != nil && modelBucketForDate(state, requestedModel, l.dateKey(now)).TotalUSD >= modelLimit {
-			return "model_daily_exceeded", summary
-		}
+	if modelLimit > 0 && cycleModelBucket(&l.entries[keyID].Cycles.Daily, requestedModel).TotalUSD >= modelLimit {
+		return "model_daily_exceeded", summary
 	}
 	return "", UsageSummary{}
 }
 
-func modelBucketForDate(state *UsageState, model, date string) UsageBucket {
-	var total UsageBucket
-	for name, days := range state.ByModel {
-		if strings.EqualFold(name, model) {
-			total = addUsageBucket(total, sumBuckets(days, date, date))
-		}
-	}
-	return total
-}
-
-func (l *usageLedger) resetUsage(id string) {
+func (l *usageLedger) removeKeyUsage(id string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if _, ok := l.entries[id]; ok {
@@ -415,58 +430,39 @@ func (l *usageLedger) resetUsage(id string) {
 	}
 }
 
-func deleteBucketRange(days map[string]UsageBucket, fromKey, toKey string) {
-	for date := range days {
-		if date >= fromKey && date <= toKey {
-			delete(days, date)
-		}
-	}
-}
-
-// resetWindowLocked applies an in-memory reset. Caller must hold l.mu.
+// resetWindowLocked starts a new quota period without changing history or other periods.
 func (l *usageLedger) resetWindowLocked(id string, window UsageResetWindow, now time.Time) UsageResetResult {
-	state := l.entryLocked(id)
+	state := l.currentEntryLocked(id, now)
 	dailyBefore, weeklyBefore, monthlyBefore := l.windowBucketsLocked(state, now)
-	today := l.dateKey(now)
-	from := today
-	if window == UsageResetWeekly {
-		from = l.dateKeyOffset(now, -6)
-	} else if window == UsageResetMonthly {
-		from = l.dateKeyOffset(now, -29)
-	}
-	deleteBucketRange(state.Days, from, today)
-	for model, days := range state.ByModel {
-		deleteBucketRange(days, from, today)
-		if len(days) == 0 {
-			delete(state.ByModel, model)
-		}
-	}
+	cycle := state.Cycles.cycle(window)
+	*cycle = UsageCycle{StartedAt: now, ResetsAt: l.startOfDay(now).AddDate(0, 0, window.days()), ResetKind: "manual", ByModel: make(map[string]UsageBucket)}
 	l.markDirtyLocked()
 	dailyAfter, weeklyAfter, monthlyAfter := l.windowBucketsLocked(state, now)
-	nextMidnight := l.startOfDay(now).AddDate(0, 0, 1)
 	return UsageResetResult{
-		KeyID:                    id,
-		Window:                   window,
-		BeforeDailyUSD:           dailyBefore.TotalUSD,
-		BeforeWeeklyUSD:          weeklyBefore.TotalUSD,
-		BeforeMonthlyUSD:         monthlyBefore.TotalUSD,
-		AfterDailyUSD:            dailyAfter.TotalUSD,
-		AfterWeeklyUSD:           weeklyAfter.TotalUSD,
-		AfterMonthlyUSD:          monthlyAfter.TotalUSD,
-		NextAccountingBoundaryAt: nextMidnight,
+		KeyID: id, Window: window,
+		BeforeDailyUSD: dailyBefore.TotalUSD, BeforeWeeklyUSD: weeklyBefore.TotalUSD, BeforeMonthlyUSD: monthlyBefore.TotalUSD,
+		AfterDailyUSD: dailyAfter.TotalUSD, AfterWeeklyUSD: weeklyAfter.TotalUSD, AfterMonthlyUSD: monthlyAfter.TotalUSD,
+		NextAccountingBoundaryAt: cycle.ResetsAt,
 	}
 }
 
 // resetWindowAndPersist owns the reset transaction so callers never manipulate
 // ledger internals. The persist callback runs while l.mu is held, establishing
 // a single accounting cut; on failure the exact prior ledger is restored.
-func (l *usageLedger) resetWindowAndPersist(id string, window UsageResetWindow, persist func(map[string]*UsageState) error) (UsageResetResult, error) {
+func (l *usageLedger) resetWindowAndPersist(id string, window UsageResetWindow, expected *UsageResetExpectation, persist func(map[string]*UsageState) error) (UsageResetResult, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	now := l.now()
+	if expected != nil {
+		cycle := l.currentEntryLocked(id, now).Cycles.cycle(window)
+		if !cycle.StartedAt.Equal(expected.StartedAt) || !l.startOfDay(now).AddDate(0, 0, window.days()).Equal(expected.ResetAfterManualAt) {
+			return UsageResetResult{}, ErrUsageResetChanged
+		}
+	}
 	previous, hadPrevious := l.entries[id]
 	previous = cloneUsageState(previous)
 	previousDirty, previousRevision := l.dirty, l.revision
-	result := l.resetWindowLocked(id, window, l.now())
+	result := l.resetWindowLocked(id, window, now)
 	if err := persist(l.snapshotLocked()); err != nil {
 		if hadPrevious {
 			l.entries[id] = previous
@@ -506,9 +502,9 @@ func usageWindowFromBucket(bucket UsageBucket, start time.Time) UsageWindow {
 }
 
 func (l *usageLedger) ModelUsage(keyID string, models []ModelDefinition) []ModelUsageEntry {
-	now := l.now()
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	now := l.now()
 	if l.evictExpiredLocked(now) {
 		l.markDirtyLocked()
 	}
@@ -522,8 +518,16 @@ func (l *usageLedger) ModelUsage(keyID string, models []ModelDefinition) []Model
 			PerCallUSD: model.PerCallUSD, InConfig: true,
 		}
 	}
-	if state := l.entries[keyID]; state != nil {
-		for model, days := range state.ByModel {
+	state := l.currentEntryLocked(keyID, now)
+	for _, window := range quotaWindows {
+		cycle := state.Cycles.cycle(window)
+		names := make([]string, 0, len(cycle.ByModel))
+		for name := range cycle.ByModel {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, model := range names {
+			bucket := cycle.ByModel[model]
 			display := model
 			if configured, ok := canonical[strings.ToLower(model)]; ok {
 				display = configured
@@ -532,13 +536,19 @@ func (l *usageLedger) ModelUsage(keyID string, models []ModelDefinition) []Model
 			if !ok {
 				entry = ModelUsageEntry{Name: display}
 			}
-			today := l.dateKey(now)
-			entry.Daily = addUsageWindow(entry.Daily, usageWindowFromBucket(sumBuckets(days, today, today), l.startOfDay(now)))
-			entry.Weekly = addUsageWindow(entry.Weekly, usageWindowFromBucket(sumBuckets(days, l.dateKeyOffset(now, -6), today), l.startOfDay(now).AddDate(0, 0, -6)))
-			entry.Monthly = addUsageWindow(entry.Monthly, usageWindowFromBucket(sumBuckets(days, l.dateKeyOffset(now, -29), today), l.startOfDay(now).AddDate(0, 0, -29)))
+			usage := usageWindowFromBucket(bucket, cycle.StartedAt)
+			switch window {
+			case UsageResetDaily:
+				entry.Daily = addUsageWindow(entry.Daily, usage)
+			case UsageResetWeekly:
+				entry.Weekly = addUsageWindow(entry.Weekly, usage)
+			case UsageResetMonthly:
+				entry.Monthly = addUsageWindow(entry.Monthly, usage)
+			}
 			byModel[display] = entry
 		}
 	}
+
 	result := make([]ModelUsageEntry, 0, len(byModel))
 	for _, entry := range byModel {
 		result = append(result, entry)
@@ -575,9 +585,9 @@ func (l *usageLedger) History(keyID string, count int) []UsageHistoryDay {
 	if count > usageRetentionDays {
 		count = usageRetentionDays
 	}
-	now := l.now()
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	now := l.now()
 	if l.evictExpiredLocked(now) {
 		l.markDirtyLocked()
 	}
@@ -621,6 +631,11 @@ func (l *usageLedger) snapshotForFlush() (map[string]*UsageState, uint64, bool) 
 	defer l.mu.Unlock()
 	if l.evictExpiredLocked(l.now()) {
 		l.markDirtyLocked()
+	}
+	for _, state := range l.entries {
+		if l.advanceCyclesLocked(state, l.now()) {
+			l.markDirtyLocked()
+		}
 	}
 	if !l.dirty {
 		return nil, l.revision, false

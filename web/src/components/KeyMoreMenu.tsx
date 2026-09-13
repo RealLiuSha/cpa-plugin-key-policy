@@ -1,10 +1,15 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { CSSProperties } from "react";
-import { deleteKey, resetRPM, resetUsage, rotateKey } from "../api/keys";
+import { resetRPM } from "../api/keys";
 import { useT } from "../i18n";
+import { Link } from "react-router-dom";
+import KeyActionDialog, { type KeyAction } from "./KeyActionDialog";
+import QuotaResetDialog from "./QuotaResetDialog";
+import { extractApiError } from "../api/error";
+import type { QuotaWindow } from "../types";
 
 /** Menu actions the more-menu can expose; order is caller-controlled via `items`. */
-export type KeyMoreMenuItem = "daily" | "weekly" | "monthly" | "rpm" | "rotate" | "delete";
+export type KeyMoreMenuItem = "edit" | "daily" | "weekly" | "monthly" | "rpm" | "rotate" | "delete";
 
 const DEFAULT_LIST_ITEMS: KeyMoreMenuItem[] = [
   "daily",
@@ -16,6 +21,7 @@ const DEFAULT_LIST_ITEMS: KeyMoreMenuItem[] = [
 ];
 
 const LABEL_KEY: Record<KeyMoreMenuItem, string> = {
+  edit: "keys.edit",
   daily: "keys.resetDaily",
   weekly: "keys.resetWeekly",
   monthly: "keys.resetMonthly",
@@ -30,15 +36,15 @@ const VIEW_PAD = 8;
 const GAP = 6;
 
 /**
- * Configurable "more" dropdown for key ops. List pages use the full five-item
- * set; edit pages pass a shorter `items` array for reset-only actions. API
- * calls live here so callers only wire completion callbacks.
+ * Configurable key operations. Mutation dialogs own request and error state;
+ * callers refresh their view after a completed operation.
  *
  * The panel is position:fixed while open so it is not trapped by card stacking
  * contexts, table overflow, or the fixed tab bar.
  */
 export default function KeyMoreMenu({
   keyId,
+  keyListReturnTo,
   items = DEFAULT_LIST_ITEMS,
   summaryLabel,
   onResetComplete,
@@ -47,6 +53,7 @@ export default function KeyMoreMenu({
   onOpenChange,
 }: {
   keyId: string;
+  keyListReturnTo?: string;
   items?: KeyMoreMenuItem[];
   /** Defaults to keys.more; edit page passes keys.reset. */
   summaryLabel?: string;
@@ -59,6 +66,10 @@ export default function KeyMoreMenu({
   const menuRef = useRef<HTMLDetailsElement>(null);
   const panelRef = useRef<HTMLDivElement>(null);
   const [open, setOpen] = useState(false);
+  const [quotaWindow, setQuotaWindow] = useState<QuotaWindow | null>(null);
+  const [pending, setPending] = useState<KeyAction | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
   const [panelStyle, setPanelStyle] = useState<CSSProperties | undefined>();
 
   const updateOpen = useCallback(
@@ -160,49 +171,40 @@ export default function KeyMoreMenu({
     };
   }, [closeMenu, open, placePanel]);
 
-  const runItem = async (kind: KeyMoreMenuItem) => {
-    closeMenu();
-    if (kind === "daily" && !confirm(t("keys.resetDailyConfirm", { id: keyId }))) return;
-    if (kind === "weekly" && !confirm(t("keys.resetWeeklyConfirm", { id: keyId }))) return;
-    if (kind === "monthly" && !confirm(t("keys.resetMonthlyConfirm", { id: keyId }))) return;
-    if (kind === "rotate" && !confirm(t("keys.rotateConfirm", { id: keyId }))) return;
-    if (kind === "delete" && !confirm(t("keys.deleteConfirm", { id: keyId }))) return;
-
+  const refreshAfterAction = async (deleted = false) => {
     try {
-      if (kind === "rpm") {
-        await resetRPM(keyId);
-        await onResetComplete?.();
-        return;
-      }
-      if (kind === "daily" || kind === "weekly" || kind === "monthly") {
-        await resetUsage(keyId, kind);
-        await onResetComplete?.();
-        return;
-      }
-      if (kind === "rotate") {
-        const r = await rotateKey(keyId);
-        onRotated?.(r.plain_key);
-        await onResetComplete?.();
-        return;
-      }
-      if (kind === "delete") {
-        await deleteKey(keyId);
-        await onDeleted?.();
-      }
-    } catch (e) {
-      const fallback =
-        kind === "rotate"
-          ? t("keys.rotateFailed")
-          : kind === "delete"
-            ? t("keys.deleteFailed")
-            : t("keys.resetFailed");
-      alert((e as Error).message ?? fallback);
+      if (deleted) await onDeleted?.();
+      else await onResetComplete?.();
+    } catch {
+      setError(t("quota.actionRefreshFailed"));
     }
+  };
+  const resetRateLimit = async () => {
+    if (busy) return;
+    setBusy(true);
+    setError("");
+    try {
+      await resetRPM(keyId);
+    } catch (reason) {
+      setError(extractApiError(reason, t("keys.resetFailed")));
+      setBusy(false);
+      return;
+    }
+    await refreshAfterAction();
+    setBusy(false);
+  };
+  const runItem = (kind: KeyMoreMenuItem) => {
+    closeMenu();
+    setError("");
+    if (kind === "daily" || kind === "weekly" || kind === "monthly") { setQuotaWindow(kind); return; }
+    if (kind === "rotate" || kind === "delete") { setPending(kind); return; }
+    if (kind === "rpm") void resetRateLimit();
   };
 
   const summary = summaryLabel ?? t("keys.more");
 
   return (
+    <>
     <details
       ref={menuRef}
       className={"more-menu" + (open ? " more-menu--open" : "")}
@@ -218,18 +220,26 @@ export default function KeyMoreMenu({
         role="menu"
         style={panelStyle}
       >
-        {items.map((kind) => (
+        {items.map((kind) => kind === "edit" ? <Link role="menuitem" key={kind} to={`/keys/${encodeURIComponent(keyId)}/edit`} state={{ keyListReturnTo }} onClick={closeMenu}>{t("keys.edit")}</Link> : (
           <button
             key={kind}
+            disabled={busy}
             type="button"
             role="menuitem"
             className={kind === "delete" ? "danger" : undefined}
-            onClick={() => void runItem(kind)}
+            onClick={() => runItem(kind)}
           >
             {t(LABEL_KEY[kind])}
           </button>
         ))}
       </div>
     </details>
+    {quotaWindow && <QuotaResetDialog keyId={keyId} initialWindow={quotaWindow} onClose={() => setQuotaWindow(null)} onComplete={async () => { await onResetComplete?.(); }} />}
+    {pending && <KeyActionDialog keyId={keyId} action={pending} onClose={() => setPending(null)} onComplete={(result) => {
+      if (result) onRotated?.(result.plain_key);
+      void refreshAfterAction(result === null);
+    }} />}
+    {error && !pending && <span className="error" role="alert">{error}</span>}
+    </>
   );
 }

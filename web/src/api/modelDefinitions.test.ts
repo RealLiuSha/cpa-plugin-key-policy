@@ -70,6 +70,7 @@ describe("model definition management APIs", () => {
       ref_keys: ["k1", "k2"],
     });
     expect(client.post).toHaveBeenCalledWith("/plugin/models", {
+      billing_multiplier: 1,
       name: "fast",
       targets: [{ provider: "codex", target_model: "gpt" }],
       dispatch: "round-robin",

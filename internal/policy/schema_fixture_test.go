@@ -118,7 +118,7 @@ func TestSchemaV4Fixtures(t *testing.T) {
 	assertJSONFields(t, managementRaw, []string{"key_usage", "keys", "models"})
 }
 
-func TestV3StateLoadsAndSubsequentWriteUpgradesToV4(t *testing.T) {
+func TestV3StateMigratesToV5BeforeServing(t *testing.T) {
 	directory := t.TempDir()
 	statePath := filepath.Join(directory, "state.json")
 	usagePath := persist.UsagePath(statePath)
@@ -136,8 +136,8 @@ func TestV3StateLoadsAndSubsequentWriteUpgradesToV4(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if loadedState.Version != 3 || loadedState.Models[0].CacheWritePricePerMillion != nil {
-		t.Fatalf("configure must not rewrite v3 until a later write: %+v", loadedState)
+	if loadedState.Version != currentStateFileVersion || loadedState.Models[0].CacheWritePricePerMillion != nil {
+		t.Fatalf("configure must migrate v3 before publishing: %+v", loadedState)
 	}
 	model := loadedState.Models[0]
 	model.CacheWritePricePerMillion = fptr(0.3)
@@ -155,8 +155,8 @@ func TestV3StateLoadsAndSubsequentWriteUpgradesToV4(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if usage.Version != 3 {
-		t.Fatalf("usage version = %d, want still 3 until a usage write", usage.Version)
+	if usage.Version != currentUsageFileVersion {
+		t.Fatalf("usage version = %d, want current after migration", usage.Version)
 	}
 	if usage.Usage["team-a"].Days["2026-08-08"].CacheWriteTokens != 0 {
 		t.Fatal("v3 history invented cache-write tokens")

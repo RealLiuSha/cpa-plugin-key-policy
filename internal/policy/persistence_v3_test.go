@@ -58,7 +58,7 @@ func TestFirstBootPersistsGeneratedKeyTimestampsAcrossRestart(t *testing.T) {
 }
 
 func TestRuntimeRejectsUnsupportedVersions(t *testing.T) {
-	for name, version := range map[string]int{"below-current": 2, "future": 5} {
+	for name, version := range map[string]int{"below-current": 2, "future": 6} {
 		t.Run(name, func(t *testing.T) {
 			directory := t.TempDir()
 			statePath := filepath.Join(directory, "state.json")
@@ -77,7 +77,7 @@ func TestRuntimeRejectsUnsupportedVersions(t *testing.T) {
 			if usageErr == nil {
 				t.Fatal("unsupported usage version was accepted")
 			}
-			if !strings.Contains(stateErr.Error(), "require version 3 or 4") || !strings.Contains(usageErr.Error(), "require version 3 or 4") {
+			if !strings.Contains(stateErr.Error(), "require version 3 through 5") || !strings.Contains(usageErr.Error(), "require version 3 through 5") {
 				t.Fatalf("version errors: state=%v usage=%v", stateErr, usageErr)
 			}
 		})
@@ -106,7 +106,7 @@ func TestConfigureRejectsDatasetMismatchAndMissingPair(t *testing.T) {
 	if err := os.WriteFile(usagePath, []byte(`{"version":2,"usage":{},"updated_at":"2026-08-08T00:00:00Z"}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.Configure(Config{Enabled: true, StateFile: path}); err == nil || !strings.Contains(err.Error(), "require version 3 or 4") {
+	if err := store.Configure(Config{Enabled: true, StateFile: path}); err == nil || !strings.Contains(err.Error(), "require version 3 through 5") {
 		t.Fatalf("mixed-version pair error = %v", err)
 	}
 }
@@ -120,6 +120,7 @@ func TestUsageSaveWritesRealUpdatedAtAndPreservesInvariant(t *testing.T) {
 		},
 	}
 	before := time.Now().UTC()
+	usage["k"].Cycles = newUsageLedger(nil).newCycles(usage["k"], before, "initial")
 	if err := SaveUsage(path, "dataset", usage); err != nil {
 		t.Fatal(err)
 	}

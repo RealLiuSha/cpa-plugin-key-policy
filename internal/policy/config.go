@@ -67,6 +67,7 @@ type UsageBucket struct {
 type UsageState struct {
 	Days    map[string]UsageBucket            `json:"days"`
 	ByModel map[string]map[string]UsageBucket `json:"by_model,omitempty"`
+	Cycles  *UsageCycles                      `json:"cycles,omitempty"`
 }
 
 type UsageWindow struct {

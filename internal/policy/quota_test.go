@@ -19,7 +19,7 @@ func mustShanghai(t *testing.T) *time.Location {
 	return loc
 }
 
-func TestDailyNeverExceedsWeekly(t *testing.T) {
+func TestDailyBoundaryPreservesLongerCycles(t *testing.T) {
 	loc := mustShanghai(t)
 	now := time.Date(2026, 8, 7, 23, 30, 0, 0, loc)
 	ledger := newUsageLedgerWithLocation(func() time.Time { return now }, loc, "Asia/Shanghai")
@@ -60,7 +60,7 @@ func TestBucketBoundaryIndependentOfFirstRecord(t *testing.T) {
 	}
 }
 
-func TestWeeklyRollsOneDayAtATime(t *testing.T) {
+func TestWeeklyResetsAtItsFixedBoundary(t *testing.T) {
 	loc := mustShanghai(t)
 	now := time.Date(2026, 8, 1, 12, 0, 0, 0, loc)
 	ledger := newUsageLedgerWithLocation(func() time.Time { return now }, loc, "Asia/Shanghai")
@@ -72,8 +72,8 @@ func TestWeeklyRollsOneDayAtATime(t *testing.T) {
 	}
 
 	summary := ledger.Summary(key.ID, quotaLimitsForKey(key))
-	if !nearly(summary.DailyUSD, 1) || !nearly(summary.WeeklyUSD, 7) || !nearly(summary.MonthlyUSD, 8) {
-		t.Fatalf("rolling windows = %+v, want daily=1 weekly=7 monthly=8", summary)
+	if !nearly(summary.DailyUSD, 1) || !nearly(summary.WeeklyUSD, 1) || !nearly(summary.MonthlyUSD, 8) {
+		t.Fatalf("fixed windows = %+v, want daily=1 weekly=1 monthly=8", summary)
 	}
 }
 
@@ -120,10 +120,10 @@ func TestModelWindowsMatchKeyWindows(t *testing.T) {
 		!nearly(row.Monthly.TotalUSD, summary.MonthlyUSD) {
 		t.Fatalf("model windows = %+v, key summary = %+v", row, summary)
 	}
-	if !nearly(row.Daily.TotalUSD, 1) || !nearly(row.Weekly.TotalUSD, 7) || !nearly(row.Monthly.TotalUSD, 30) {
-		t.Fatalf("model rolling totals = %+v", row)
+	if !nearly(row.Daily.TotalUSD, 1) || !nearly(row.Weekly.TotalUSD, 3) || !nearly(row.Monthly.TotalUSD, 1) {
+		t.Fatalf("model fixed-cycle totals = %+v", row)
 	}
-	if row.Monthly.CallCount != 30 || row.Monthly.CacheReadTokens != 60 || !nearly(row.Monthly.CacheCostUSD, 7.5) || row.Monthly.InputTokens != 90 || row.Monthly.OutputTokens != 120 {
+	if row.Monthly.CallCount != 1 || row.Monthly.CacheReadTokens != 2 || !nearly(row.Monthly.CacheCostUSD, 0.25) || row.Monthly.InputTokens != 3 || row.Monthly.OutputTokens != 4 {
 		t.Fatalf("model monthly counters = %+v", row.Monthly)
 	}
 }

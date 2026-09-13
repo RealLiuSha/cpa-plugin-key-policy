@@ -290,7 +290,7 @@ func TestResetUsageWindowDailyAndWeekly(t *testing.T) {
 	_ = store.RecordUsage("resettable", "fast", "gpt-5", false, UsageDetail{
 		InputTokens: 300_000,
 	})
-	dailyResult, err := store.ResetUsageWindow("resettable", UsageResetDaily)
+	dailyResult, err := store.ResetUsageWindow("resettable", UsageResetDaily, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -298,47 +298,51 @@ func TestResetUsageWindowDailyAndWeekly(t *testing.T) {
 		t.Fatalf("daily reset before = %+v, want 0.30/0.30", dailyResult)
 	}
 	summary := store.UsageSummaryFor(store.Keys()[0])
-	if !nearly(summary.DailyUSD, 0) || !nearly(summary.WeeklyUSD, 0) {
-		t.Fatalf("after daily reset = %+v, want daily 0 / weekly 0", summary)
+	if !nearly(summary.DailyUSD, 0) || !nearly(summary.WeeklyUSD, 0.30) {
+		t.Fatalf("after daily reset = %+v, want only the selected quota cleared", summary)
 	}
 	_, models, ok := store.ModelUsageFor("resettable")
-	if !ok || len(models) != 1 || !nearly(models[0].Daily.TotalUSD, 0) || !nearly(models[0].Weekly.TotalUSD, 0) {
-		t.Fatalf("model after daily reset = %+v, want daily 0 / weekly 0", models)
+	if !ok || len(models) != 1 || !nearly(models[0].Daily.TotalUSD, 0) || !nearly(models[0].Weekly.TotalUSD, 0.30) {
+		t.Fatalf("model after daily reset = %+v, want only the selected quota cleared", models)
 	}
 
 	_ = store.RecordUsage("resettable", "fast", "gpt-5", false, UsageDetail{
 		InputTokens: 200_000,
 	})
-	weeklyResult, err := store.ResetUsageWindow("resettable", UsageResetWeekly)
+	weeklyResult, err := store.ResetUsageWindow("resettable", UsageResetWeekly, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !nearly(weeklyResult.BeforeDailyUSD, 0.20) || !nearly(weeklyResult.BeforeWeeklyUSD, 0.20) {
-		t.Fatalf("weekly reset before = %+v, want 0.20/0.20", weeklyResult)
+	if !nearly(weeklyResult.BeforeDailyUSD, 0.20) || !nearly(weeklyResult.BeforeWeeklyUSD, 0.50) {
+		t.Fatalf("weekly reset before = %+v, want 0.20/0.50", weeklyResult)
 	}
 	summary = store.UsageSummaryFor(store.Keys()[0])
-	if !nearly(summary.DailyUSD, 0) || !nearly(summary.WeeklyUSD, 0) {
-		t.Fatalf("after weekly reset = %+v, want daily 0 / weekly 0", summary)
+	if !nearly(summary.DailyUSD, 0.20) || !nearly(summary.WeeklyUSD, 0) {
+		t.Fatalf("after weekly reset = %+v, want only the selected quota cleared", summary)
 	}
 	_, models, _ = store.ModelUsageFor("resettable")
-	if len(models) != 1 || !nearly(models[0].Daily.TotalUSD, 0) || !nearly(models[0].Weekly.TotalUSD, 0) {
-		t.Fatalf("model after weekly reset = %+v, want daily 0 / weekly 0", models)
+	if len(models) != 1 || !nearly(models[0].Daily.TotalUSD, 0.20) || !nearly(models[0].Weekly.TotalUSD, 0) {
+		t.Fatalf("model after weekly reset = %+v, want only the selected quota cleared", models)
 	}
 
+	_, history, _ := store.UsageHistoryFor("resettable", 1)
+	if len(history) != 1 || !nearly(history[0].TotalUSD, 0.50) {
+		t.Fatalf("reset removed history: %+v", history)
+	}
 	reloaded := NewStore()
 	reloaded.SetClock(func() time.Time { return now })
 	if err := reloaded.Configure(Config{Enabled: true, StateFile: statePath}); err != nil {
 		t.Fatal(err)
 	}
 	reloadedSummary := reloaded.UsageSummaryFor(reloaded.Keys()[0])
-	if !nearly(reloadedSummary.DailyUSD, 0) || !nearly(reloadedSummary.WeeklyUSD, 0) {
-		t.Fatalf("persisted reset after reload = %+v, want 0/0", reloadedSummary)
+	if !nearly(reloadedSummary.DailyUSD, 0.20) || !nearly(reloadedSummary.WeeklyUSD, 0) {
+		t.Fatalf("persisted reset after reload = %+v, want daily 0.20 / weekly 0", reloadedSummary)
 	}
 }
 
-func TestResetUsageWindowMonthlyClearsThirtyDays(t *testing.T) {
+func TestResetUsageWindowMonthlyPreservesOtherCycles(t *testing.T) {
 	loc := mustShanghai(t)
-	now := time.Date(2026, 8, 8, 12, 0, 0, 0, loc)
+	now := time.Date(2026, 7, 19, 12, 0, 0, 0, loc)
 	statePath := filepath.Join(t.TempDir(), "state.json")
 	store := NewStore()
 	store.SetClock(func() time.Time { return now })
@@ -353,21 +357,20 @@ func TestResetUsageWindowMonthlyClearsThirtyDays(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	now = now.AddDate(0, 0, -20)
 	_ = store.RecordUsage("monthly-reset", "fast", "gpt-5", false, UsageDetail{InputTokens: 2_000_000})
 	now = now.AddDate(0, 0, 20)
 	_ = store.RecordUsage("monthly-reset", "fast", "gpt-5", false, UsageDetail{InputTokens: 1_000_000})
 
-	result, err := store.ResetUsageWindow("monthly-reset", UsageResetMonthly)
+	result, err := store.ResetUsageWindow("monthly-reset", UsageResetMonthly, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !nearly(result.BeforeDailyUSD, 1) || !nearly(result.BeforeWeeklyUSD, 1) || !nearly(result.BeforeMonthlyUSD, 3) ||
-		!nearly(result.AfterDailyUSD, 0) || !nearly(result.AfterWeeklyUSD, 0) || !nearly(result.AfterMonthlyUSD, 0) {
+		!nearly(result.AfterDailyUSD, 1) || !nearly(result.AfterWeeklyUSD, 1) || !nearly(result.AfterMonthlyUSD, 0) {
 		t.Fatalf("monthly reset result = %+v", result)
 	}
 	summary := store.UsageSummaryFor(store.Keys()[0])
-	if !nearly(summary.DailyUSD, 0) || !nearly(summary.WeeklyUSD, 0) || !nearly(summary.MonthlyUSD, 0) {
+	if !nearly(summary.DailyUSD, 1) || !nearly(summary.WeeklyUSD, 1) || !nearly(summary.MonthlyUSD, 0) {
 		t.Fatalf("monthly reset summary = %+v", summary)
 	}
 	_, models, ok := store.ModelUsageFor("monthly-reset")
@@ -378,10 +381,10 @@ func TestResetUsageWindowMonthlyClearsThirtyDays(t *testing.T) {
 
 func TestResetUsageWindowRejectsInvalidInput(t *testing.T) {
 	store, _ := newClockedStore(t, time.Date(2026, 8, 2, 1, 30, 0, 0, time.UTC))
-	if _, err := store.ResetUsageWindow("missing", UsageResetDaily); !errors.Is(err, ErrUnknownKey) {
+	if _, err := store.ResetUsageWindow("missing", UsageResetDaily, nil); !errors.Is(err, ErrUnknownKey) {
 		t.Fatalf("unknown key error = %v, want ErrUnknownKey", err)
 	}
-	if _, err := store.ResetUsageWindow("team-a", UsageResetWindow("year")); err == nil {
+	if _, err := store.ResetUsageWindow("team-a", UsageResetWindow("year"), nil); err == nil {
 		t.Fatal("invalid reset window should fail")
 	}
 }
@@ -418,7 +421,7 @@ func TestResetUsageWindowRollsBackWhenPersistenceFails(t *testing.T) {
 	if err := os.Mkdir(usagePath, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.ResetUsageWindow("resettable", UsageResetWeekly); err == nil {
+	if _, err := store.ResetUsageWindow("resettable", UsageResetWeekly, nil); err == nil {
 		t.Fatal("reset should fail when the usage file cannot be replaced")
 	}
 
@@ -991,6 +994,7 @@ func TestModelUsageCaseCanonicalReadOnlyMerge(t *testing.T) {
 		},
 	}
 	usagePath := filepath.Join(filepath.Dir(statePath), "cpa-key-policy-usage.json")
+	usageState.Cycles = newUsageLedger(nil).newCycles(usageState, now, "migration")
 	if err := SaveUsage(usagePath, datasetID, map[string]*UsageState{"team-sol": usageState}); err != nil {
 		t.Fatal(err)
 	}
@@ -1125,5 +1129,40 @@ func TestCallCountIncrementedTokenMode(t *testing.T) {
 	s := store.UsageSummaryFor(store.Keys()[0])
 	if s.DailyCallCount != 2 {
 		t.Fatalf("token-mode daily call count = %d, want 2", s.DailyCallCount)
+	}
+}
+
+func TestQuotaResetRejectsStalePreview(t *testing.T) {
+	for _, scenario := range []string{"date_changed", "already_reset", "current"} {
+		t.Run(scenario, func(t *testing.T) {
+			now := time.Date(2026, 9, 12, 23, 59, 0, 0, mustShanghai(t))
+			ledger := newUsageLedgerWithLocation(func() time.Time { return now }, mustShanghai(t), "Asia/Shanghai")
+			ledger.RecordCost("key", "model", 5, 0, 0, 0, 0, 100, 0, 1)
+			cycle := ledger.Summary("key", quotaLimits{WeeklyUSD: 10}).Cycles[1]
+			expected := &UsageResetExpectation{StartedAt: cycle.StartedAt, ResetAfterManualAt: cycle.ResetAfterManualAt}
+			if scenario == "date_changed" {
+				now = now.Add(2 * time.Minute)
+			}
+			if scenario == "already_reset" {
+				now = now.Add(time.Second)
+				if _, err := ledger.resetWindowAndPersist("key", UsageResetWeekly, nil, func(map[string]*UsageState) error { return nil }); err != nil {
+					t.Fatal(err)
+				}
+				ledger.RecordCost("key", "model", 2, 0, 0, 0, 0, 20, 0, 1)
+			}
+			before := ledger.Summary("key", quotaLimits{WeeklyUSD: 10})
+			persisted := false
+			_, err := ledger.resetWindowAndPersist("key", UsageResetWeekly, expected, func(map[string]*UsageState) error { persisted = true; return nil })
+			after := ledger.Summary("key", quotaLimits{WeeklyUSD: 10})
+			if scenario == "current" {
+				if err != nil || !persisted || after.WeeklyUSD != 0 {
+					t.Fatalf("current preview failed: %v %+v", err, after)
+				}
+				return
+			}
+			if !errors.Is(err, ErrUsageResetChanged) || persisted || after.WeeklyUSD != before.WeeklyUSD {
+				t.Fatalf("stale preview reset quota: %v persisted=%v before=%+v after=%+v", err, persisted, before, after)
+			}
+		})
 	}
 }

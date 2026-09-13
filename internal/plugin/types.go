@@ -51,7 +51,7 @@ const (
 const (
 	PluginID   = "cpa-key-policy"
 	PluginName = "cpa-key-policy"
-	Version    = "0.5.1"
+	Version    = "0.6.0"
 )
 
 type Envelope struct {
@@ -117,18 +117,9 @@ type FrontendAuthRequest struct {
 }
 
 type FrontendAuthResponse struct {
-	Authenticated bool                   `json:"Authenticated"`
-	Principal     string                 `json:"Principal,omitempty"`
-	Metadata      map[string]string      `json:"Metadata,omitempty"`
-	Rejection     *FrontendAuthRejection `json:"Rejection,omitempty"`
-}
-
-type FrontendAuthRejection struct {
-	Code              string `json:"code"`
-	PolicyReason      string `json:"policy_reason,omitempty"`
-	Message           string `json:"message"`
-	HTTPStatus        int    `json:"http_status"`
-	RetryAfterSeconds int    `json:"retry_after_seconds,omitempty"`
+	Authenticated bool              `json:"Authenticated"`
+	Principal     string            `json:"Principal,omitempty"`
+	Metadata      map[string]string `json:"Metadata,omitempty"`
 }
 
 type ModelRouteRequest struct {

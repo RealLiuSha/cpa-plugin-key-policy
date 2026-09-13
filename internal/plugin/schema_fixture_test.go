@@ -42,7 +42,7 @@ func TestManagementSchemaV3FixtureLoadsWithoutInventingCacheWrite(t *testing.T) 
 	}
 }
 
-func TestManagementSchemaV4FixtureMatchesRuntimeResponses(t *testing.T) {
+func TestManagementMigratesV4ToV5RuntimeResponses(t *testing.T) {
 	fixtureDir := filepath.Join("..", "policy", "testdata", "schema-v4")
 	stateRaw, err := os.ReadFile(filepath.Join(fixtureDir, "state.json"))
 	if err != nil {
@@ -96,7 +96,7 @@ func TestManagementSchemaV4FixtureMatchesRuntimeResponses(t *testing.T) {
 		"models":    modelsEnvelope["models"],
 		"key_usage": keyUsage,
 	}
-	wantRaw, err := os.ReadFile(filepath.Join(fixtureDir, "management.json"))
+	wantRaw, err := os.ReadFile(filepath.Join("..", "policy", "testdata", "schema-v5", "management.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -106,6 +106,6 @@ func TestManagementSchemaV4FixtureMatchesRuntimeResponses(t *testing.T) {
 	}
 	if !reflect.DeepEqual(actual, want) {
 		actualRaw, _ := json.MarshalIndent(actual, "", "  ")
-		t.Fatalf("management v4 fixture drifted; actual response composite:\n%s", actualRaw)
+		t.Fatalf("management v5 fixture drifted; actual response composite:\n%s", actualRaw)
 	}
 }

@@ -1,3 +1,4 @@
+import { modelPriceSummary } from "./modelPricing";
 import { useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import type { KeyModelRef, KeyPublic, KeyWriteRequest, ModelDefinition } from "../types";
@@ -39,6 +40,7 @@ interface Props {
   onCancel: () => void;
   error?: string;
   returnPath?: string;
+  keyListReturnTo?: string;
   showCurrentUsage?: boolean;
   dangerLabel?: string;
   onDanger?: () => void;
@@ -49,16 +51,6 @@ function parseNumber(value: string): number {
   return Number.isFinite(parsed) ? parsed : 0;
 }
 
-function priceSummary(model: ModelDefinition, translate: (key: string, variables?: Record<string, string | number>) => string): string {
-  if (model.free) return translate("models.free");
-  if (model.billing_mode === "per_call") return translate("models.pricePerCallSummary", { price: model.per_call_usd ?? 0 });
-  return translate("models.priceTokenSummary", {
-    input: model.input_price_per_million ?? 0,
-    output: model.output_price_per_million ?? 0,
-    cache: model.cache_read_price_per_million ?? 0,
-    write: model.cache_write_price_per_million ?? 0,
-  });
-}
 
 export default function KeyForm({
   initial,
@@ -68,6 +60,7 @@ export default function KeyForm({
   onCancel,
   error,
   returnPath,
+  keyListReturnTo,
   showCurrentUsage = false,
   dangerLabel,
   onDanger,
@@ -168,6 +161,7 @@ export default function KeyForm({
       state: {
         returnTo: returnPath ?? window.location.pathname,
         draftKey: currentValues(),
+        keyListReturnTo,
       },
     });
   };
@@ -262,7 +256,7 @@ export default function KeyForm({
                 <div className={"model-definition-row" + (ref ? " active" : "")} key={model.name}>
                   <label className="model-definition-main">
                     <input type="checkbox" checked={!!ref} onChange={() => toggleModel(model)} />
-                    <span><strong>{model.name}</strong><small>{priceSummary(model, t)}</small></span>
+                    <span><strong>{model.name}</strong><small>{modelPriceSummary(model, t)}</small></span>
                   </label>
                   {ref && (
                     <label className="model-limit-field" title={t("keyForm.modelDailyLimit", { model: model.name })}>
