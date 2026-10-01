@@ -237,7 +237,9 @@ func MarshalUsage(datasetID string, usage map[string]*UsageState, updatedAt time
 	disk := persistedUsage{
 		Version: currentUsageFileVersion, DatasetID: datasetID, Usage: usage, UpdatedAt: updatedAt.UTC(),
 	}
-	return json.MarshalIndent(disk, "", "  ")
+	// The ledger is rewritten whole on every flush; indentation would add
+	// about 40% to each write and most of its encoding time.
+	return json.Marshal(disk)
 }
 
 func ValidateUsageStates(states map[string]*UsageState) error {

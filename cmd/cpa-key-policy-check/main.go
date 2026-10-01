@@ -103,7 +103,7 @@ func run(source, zone, at string) error {
 	}
 	local := now.In(loc)
 	day := time.Date(local.Year(), local.Month(), local.Day(), 0, 0, 0, 0, loc)
-	oldest := day.AddDate(0, 0, -34).Format(time.DateOnly)
+	oldest := day.AddDate(0, 0, 1-policy.UsageRetentionDays).Format(time.DateOnly)
 	today := day.Format(time.DateOnly)
 	preserved := 0
 	for id, state := range oldUsage.Usage {

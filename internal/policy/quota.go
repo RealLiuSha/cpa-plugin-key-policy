@@ -8,8 +8,11 @@ import (
 	"time"
 )
 
+// UsageRetentionDays is how many natural days of daily and per-model
+// consumption history each key keeps. Quota cycles do not depend on it.
+const UsageRetentionDays = 90
+
 const (
-	usageRetentionDays = 35
 	usageFlushInterval = 15 * time.Second
 	softLimitRatio     = 0.8
 	dateLayout         = "2006-01-02"
@@ -183,7 +186,7 @@ func (l *usageLedger) evictExpiredLocked(now time.Time) bool {
 		return false
 	}
 	l.lastEvictedDate = currentDate
-	oldest := l.dateKeyOffset(now, -(usageRetentionDays - 1))
+	oldest := l.dateKeyOffset(now, -(UsageRetentionDays - 1))
 	changed := false
 	for _, state := range l.entries {
 		if state == nil {
@@ -645,8 +648,8 @@ func (l *usageLedger) History(keyID string, count int) []UsageHistoryDay {
 	if count < 1 {
 		count = 30
 	}
-	if count > usageRetentionDays {
-		count = usageRetentionDays
+	if count > UsageRetentionDays {
+		count = UsageRetentionDays
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()

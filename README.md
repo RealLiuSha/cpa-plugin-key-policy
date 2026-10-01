@@ -46,7 +46,7 @@ The first boot seeds keys and models from YAML and creates paired state and usag
 
 ## Accounting
 
-Consumption history remains in `days` / `by_model` with the existing 35-day retention. Each key now has independent daily, 7-day and 30-day quota cycles under `cycles`. Model counters are authoritative within each cycle; totals are derived from them.
+Consumption history is kept in `days` / `by_model` for the last 90 days; the usage file is compact JSON (read it with `jq .`). Each key now has independent daily, 7-day and 30-day quota cycles under `cycles`. Model counters are authoritative within each cycle; totals are derived from them.
 
 Daily quotas reset at 00:00 in `usage_timezone` (default `Asia/Shanghai`). Longer quotas reset on fixed calendar-day schedules. A manual reset restores only the selected cycle immediately and sets its next reset to the operation date plus 1/7/30 days at 00:00. Other cycles and consumption history are preserved. Automatic advancement retains the original schedule across idle periods and downtime. Changing limits, enabled state or a key secret does not reset consumption. Usage is assigned when the host usage event reaches the ledger.
 
