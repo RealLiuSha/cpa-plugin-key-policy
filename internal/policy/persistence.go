@@ -17,19 +17,28 @@ import (
 )
 
 const (
-	currentStateFileVersion = 5
-	currentUsageFileVersion = 5
+	currentStateFileVersion = 6
+	currentUsageFileVersion = 6
 	minReadableFileVersion  = 3
-	maxReadableFileVersion  = 5
+	maxReadableFileVersion  = 6
 )
 
 type persistedState struct {
-	Version       int               `json:"version"`
-	DatasetID     string            `json:"dataset_id"`
-	Keys          []KeyConfig       `json:"keys"`
-	Models        []ModelDefinition `json:"models"`
-	ClassifyRules []ClassifyRule    `json:"classify_rules,omitempty"`
-	UpdatedAt     time.Time         `json:"updated_at"`
+	Version   int               `json:"version"`
+	DatasetID string            `json:"dataset_id"`
+	Keys      []KeyConfig       `json:"keys"`
+	Models    []ModelDefinition `json:"models"`
+	UpdatedAt time.Time         `json:"updated_at"`
+}
+
+// compatState is the state layout of versions 3 through 5.
+type compatState struct {
+	Version       int           `json:"version"`
+	DatasetID     string        `json:"dataset_id"`
+	Keys          []KeyConfig   `json:"keys"`
+	Models        []compatModel `json:"models"`
+	ClassifyRules []compatRule  `json:"classify_rules,omitempty"`
+	UpdatedAt     time.Time     `json:"updated_at"`
 }
 
 type persistedUsage struct {
@@ -84,20 +93,34 @@ func decodeState(raw []byte) (*State, error) {
 		return nil, errors.New("state dataset_id is required")
 	}
 	var disk persistedState
-	if err := decodeJSONStrict(raw, &disk); err != nil {
-		return nil, fmt.Errorf("decode current state: %w", err)
+	var removed []string
+	if header.Version >= currentStateFileVersion {
+		if err := decodeJSONStrict(raw, &disk); err != nil {
+			return nil, fmt.Errorf("decode current state: %w", err)
+		}
+	} else {
+		var legacy compatState
+		if err := decodeJSONStrict(raw, &legacy); err != nil {
+			return nil, fmt.Errorf("decode state version %d: %w", header.Version, err)
+		}
+		models, notes, err := projectCompatModels(legacy.Models, legacy.ClassifyRules)
+		if err != nil {
+			return nil, fmt.Errorf("convert state version %d: %w", header.Version, err)
+		}
+		disk = persistedState{Version: legacy.Version, DatasetID: legacy.DatasetID, Keys: legacy.Keys, Models: models, UpdatedAt: legacy.UpdatedAt}
+		removed = notes
 	}
-	cfg := Config{Enabled: true, Keys: disk.Keys, Models: disk.Models, ClassifyRules: disk.ClassifyRules}
+	cfg := Config{Enabled: true, Keys: disk.Keys, Models: disk.Models}
 	if err := normalizeConfig(&cfg); err != nil {
 		return nil, fmt.Errorf("validate current state: %w", err)
 	}
 	return &State{
-		Version:       disk.Version,
-		DatasetID:     strings.TrimSpace(disk.DatasetID),
-		Keys:          cfg.Keys,
-		Models:        cfg.Models,
-		ClassifyRules: cfg.ClassifyRules,
-		UpdatedAt:     disk.UpdatedAt,
+		Version:         disk.Version,
+		DatasetID:       strings.TrimSpace(disk.DatasetID),
+		Keys:            cfg.Keys,
+		Models:          cfg.Models,
+		UpdatedAt:       disk.UpdatedAt,
+		RemovedSettings: removed,
 	}, nil
 }
 
@@ -136,7 +159,7 @@ func decodeUsage(raw []byte) (*UsageFile, error) {
 	if disk.Version >= 5 {
 		for id, state := range disk.Usage {
 			if state.Cycles == nil {
-				return nil, fmt.Errorf("v5 key %q is missing quota cycles", id)
+				return nil, fmt.Errorf("usage version %d key %q is missing quota cycles", disk.Version, id)
 			}
 		}
 	}
@@ -167,26 +190,25 @@ func decodeJSONStrict(raw []byte, target any) error {
 	return nil
 }
 
-func SaveState(path, datasetID string, keys []KeyConfig, models []ModelDefinition, rules []ClassifyRule) error {
-	raw, err := MarshalState(datasetID, keys, models, rules, time.Now().UTC())
+func SaveState(path, datasetID string, keys []KeyConfig, models []ModelDefinition) error {
+	raw, err := MarshalState(datasetID, keys, models, time.Now().UTC())
 	if err != nil {
 		return err
 	}
 	return persist.AtomicWrite(path, raw)
 }
 
-func MarshalState(datasetID string, keys []KeyConfig, models []ModelDefinition, rules []ClassifyRule, updatedAt time.Time) ([]byte, error) {
+func MarshalState(datasetID string, keys []KeyConfig, models []ModelDefinition, updatedAt time.Time) ([]byte, error) {
 	datasetID = strings.TrimSpace(datasetID)
 	if datasetID == "" {
 		return nil, errors.New("state dataset_id is required")
 	}
-	cfg := Config{Enabled: true, Keys: append([]KeyConfig(nil), keys...), Models: append([]ModelDefinition(nil), models...), ClassifyRules: append([]ClassifyRule(nil), rules...)}
+	cfg := Config{Enabled: true, Keys: append([]KeyConfig(nil), keys...), Models: append([]ModelDefinition(nil), models...)}
 	if err := normalizeConfig(&cfg); err != nil {
 		return nil, err
 	}
 	state := persistedState{
-		Version: currentStateFileVersion, DatasetID: datasetID, Keys: cfg.Keys, Models: cfg.Models,
-		ClassifyRules: cfg.ClassifyRules, UpdatedAt: updatedAt.UTC(),
+		Version: currentStateFileVersion, DatasetID: datasetID, Keys: cfg.Keys, Models: cfg.Models, UpdatedAt: updatedAt.UTC(),
 	}
 	return json.MarshalIndent(state, "", "  ")
 }
@@ -209,7 +231,7 @@ func MarshalUsage(datasetID string, usage map[string]*UsageState, updatedAt time
 	}
 	for id, state := range usage {
 		if state.Cycles == nil {
-			return nil, fmt.Errorf("cannot save v5 key %q without quota cycles", id)
+			return nil, fmt.Errorf("cannot save key %q without quota cycles", id)
 		}
 	}
 	disk := persistedUsage{

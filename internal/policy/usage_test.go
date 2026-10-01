@@ -82,7 +82,7 @@ func TestUsageRecordAndOverLimitDaily(t *testing.T) {
 
 	// 500K prompt × $1/M = $0.50 → under the $1 daily limit.
 	_ = store.RecordUsage("team-a", "fast", "gpt-5-codex", false, UsageDetail{InputTokens: 500_000})
-	d := store.Authenticate("POST", "/v1/chat/completions", headers, nil, []byte(`{"model":"fast"}`))
+	d := admitRequest(store, "POST", "/v1/chat/completions", headers, []byte(`{"model":"fast"}`))
 	if !d.Allowed {
 		t.Fatalf("first request should be allowed: %+v", d)
 	}
@@ -91,14 +91,14 @@ func TestUsageRecordAndOverLimitDaily(t *testing.T) {
 	// passed), but the NEXT request now sees daily_usd >= limit and is
 	// rejected (Authenticate is a pre-request gate on accumulated usage).
 	_ = store.RecordUsage("team-a", "fast", "gpt-5-codex", false, UsageDetail{InputTokens: 500_000})
-	d = store.Authenticate("POST", "/v1/chat/completions", headers, nil, []byte(`{"model":"fast"}`))
-	if d.Allowed || !d.CostLimited || d.Reason != "daily_exceeded" {
+	d = admitRequest(store, "POST", "/v1/chat/completions", headers, []byte(`{"model":"fast"}`))
+	if d.Allowed || d.Reason != "daily_exceeded" {
 		t.Fatalf("at-limit request should be rejected on the next Authenticate: %+v", d)
 	}
 	// Crossing UTC midnight resets the daily window.
 	tm = tm.Add(14 * time.Hour) // next day
 	store.SetClock(func() time.Time { return tm })
-	d = store.Authenticate("POST", "/v1/chat/completions", headers, nil, []byte(`{"model":"fast"}`))
+	d = admitRequest(store, "POST", "/v1/chat/completions", headers, []byte(`{"model":"fast"}`))
 	if !d.Allowed {
 		t.Fatalf("after midnight should be allowed again: %+v", d)
 	}
@@ -124,29 +124,10 @@ func TestUsageUnlimitedKeyNeverBlocked(t *testing.T) {
 	hdr := map[string][]string{"Authorization": {"Bearer cpa_free"}}
 	for i := 0; i < 50; i++ {
 		_ = store.RecordUsage("free", "fast", "gpt-5-codex", false, UsageDetail{InputTokens: 1_000_000, OutputTokens: 1_000_000})
-		d := store.Authenticate("POST", "/v1/chat/completions", hdr, nil, []byte(`{"model":"fast"}`))
+		d := admitRequest(store, "POST", "/v1/chat/completions", hdr, []byte(`{"model":"fast"}`))
 		if !d.Allowed {
 			t.Fatalf("unlimited key blocked at iter %d: %+v", i, d)
 		}
-	}
-}
-
-func TestUsageUnpricedModelRejected(t *testing.T) {
-	store := NewStore()
-	err := store.Configure(Config{
-		Enabled:   true,
-		StateFile: filepath.Join(t.TempDir(), "state.json"),
-		Models: []ModelDefinition{{
-			Name: "fast", Targets: []ModelTarget{{Provider: "codex", TargetModel: "gpt-5-codex"}}, BillingMode: "tokens",
-		}},
-		Keys: []KeyConfig{{
-			ID: "cheap", Enabled: true, DailyLimitUSD: 0.01,
-			KeyHash: hashForUsageTest(t, "cpa_cheap"),
-			Models:  modelRefs("fast"),
-		}},
-	})
-	if err == nil {
-		t.Fatal("unpriced model was accepted")
 	}
 }
 
@@ -171,9 +152,9 @@ func TestUsageHandleBillsStreamingAndSkipsMissingReports(t *testing.T) {
 
 	// usage.handle delivers the parsed final frame for streaming requests.
 	_ = store.RecordUsage("streamy", "fast", "gpt-5-codex", false, UsageDetail{InputTokens: 1_000_000})
-	d := store.Authenticate("POST", "/v1/chat/completions", hdr, nil, []byte(`{"model":"fast"}`))
+	d := admitRequest(store, "POST", "/v1/chat/completions", hdr, []byte(`{"model":"fast"}`))
 	// 1M tokens × $1/M = $1.00 >= $0.01 limit → rejected.
-	if d.Allowed || !d.CostLimited || d.Reason != "daily_exceeded" {
+	if d.Allowed || d.Reason != "daily_exceeded" {
 		t.Fatalf("streaming with usage frame should be billed & blocked: %+v", d)
 	}
 
@@ -192,7 +173,7 @@ func TestUsageHandleBillsStreamingAndSkipsMissingReports(t *testing.T) {
 		t.Fatal(err)
 	}
 	hdr2 := map[string][]string{"Authorization": {"Bearer cpa_stream2"}}
-	d = store2.Authenticate("POST", "/v1/chat/completions", hdr2, nil, []byte(`{"model":"fast"}`))
+	d = admitRequest(store2, "POST", "/v1/chat/completions", hdr2, []byte(`{"model":"fast"}`))
 	if !d.Allowed {
 		t.Fatalf("streaming without usage frame should not be billed: %+v", d)
 	}
@@ -263,7 +244,7 @@ func TestUsagePersistsAcrossRestart(t *testing.T) {
 		t.Fatalf("usage after restart = %+v, want 0.80", s)
 	}
 	// Over-limit is enforced post-restart (0.80 < 1.0, allowed; then bill to >1).
-	d := s2.Authenticate("POST", "/v1/chat/completions", hdr, nil, []byte(`{"model":"fast"}`))
+	d := admitRequest(s2, "POST", "/v1/chat/completions", hdr, []byte(`{"model":"fast"}`))
 	if !d.Allowed {
 		t.Fatalf("should be allowed at 0.80/1.0: %+v", d)
 	}
@@ -452,7 +433,7 @@ func newCacheStore(t *testing.T, now time.Time, provider string) *Store {
 		Enabled:   true,
 		StateFile: filepath.Join(t.TempDir(), "state.json"),
 		Models: []ModelDefinition{{
-			Name: "fast", Targets: []ModelTarget{{Provider: provider, TargetModel: "m"}}, BillingMode: "tokens",
+			Name: "fast", Provider: provider, TargetModel: "m", BillingMode: "tokens",
 			InputPricePerMillion: 3, OutputPricePerMillion: 15, CacheReadPricePerMillion: 0.30,
 		}},
 		Keys: []KeyConfig{{
@@ -566,7 +547,7 @@ func TestCacheWriteStatsAccumulatedIndependently(t *testing.T) {
 		Enabled:   true,
 		StateFile: filepath.Join(t.TempDir(), "state.json"),
 		Models: []ModelDefinition{{
-			Name: "fast", Targets: []ModelTarget{{Provider: "claude", TargetModel: "m"}}, BillingMode: "tokens",
+			Name: "fast", Provider: "claude", TargetModel: "m", BillingMode: "tokens",
 			InputPricePerMillion: 3, OutputPricePerMillion: 15, CacheReadPricePerMillion: 0.30, CacheWritePricePerMillion: fptr(3.75),
 		}},
 		Keys: []KeyConfig{{
@@ -601,7 +582,7 @@ func TestCacheOnlyUsageIsBilledAndRecorded(t *testing.T) {
 		Enabled:   true,
 		StateFile: filepath.Join(t.TempDir(), "state.json"),
 		Models: []ModelDefinition{{
-			Name: "fast", Targets: []ModelTarget{{Provider: "claude", TargetModel: "m"}}, BillingMode: "tokens",
+			Name: "fast", Provider: "claude", TargetModel: "m", BillingMode: "tokens",
 			InputPricePerMillion: 3, OutputPricePerMillion: 15, CacheReadPricePerMillion: 0.30, CacheWritePricePerMillion: fptr(3.75),
 		}},
 		Keys: []KeyConfig{{ID: "cache-key", Enabled: true, KeyHash: hashForUsageTest(t, "cpa_cache"), Models: modelRefs("fast")}},
@@ -632,7 +613,7 @@ func TestCacheStatsPersistAcrossRestart(t *testing.T) {
 		if err := s.Configure(Config{
 			Enabled: true, StateFile: path,
 			Models: []ModelDefinition{{
-				Name: "fast", Targets: []ModelTarget{{Provider: "openai", TargetModel: "m"}}, BillingMode: "tokens",
+				Name: "fast", Provider: "openai", TargetModel: "m", BillingMode: "tokens",
 				InputPricePerMillion: 3, OutputPricePerMillion: 15, CacheReadPricePerMillion: 0.30,
 			}},
 			Keys: []KeyConfig{{
@@ -667,9 +648,6 @@ func newPerCallStore(t *testing.T, perCallUSD, dailyLimit float64) *Store {
 	store := NewStore()
 	store.SetClock(func() time.Time { return now })
 	model := perCallTestModel("fast", "codex", "gpt-5-codex", perCallUSD)
-	if perCallUSD == 0 {
-		model.Free = true
-	}
 	if err := store.Configure(Config{
 		Enabled:   true,
 		StateFile: filepath.Join(t.TempDir(), "state.json"),
@@ -700,14 +678,14 @@ func TestPerCallBillsFixedUSD(t *testing.T) {
 	if !nearly(cost, 0.50) {
 		t.Fatalf("per_call cost = %v, want 0.50", cost)
 	}
-	d := store.Authenticate("POST", "/v1/chat/completions", hdr, nil, []byte(`{"model":"fast"}`))
+	d := admitRequest(store, "POST", "/v1/chat/completions", hdr, []byte(`{"model":"fast"}`))
 	if !d.Allowed {
 		t.Fatalf("first call should be allowed: %+v", d)
 	}
 	// Second $0.50 → total $1.00 == limit. Next Authenticate rejected.
 	_ = store.RecordUsage("percall", "FaSt", "gpt-5-codex", false, UsageDetail{})
-	d = store.Authenticate("POST", "/v1/chat/completions", hdr, nil, []byte(`{"model":"fast"}`))
-	if d.Allowed || !d.CostLimited || d.Reason != "daily_exceeded" {
+	d = admitRequest(store, "POST", "/v1/chat/completions", hdr, []byte(`{"model":"fast"}`))
+	if d.Allowed || d.Reason != "daily_exceeded" {
 		t.Fatalf("after two per_call charges, next should be daily_exceeded: %+v", d)
 	}
 	// CallCount reflects two successful calls.
@@ -816,7 +794,7 @@ func TestPerCallZeroStillCounts(t *testing.T) {
 	}
 	// No dollar spend → never blocked even with a tiny limit.
 	hdr := map[string][]string{"Authorization": {"Bearer cpa_percall"}}
-	d := store.Authenticate("POST", "/v1/chat/completions", hdr, nil, []byte(`{"model":"fast"}`))
+	d := admitRequest(store, "POST", "/v1/chat/completions", hdr, []byte(`{"model":"fast"}`))
 	if !d.Allowed {
 		t.Fatalf("free per_call should never exceed dollar limit: %+v", d)
 	}
@@ -980,7 +958,7 @@ func TestModelUsageCaseCanonicalReadOnlyMerge(t *testing.T) {
 	datasetID := "mixed-case-dataset"
 	model := tokenTestModel("gpt-5.6-sol", "codex", "gpt-5.6", 1, 2)
 	key := KeyConfig{ID: "team-sol", Enabled: true, KeyHash: hashForUsageTest(t, "cpa_sol"), Models: modelRefs("gpt-5.6-sol")}
-	if err := SaveState(statePath, datasetID, []KeyConfig{key}, []ModelDefinition{model}, nil); err != nil {
+	if err := SaveState(statePath, datasetID, []KeyConfig{key}, []ModelDefinition{model}); err != nil {
 		t.Fatal(err)
 	}
 	date := "2026-06-29"

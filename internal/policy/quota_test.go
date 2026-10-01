@@ -200,7 +200,7 @@ func TestChangedLimitAppliesToAlreadyAccumulatedUsage(t *testing.T) {
 	}
 }
 
-func TestModelDailyLimitIsIsolatedAcrossModelsAndTargets(t *testing.T) {
+func TestModelDailyLimitIsIsolatedAcrossModels(t *testing.T) {
 	dir := t.TempDir()
 	hash, err := HashKey("cpa_model_limit")
 	if err != nil {
@@ -212,7 +212,7 @@ func TestModelDailyLimitIsIsolatedAcrossModelsAndTargets(t *testing.T) {
 	if err := store.Configure(Config{
 		Enabled: true, StateFile: filepath.Join(dir, "state.json"),
 		Models: []ModelDefinition{
-			{Name: "fast", Targets: []ModelTarget{{Provider: "codex", TargetModel: "m1"}, {Provider: "openai", TargetModel: "m2"}}, BillingMode: "tokens", InputPricePerMillion: 1},
+			tokenTestModel("fast", "codex", "m1", 1, 0),
 			tokenTestModel("slow", "codex", "m3", 1, 0),
 		},
 		Keys: []KeyConfig{{ID: "limited", Enabled: true, KeyHash: hash, Models: []KeyModelRef{{Name: "fast", DailyLimitUSD: 1}, {Name: "slow"}}}},
@@ -221,11 +221,11 @@ func TestModelDailyLimitIsIsolatedAcrossModelsAndTargets(t *testing.T) {
 	}
 	store.RecordUsage("limited", "fast", "m1", false, UsageDetail{InputTokens: 1_000_000})
 	headers := map[string][]string{"Authorization": {"Bearer cpa_model_limit"}}
-	blocked := store.Authenticate("POST", "/v1/chat/completions", headers, nil, []byte(`{"model":"fast"}`))
+	blocked := admitRequest(store, "POST", "/v1/chat/completions", headers, []byte(`{"model":"fast"}`))
 	if blocked.Allowed || blocked.Reason != "model_daily_exceeded" {
 		t.Fatalf("fast model decision = %+v", blocked)
 	}
-	allowed := store.Authenticate("POST", "/v1/chat/completions", headers, nil, []byte(`{"model":"slow"}`))
+	allowed := admitRequest(store, "POST", "/v1/chat/completions", headers, []byte(`{"model":"slow"}`))
 	if !allowed.Allowed {
 		t.Fatalf("slow model was affected: %+v", allowed)
 	}
@@ -383,7 +383,7 @@ func TestSplitUsageFileAndDirtyFlush(t *testing.T) {
 func TestTmpCleanupRemovesOnlyOldMatchingFiles(t *testing.T) {
 	dir := t.TempDir()
 	statePath := filepath.Join(dir, "state.json")
-	if err := SaveState(statePath, "cleanup-dataset", nil, nil, nil); err != nil {
+	if err := SaveState(statePath, "cleanup-dataset", nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	oldPath := filepath.Join(dir, ".state.json.tmp-old")
@@ -414,7 +414,7 @@ func TestTmpCleanupRemovesOnlyOldMatchingFiles(t *testing.T) {
 func TestConfigureCleansStaleStateAndUsageTemps(t *testing.T) {
 	dir := t.TempDir()
 	statePath := filepath.Join(dir, "state.json")
-	if err := SaveState(statePath, "cleanup-dataset", nil, nil, nil); err != nil {
+	if err := SaveState(statePath, "cleanup-dataset", nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	if err := SaveUsage(filepath.Join(dir, "cpa-key-policy-usage.json"), "cleanup-dataset", map[string]*UsageState{}); err != nil {

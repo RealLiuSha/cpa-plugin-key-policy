@@ -136,27 +136,30 @@ func TestModelManagementLifecycle(t *testing.T) {
 
 	createModel := managementCall(t, app, http.MethodPost, "/v0/management/plugins/cpa-key-policy/models", []byte(`{
   "name": " Chat ",
-  "targets": [{"provider":"CODEX","target_model":"gpt"}],
-  "free": true
+  "provider": "CODEX",
+  "target_model": "gpt"
 }`))
 	if createModel.StatusCode != http.StatusOK {
 		t.Fatalf("create model status=%d body=%s", createModel.StatusCode, createModel.Body)
 	}
 	var created struct {
 		Model struct {
-			Name    string `json:"name"`
-			Targets []struct {
-				Provider string `json:"provider"`
-			} `json:"targets"`
-			Dispatch    string `json:"dispatch"`
-			BillingMode string `json:"billing_mode"`
+			Name              string  `json:"name"`
+			Provider          string  `json:"provider"`
+			TargetModel       string  `json:"target_model"`
+			BillingMode       string  `json:"billing_mode"`
+			BillingMultiplier float64 `json:"billing_multiplier"`
 		} `json:"model"`
 	}
 	if err := json.Unmarshal(createModel.Body, &created); err != nil {
 		t.Fatal(err)
 	}
-	if created.Model.Name != "Chat" || created.Model.Targets[0].Provider != "codex" || created.Model.Dispatch != "round-robin" || created.Model.BillingMode != "tokens" {
+	if created.Model.Name != "Chat" || created.Model.Provider != "codex" || created.Model.TargetModel != "gpt" || created.Model.BillingMode != "tokens" || created.Model.BillingMultiplier != 1 {
 		t.Fatalf("model response is not canonical: %+v", created.Model)
+	}
+	legacy := managementCall(t, app, http.MethodPost, "/v0/management/plugins/cpa-key-policy/models", []byte(`{"name":"old","targets":[{"provider":"codex","target_model":"gpt"}]}`))
+	if legacy.StatusCode != http.StatusBadRequest {
+		t.Fatalf("removed targets field status=%d body=%s", legacy.StatusCode, legacy.Body)
 	}
 
 	createKey := managementCall(t, app, http.MethodPost, "/v0/management/plugins/cpa-key-policy/keys", []byte(`{

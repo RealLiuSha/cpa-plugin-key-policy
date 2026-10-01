@@ -6,24 +6,20 @@ import (
 	"strings"
 )
 
+// ModelDefinition is one public model: the name clients send, the CPA
+// capability it routes to, and the prices charged for it. All-zero prices are
+// valid and bill $0, so a freshly imported model is usable before pricing.
 type ModelDefinition struct {
-	BillingMultiplier         float64       `yaml:"billing_multiplier,omitempty" json:"billing_multiplier"`
-	Name                      string        `yaml:"name" json:"name"`
-	Targets                   []ModelTarget `yaml:"targets" json:"targets"`
-	Dispatch                  string        `yaml:"dispatch,omitempty" json:"dispatch,omitempty"`
-	BillingMode               string        `yaml:"billing_mode,omitempty" json:"billing_mode,omitempty"`
-	Free                      bool          `yaml:"free" json:"free"`
-	InputPricePerMillion      float64       `yaml:"input_price_per_million,omitempty" json:"input_price_per_million,omitempty"`
-	OutputPricePerMillion     float64       `yaml:"output_price_per_million,omitempty" json:"output_price_per_million,omitempty"`
-	CacheReadPricePerMillion  float64       `yaml:"cache_read_price_per_million,omitempty" json:"cache_read_price_per_million,omitempty"`
-	CacheWritePricePerMillion *float64      `yaml:"cache_write_price_per_million,omitempty" json:"cache_write_price_per_million,omitempty"`
-	PerCallUSD                float64       `yaml:"per_call_usd,omitempty" json:"per_call_usd,omitempty"`
-}
-
-type ModelTarget struct {
-	Provider    string `yaml:"provider" json:"provider"`
-	TargetModel string `yaml:"target_model" json:"target_model"`
-	Group       string `yaml:"group,omitempty" json:"group,omitempty"`
+	Name                      string   `json:"name"`
+	Provider                  string   `json:"provider"`
+	TargetModel               string   `json:"target_model"`
+	BillingMode               string   `json:"billing_mode,omitempty"`
+	BillingMultiplier         float64  `json:"billing_multiplier"`
+	InputPricePerMillion      float64  `json:"input_price_per_million,omitempty"`
+	OutputPricePerMillion     float64  `json:"output_price_per_million,omitempty"`
+	CacheReadPricePerMillion  float64  `json:"cache_read_price_per_million,omitempty"`
+	CacheWritePricePerMillion *float64 `json:"cache_write_price_per_million,omitempty"`
+	PerCallUSD                float64  `json:"per_call_usd,omitempty"`
 }
 
 type KeyModelRef struct {
@@ -31,31 +27,10 @@ type KeyModelRef struct {
 	DailyLimitUSD float64 `yaml:"daily_limit_usd,omitempty" json:"daily_limit_usd,omitempty"`
 }
 
-type ResolvedModelRoute struct {
-	BillingMultiplier         float64
-	PublicModel               string
-	Provider                  string
-	TargetModel               string
-	Group                     string
-	BillingMode               string
-	Free                      bool
-	InputPricePerMillion      float64
-	OutputPricePerMillion     float64
-	CacheReadPricePerMillion  float64
-	CacheWritePricePerMillion *float64
-	PerCallUSD                float64
-}
-
 func normalizeModelDefinitions(models []ModelDefinition) (map[string]*ModelDefinition, error) {
 	index := make(map[string]*ModelDefinition, len(models))
 	for i := range models {
 		model := &models[i]
-		if model.BillingMultiplier == 0 {
-			model.BillingMultiplier = 1
-		}
-		if model.BillingMultiplier < 1 || math.IsNaN(model.BillingMultiplier) || math.IsInf(model.BillingMultiplier, 0) {
-			return nil, fmt.Errorf("model %q billing_multiplier must be finite and at least 1", model.Name)
-		}
 		model.Name = strings.TrimSpace(model.Name)
 		if model.Name == "" {
 			return nil, fmt.Errorf("model entry %d: name is required", i)
@@ -64,31 +39,16 @@ func normalizeModelDefinitions(models []ModelDefinition) (map[string]*ModelDefin
 		if _, duplicate := index[lowerName]; duplicate {
 			return nil, fmt.Errorf("duplicate model name %q", model.Name)
 		}
-		if len(model.Targets) == 0 {
-			return nil, fmt.Errorf("model %q must have at least one target", model.Name)
+		model.Provider = strings.ToLower(strings.TrimSpace(model.Provider))
+		model.TargetModel = strings.TrimSpace(model.TargetModel)
+		if model.Provider == "" || model.TargetModel == "" {
+			return nil, fmt.Errorf("model %q: provider and target_model are required", model.Name)
 		}
-		targetSeen := make(map[string]struct{}, len(model.Targets))
-		for j := range model.Targets {
-			target := &model.Targets[j]
-			target.Provider = strings.ToLower(strings.TrimSpace(target.Provider))
-			target.TargetModel = strings.TrimSpace(target.TargetModel)
-			target.Group = strings.ToLower(strings.TrimSpace(target.Group))
-			if target.Provider == "" || target.TargetModel == "" {
-				return nil, fmt.Errorf("model %q target %d: provider and target_model are required", model.Name, j)
-			}
-			targetKey := strings.ToLower(target.Provider) + "\x00" + strings.ToLower(target.TargetModel) + "\x00" + strings.ToLower(target.Group)
-			if _, duplicate := targetSeen[targetKey]; duplicate {
-				return nil, fmt.Errorf("model %q has duplicate target provider=%q target_model=%q group=%q", model.Name, target.Provider, target.TargetModel, target.Group)
-			}
-			targetSeen[targetKey] = struct{}{}
+		if model.BillingMultiplier == 0 {
+			model.BillingMultiplier = 1
 		}
-		switch strings.ToLower(strings.TrimSpace(model.Dispatch)) {
-		case "", "round-robin":
-			model.Dispatch = "round-robin"
-		case "priority":
-			model.Dispatch = "priority"
-		default:
-			return nil, fmt.Errorf("model %q dispatch %q must be \"round-robin\" or \"priority\"", model.Name, model.Dispatch)
+		if model.BillingMultiplier < 1 || math.IsNaN(model.BillingMultiplier) || math.IsInf(model.BillingMultiplier, 0) {
+			return nil, fmt.Errorf("model %q billing_multiplier must be finite and at least 1", model.Name)
 		}
 		switch strings.ToLower(strings.TrimSpace(model.BillingMode)) {
 		case "", "tokens":
@@ -100,17 +60,6 @@ func normalizeModelDefinitions(models []ModelDefinition) (map[string]*ModelDefin
 		}
 		if model.InputPricePerMillion < 0 || model.OutputPricePerMillion < 0 || model.CacheReadPricePerMillion < 0 || optionalPriceNegative(model.CacheWritePricePerMillion) || model.PerCallUSD < 0 {
 			return nil, fmt.Errorf("model %q prices cannot be negative", model.Name)
-		}
-		if model.Free {
-			if model.InputPricePerMillion != 0 || model.OutputPricePerMillion != 0 || model.CacheReadPricePerMillion != 0 || optionalPriceNonZero(model.CacheWritePricePerMillion) || model.PerCallUSD != 0 {
-				return nil, fmt.Errorf("model %q is free and all price fields must be zero", model.Name)
-			}
-		} else if model.BillingMode == "per_call" {
-			if model.PerCallUSD <= 0 {
-				return nil, fmt.Errorf("model %q per_call_usd must be positive unless free is true", model.Name)
-			}
-		} else if model.InputPricePerMillion <= 0 && model.OutputPricePerMillion <= 0 && model.CacheReadPricePerMillion <= 0 && optionalPriceValue(model.CacheWritePricePerMillion) <= 0 {
-			return nil, fmt.Errorf("model %q must have a positive token price unless free is true", model.Name)
 		}
 		index[lowerName] = model
 	}
@@ -128,10 +77,6 @@ func optionalPriceNegative(price *float64) bool {
 	return price != nil && *price < 0
 }
 
-func optionalPriceNonZero(price *float64) bool {
-	return price != nil && *price != 0
-}
-
 func cloneFloat64(value *float64) *float64 {
 	if value == nil {
 		return nil
@@ -140,19 +85,7 @@ func cloneFloat64(value *float64) *float64 {
 	return &copy
 }
 
-func resolveModelRoute(model ModelDefinition, target ModelTarget) ResolvedModelRoute {
-	return ResolvedModelRoute{
-		BillingMultiplier:         model.BillingMultiplier,
-		PublicModel:               model.Name,
-		Provider:                  target.Provider,
-		TargetModel:               target.TargetModel,
-		Group:                     target.Group,
-		BillingMode:               model.BillingMode,
-		Free:                      model.Free,
-		InputPricePerMillion:      model.InputPricePerMillion,
-		OutputPricePerMillion:     model.OutputPricePerMillion,
-		CacheReadPricePerMillion:  model.CacheReadPricePerMillion,
-		CacheWritePricePerMillion: cloneFloat64(model.CacheWritePricePerMillion),
-		PerCallUSD:                model.PerCallUSD,
-	}
+func cloneModel(model ModelDefinition) ModelDefinition {
+	model.CacheWritePricePerMillion = cloneFloat64(model.CacheWritePricePerMillion)
+	return model
 }

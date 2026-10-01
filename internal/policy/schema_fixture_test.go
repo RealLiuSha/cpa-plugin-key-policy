@@ -11,31 +11,6 @@ import (
 	"cpa-key-policy/internal/policy/persist"
 )
 
-type managementFixtureKey struct {
-	ID                  string        `json:"id"`
-	Name                string        `json:"name"`
-	Enabled             bool          `json:"enabled"`
-	KeyPreview          string        `json:"key_preview"`
-	RPM                 int           `json:"rpm"`
-	Models              []KeyModelRef `json:"models"`
-	DailyLimitUSD       float64       `json:"daily_limit_usd"`
-	WeeklyLimitUSD      float64       `json:"weekly_limit_usd"`
-	MonthlyLimitUSD     float64       `json:"monthly_limit_usd"`
-	AllowModelsEndpoint bool          `json:"allow_models_endpoint,omitempty"`
-	Usage               UsageSummary  `json:"usage"`
-	CreatedAt           string        `json:"created_at,omitempty"`
-	UpdatedAt           string        `json:"updated_at,omitempty"`
-}
-
-type managementFixtureKeyUsage struct {
-	KeyID           string            `json:"key_id"`
-	KeyName         string            `json:"key_name"`
-	DailyLimitUSD   float64           `json:"daily_limit_usd"`
-	WeeklyLimitUSD  float64           `json:"weekly_limit_usd"`
-	MonthlyLimitUSD float64           `json:"monthly_limit_usd"`
-	Models          []ModelUsageEntry `json:"models"`
-}
-
 func TestSchemaV3Fixtures(t *testing.T) {
 	directory := filepath.Join("testdata", "schema-v3")
 	state, err := LoadState(filepath.Join(directory, "state.json"))
@@ -56,29 +31,14 @@ func TestSchemaV3Fixtures(t *testing.T) {
 	if day.CacheWriteTokens != 0 || day.CacheWriteUSD != 0 {
 		t.Fatalf("v3 usage invented cache-write history: %+v", day)
 	}
-	if len(state.Models) != 1 || len(state.Models[0].Targets) != 2 || len(state.Keys) != 1 || len(state.Keys[0].Models) != 1 {
+	if len(state.Models) != 1 || state.Models[0].Provider != "codex" || state.Models[0].TargetModel != "gpt-5.6" || len(state.Keys) != 1 || len(state.Keys[0].Models) != 1 {
 		t.Fatalf("state fixture lost model-domain structure: %+v", state)
 	}
-
-	managementRaw := mustReadSchemaFixture(t, filepath.Join(directory, "management.json"))
-	var management struct {
-		Keys     []managementFixtureKey    `json:"keys"`
-		Models   []ModelWithRefs           `json:"models"`
-		KeyUsage managementFixtureKeyUsage `json:"key_usage"`
+	if len(state.RemovedSettings) == 0 {
+		t.Fatal("reading a v3 state must report the settings it drops")
 	}
-	if err := decodeJSONStrict(managementRaw, &management); err != nil {
-		t.Fatal(err)
-	}
-	if len(management.Keys) != 1 || len(management.Models) != 1 || len(management.KeyUsage.Models) != 1 {
-		t.Fatalf("management fixture = %+v", management)
-	}
-	if management.Models[0].RefCount != 1 || management.KeyUsage.Models[0].Name != "Chat" {
-		t.Fatalf("management model references = %+v usage=%+v", management.Models[0], management.KeyUsage.Models)
-	}
-
 	assertJSONFields(t, mustReadSchemaFixture(t, filepath.Join(directory, "state.json")), []string{"classify_rules", "dataset_id", "keys", "models", "updated_at", "version"})
 	assertJSONFields(t, mustReadSchemaFixture(t, filepath.Join(directory, "usage.json")), []string{"dataset_id", "updated_at", "usage", "version"})
-	assertJSONFields(t, managementRaw, []string{"key_usage", "keys", "models"})
 }
 
 func TestSchemaV4Fixtures(t *testing.T) {
@@ -100,25 +60,11 @@ func TestSchemaV4Fixtures(t *testing.T) {
 	if usage.Usage["team-a"].Days["2026-08-08"].CacheWriteTokens != 50 {
 		t.Fatalf("v4 cache-write tokens = %+v", usage.Usage["team-a"].Days["2026-08-08"])
 	}
-
-	managementRaw := mustReadSchemaFixture(t, filepath.Join(directory, "management.json"))
-	var management struct {
-		Keys     []managementFixtureKey    `json:"keys"`
-		Models   []ModelWithRefs           `json:"models"`
-		KeyUsage managementFixtureKeyUsage `json:"key_usage"`
-	}
-	if err := decodeJSONStrict(managementRaw, &management); err != nil {
-		t.Fatal(err)
-	}
-	if management.Models[0].CacheWritePricePerMillion == nil || *management.Models[0].CacheWritePricePerMillion != 0.3 {
-		t.Fatalf("management v4 cache-write = %+v", management.Models[0])
-	}
 	assertJSONFields(t, mustReadSchemaFixture(t, filepath.Join(directory, "state.json")), []string{"classify_rules", "dataset_id", "keys", "models", "updated_at", "version"})
 	assertJSONFields(t, mustReadSchemaFixture(t, filepath.Join(directory, "usage.json")), []string{"dataset_id", "updated_at", "usage", "version"})
-	assertJSONFields(t, managementRaw, []string{"key_usage", "keys", "models"})
 }
 
-func TestV3StateMigratesToV5BeforeServing(t *testing.T) {
+func TestV3StateMigratesToCurrentBeforeServing(t *testing.T) {
 	directory := t.TempDir()
 	statePath := filepath.Join(directory, "state.json")
 	usagePath := persist.UsagePath(statePath)

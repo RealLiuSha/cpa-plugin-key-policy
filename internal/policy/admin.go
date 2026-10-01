@@ -33,7 +33,6 @@ func (s *Store) applyKeyMutation(input KeyConfig, persist bool) (*KeyConfig, Key
 	s.mu.RLock()
 	keys := s.keysSnapshotLocked()
 	models := s.modelsSnapshotLocked()
-	rules := s.classifyRulesSnapshotLocked()
 	path, datasetID := s.statePath, s.datasetID
 	s.mu.RUnlock()
 
@@ -79,7 +78,7 @@ func (s *Store) applyKeyMutation(input KeyConfig, persist bool) (*KeyConfig, Key
 	} else {
 		keys[len(keys)-1] = input
 	}
-	cfg := Config{Enabled: true, Keys: keys, Models: models, ClassifyRules: rules}
+	cfg := Config{Enabled: true, Keys: keys, Models: models}
 	if err := normalizeConfig(&cfg); err != nil {
 		return nil, KeyConfig{}, err
 	}
@@ -90,7 +89,7 @@ func (s *Store) applyKeyMutation(input KeyConfig, persist bool) (*KeyConfig, Key
 		}
 	}
 	if persist {
-		if err := s.saveState(path, datasetID, cfg.Keys, cfg.Models, cfg.ClassifyRules); err != nil {
+		if err := s.saveState(path, datasetID, cfg.Keys, cfg.Models); err != nil {
 			return nil, KeyConfig{}, err
 		}
 	}
@@ -99,7 +98,7 @@ func (s *Store) applyKeyMutation(input KeyConfig, persist bool) (*KeyConfig, Key
 	copy.Models = append([]KeyModelRef(nil), input.Models...)
 	s.keys[input.ID] = &copy
 	s.rebuildKeysByHashLocked()
-	s.clearPendingPicksForKeyLocked(input.ID)
+	s.clearPrechargesForKeyLocked(input.ID)
 	s.mu.Unlock()
 	_, ledger := s.runtimeComponents()
 	if ledger != nil {
@@ -179,7 +178,6 @@ func (s *Store) DeleteKey(id string) error {
 	s.mu.RLock()
 	keys := s.keysSnapshotLocked()
 	models := s.modelsSnapshotLocked()
-	rules := s.classifyRulesSnapshotLocked()
 	path, datasetID := s.statePath, s.datasetID
 	_, exists := s.keys[id]
 	limiter, usageLedger := s.limiter, s.usage
@@ -193,13 +191,13 @@ func (s *Store) DeleteKey(id string) error {
 			filtered = append(filtered, key)
 		}
 	}
-	if err := s.saveState(path, datasetID, filtered, models, rules); err != nil {
+	if err := s.saveState(path, datasetID, filtered, models); err != nil {
 		return err
 	}
 	s.mu.Lock()
 	delete(s.keys, id)
 	s.rebuildKeysByHashLocked()
-	s.clearPendingPicksForKeyLocked(id)
+	s.clearPrechargesForKeyLocked(id)
 	s.mu.Unlock()
 	if limiter != nil {
 		limiter.Reset(id)

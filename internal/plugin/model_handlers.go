@@ -9,17 +9,16 @@ import (
 )
 
 type modelUpsertRequest struct {
-	BillingMultiplier         *float64             `json:"billing_multiplier,omitempty"`
-	Name                      string               `json:"name"`
-	Targets                   []policy.ModelTarget `json:"targets"`
-	Dispatch                  string               `json:"dispatch"`
-	BillingMode               string               `json:"billing_mode"`
-	Free                      bool                 `json:"free"`
-	InputPricePerMillion      float64              `json:"input_price_per_million"`
-	OutputPricePerMillion     float64              `json:"output_price_per_million"`
-	CacheReadPricePerMillion  float64              `json:"cache_read_price_per_million"`
-	CacheWritePricePerMillion *float64             `json:"cache_write_price_per_million,omitempty"`
-	PerCallUSD                float64              `json:"per_call_usd"`
+	BillingMultiplier         *float64 `json:"billing_multiplier,omitempty"`
+	Name                      string   `json:"name"`
+	Provider                  string   `json:"provider"`
+	TargetModel               string   `json:"target_model"`
+	BillingMode               string   `json:"billing_mode"`
+	InputPricePerMillion      float64  `json:"input_price_per_million"`
+	OutputPricePerMillion     float64  `json:"output_price_per_million"`
+	CacheReadPricePerMillion  float64  `json:"cache_read_price_per_million"`
+	CacheWritePricePerMillion *float64 `json:"cache_write_price_per_million,omitempty"`
+	PerCallUSD                float64  `json:"per_call_usd"`
 }
 
 func (a *App) upsertModel(raw []byte) ManagementResponse {
@@ -29,10 +28,9 @@ func (a *App) upsertModel(raw []byte) ManagementResponse {
 	}
 	model := policy.ModelDefinition{
 		Name:                      req.Name,
-		Targets:                   req.Targets,
-		Dispatch:                  req.Dispatch,
+		Provider:                  req.Provider,
+		TargetModel:               req.TargetModel,
 		BillingMode:               req.BillingMode,
-		Free:                      req.Free,
 		InputPricePerMillion:      req.InputPricePerMillion,
 		OutputPricePerMillion:     req.OutputPricePerMillion,
 		CacheReadPricePerMillion:  req.CacheReadPricePerMillion,

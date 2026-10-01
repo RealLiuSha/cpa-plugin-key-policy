@@ -3,7 +3,6 @@ package policy
 import (
 	"errors"
 	"fmt"
-	"sort"
 	"strings"
 
 	"cpa-key-policy/internal/policy/audit"
@@ -11,46 +10,30 @@ import (
 
 var ErrInvalidModelImport = errors.New("invalid model import")
 
+// ModelImportItem asks for one public model bound to a CPA capability. The
+// public name defaults to the upstream model id.
 type ModelImportItem struct {
-	Name          string        `json:"name"`
-	Targets       []ModelTarget `json:"targets"`
-	Dispatch      string        `json:"dispatch,omitempty"`
-	Free          bool          `json:"free"`
-	Overwrite     bool          `json:"overwrite"`
-	Input         float64       `json:"input_price_per_million"`
-	Output        float64       `json:"output_price_per_million"`
-	CacheRead     float64       `json:"cache_read_price_per_million"`
-	CacheWrite    *float64      `json:"cache_write_price_per_million,omitempty"`
-	PerCallUSD    float64       `json:"per_call_usd,omitempty"`
-	BillingMode   string        `json:"billing_mode,omitempty"`
-	MissingPrice  bool          `json:"missing_price,omitempty"`
-	PriceConflict bool          `json:"price_conflict,omitempty"`
+	Name        string `json:"name,omitempty"`
+	Provider    string `json:"provider"`
+	TargetModel string `json:"target_model"`
 }
 
 type ModelImportRow struct {
-	Name          string   `json:"name"`
-	Action        string   `json:"action"`
-	Reason        string   `json:"reason,omitempty"`
-	AffectedKeys  []string `json:"affected_keys,omitempty"`
-	Duplicate     bool     `json:"duplicate,omitempty"`
-	MissingPrice  bool     `json:"missing_price,omitempty"`
-	PriceConflict bool     `json:"price_conflict,omitempty"`
+	Name   string `json:"name"`
+	Reason string `json:"reason,omitempty"`
 }
 
 type ModelImportResult struct {
-	Created      []ModelImportRow `json:"created"`
-	Updated      []ModelImportRow `json:"updated"`
-	Skipped      []ModelImportRow `json:"skipped"`
-	Conflicts    []ModelImportRow `json:"conflicts"`
-	MissingPrice []ModelImportRow `json:"missing_price"`
-	AffectedKeys []string         `json:"affected_keys"`
+	Created []ModelImportRow `json:"created"`
+	// Skipped names already exist or repeat within the batch ("exists",
+	// "duplicate"). Import never overwrites a model.
+	Skipped []ModelImportRow `json:"skipped"`
 }
 
-func (s *Store) ImportModels(items []ModelImportItem, dryRun bool) (ModelImportResult, error) {
-	result := ModelImportResult{
-		Created: []ModelImportRow{}, Updated: []ModelImportRow{}, Skipped: []ModelImportRow{},
-		Conflicts: []ModelImportRow{}, MissingPrice: []ModelImportRow{}, AffectedKeys: []string{},
-	}
+// ImportModels creates the requested models at $0 in one state write; prices
+// are synced afterwards. Invalid items reject the whole batch.
+func (s *Store) ImportModels(items []ModelImportItem) (ModelImportResult, error) {
+	result := ModelImportResult{Created: []ModelImportRow{}, Skipped: []ModelImportRow{}}
 	if len(items) == 0 {
 		return result, nil
 	}
@@ -59,122 +42,49 @@ func (s *Store) ImportModels(items []ModelImportItem, dryRun bool) (ModelImportR
 	s.mu.RLock()
 	keys := s.keysSnapshotLocked()
 	models := s.modelsSnapshotLocked()
-	rules := s.classifyRulesSnapshotLocked()
-	refs := s.modelRefIndexLocked()
 	path, datasetID := s.statePath, s.datasetID
 	s.mu.RUnlock()
 
-	existing := make(map[string]int, len(models))
-	for i, model := range models {
-		existing[strings.ToLower(model.Name)] = i
+	taken := make(map[string]bool, len(models)+len(items))
+	for _, model := range models {
+		taken[strings.ToLower(model.Name)] = true
 	}
-	batchNames := make(map[string]int)
-	affected := make(map[string]struct{})
-	blocking := false
-	nextModels := append([]ModelDefinition(nil), models...)
-
+	batch := make(map[string]bool, len(items))
 	for _, item := range items {
-		row, model, err := normalizeImportItem(item)
-		if err != nil {
-			return result, fmt.Errorf("%w: %v", ErrInvalidModelImport, err)
+		name := strings.TrimSpace(item.Name)
+		if name == "" {
+			name = strings.TrimSpace(item.TargetModel)
 		}
-		nameKey := strings.ToLower(model.Name)
-		if seen := batchNames[nameKey]; seen > 0 {
-			row.Action = "conflict"
-			row.Reason = "duplicate_batch_name"
-			row.Duplicate = true
-			result.Conflicts = append(result.Conflicts, row)
-			blocking = true
+		if name == "" {
+			return result, fmt.Errorf("%w: target_model is required", ErrInvalidModelImport)
+		}
+		switch lower := strings.ToLower(name); {
+		case batch[lower]:
+			result.Skipped = append(result.Skipped, ModelImportRow{Name: name, Reason: "duplicate"})
 			continue
-		}
-		batchNames[nameKey] = 1
-		if item.MissingPrice && !item.Free {
-			row.Action = "missing_price"
-			row.Reason = "missing_price"
-			row.MissingPrice = true
-			result.MissingPrice = append(result.MissingPrice, row)
-			blocking = true
+		case taken[lower]:
+			batch[lower] = true
+			result.Skipped = append(result.Skipped, ModelImportRow{Name: name, Reason: "exists"})
 			continue
+		default:
+			batch[lower] = true
 		}
-		if item.PriceConflict && !item.Free {
-			row.Action = "conflict"
-			row.Reason = "target_price_conflict"
-			row.PriceConflict = true
-			result.Conflicts = append(result.Conflicts, row)
-			blocking = true
-			continue
-		}
-		if index, ok := existing[nameKey]; ok {
-			row.AffectedKeys = append([]string(nil), refs[nameKey]...)
-			for _, keyID := range row.AffectedKeys {
-				affected[keyID] = struct{}{}
-			}
-			if !item.Overwrite {
-				row.Action = "skip"
-				row.Reason = "exists"
-				result.Skipped = append(result.Skipped, row)
-				continue
-			}
-			model.BillingMultiplier = nextModels[index].BillingMultiplier
-			nextModels[index] = model
-			row.Action = "update"
-			result.Updated = append(result.Updated, row)
-			continue
-		}
-		nextModels = append(nextModels, model)
-		existing[nameKey] = len(nextModels) - 1
-		row.Action = "create"
-		result.Created = append(result.Created, row)
+		models = append(models, ModelDefinition{Name: name, Provider: item.Provider, TargetModel: item.TargetModel})
+		result.Created = append(result.Created, ModelImportRow{Name: name})
 	}
-
-	for keyID := range affected {
-		result.AffectedKeys = append(result.AffectedKeys, keyID)
+	if len(result.Created) == 0 {
+		return result, nil
 	}
-	sort.Strings(result.AffectedKeys)
-	if blocking {
-		if dryRun {
-			return result, nil
-		}
-		return result, fmt.Errorf("%w: batch contains missing prices or conflicts", ErrInvalidModelImport)
-	}
-	cfg := Config{Enabled: true, Keys: keys, Models: nextModels, ClassifyRules: rules}
+	cfg := Config{Enabled: true, Keys: keys, Models: models}
 	if err := normalizeConfig(&cfg); err != nil {
-		return result, fmt.Errorf("%w: %v", ErrInvalidModelImport, err)
+		return ModelImportResult{Created: []ModelImportRow{}, Skipped: []ModelImportRow{}}, fmt.Errorf("%w: %v", ErrInvalidModelImport, err)
 	}
-	if dryRun {
-		return result, nil
+	if err := s.saveState(path, datasetID, cfg.Keys, cfg.Models); err != nil {
+		return ModelImportResult{Created: []ModelImportRow{}, Skipped: []ModelImportRow{}}, err
 	}
-	if len(result.Created) == 0 && len(result.Updated) == 0 {
-		return result, nil
-	}
-	if err := s.saveState(path, datasetID, cfg.Keys, cfg.Models, cfg.ClassifyRules); err != nil {
-		return result, err
-	}
-	s.publishModels(cfg.Models, true)
+	s.publishModels(cfg.Models)
 	for _, created := range result.Created {
 		s.recordAudit(audit.Event{Action: "import_create_model", Changes: map[string]audit.Change{"model": {From: "", To: created.Name}}})
 	}
-	for _, updated := range result.Updated {
-		s.recordAudit(audit.Event{Action: "import_overwrite_model", Changes: map[string]audit.Change{
-			"model":         {From: updated.Name, To: updated.Name},
-			"affected_keys": {From: updated.AffectedKeys, To: updated.AffectedKeys},
-		}})
-	}
 	return result, nil
-}
-
-func normalizeImportItem(item ModelImportItem) (ModelImportRow, ModelDefinition, error) {
-	name := strings.TrimSpace(item.Name)
-	if name == "" {
-		return ModelImportRow{}, ModelDefinition{}, errors.New("model name is required")
-	}
-	if len(item.Targets) != 1 {
-		return ModelImportRow{Name: name, Action: "conflict", Reason: "multiple_targets"}, ModelDefinition{}, fmt.Errorf("model %q must bind exactly one target", name)
-	}
-	model := ModelDefinition{
-		Name: name, Targets: item.Targets, Dispatch: item.Dispatch, BillingMode: item.BillingMode, Free: item.Free,
-		InputPricePerMillion: item.Input, OutputPricePerMillion: item.Output,
-		CacheReadPricePerMillion: item.CacheRead, CacheWritePricePerMillion: item.CacheWrite, PerCallUSD: item.PerCallUSD,
-	}
-	return ModelImportRow{Name: name, AffectedKeys: []string{}}, model, nil
 }

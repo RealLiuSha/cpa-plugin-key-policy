@@ -87,11 +87,12 @@ describe("translate", () => {
         "models.importFromCpa",
         "models.cacheWritePrice",
         "keyUsage.colCacheWrite",
-        "credentialGroups.title",
-        "credentialGroups.preview",
-        "credentialGroups.matchCount",
+        "models.unpriced",
+        "models.importCount",
+        "models.syncHint",
         "audit.title",
-        "audit.actorHint",
+        "audit.action.migrate_state",
+        "audit.field.billing_multiplier",
       ]) {
         expect(translate(key)).not.toBe(key);
       }

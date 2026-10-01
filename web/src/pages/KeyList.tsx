@@ -127,7 +127,7 @@ export default function KeyList() {
               {!!key.usage.limited_models?.length && <span className="key-reason">{t("quota.limitedModels", { names: key.usage.limited_models.join("、") })}</span>}
             </div>
             <QuotaUsage usage={key.usage} />
-            <div className="key-row-actions"><Link className="btn sm" to={`/keys/${encodeURIComponent(key.id)}/usage`} state={{ keyListReturnTo }}>{t("keys.detail")}</Link><button className="btn sm" onClick={() => setResetKey(key.id)}>{t("quota.resetTitle")}</button><KeyMoreMenu keyId={key.id} keyListReturnTo={keyListReturnTo} items={["edit", "rpm", "rotate", "delete"]} onResetComplete={load} onDeleted={load} onRotated={setPlain} /></div>
+            <div className="key-row-actions"><Link className="btn sm" to={`/keys/${encodeURIComponent(key.id)}/usage`} state={{ keyListReturnTo }}>{t("keys.detail")}</Link><Link className="btn sm" to={`/keys/${encodeURIComponent(key.id)}/edit`} state={{ keyListReturnTo }}>{t("keys.edit")}</Link><button className="btn sm" onClick={() => setResetKey(key.id)}>{t("quota.resetTitle")}</button><KeyMoreMenu keyId={key.id} keyListReturnTo={keyListReturnTo} items={["rpm", "rotate", "delete"]} onResetComplete={load} onDeleted={load} onRotated={setPlain} /></div>
           </article>;
         })}
       </div> : <div className="card key-empty"><strong>{t(keys.length ? "keys.searchNoMatch" : "keys.empty")}</strong>{keys.length > 0 && <button className="btn" onClick={() => setParams({}, { replace: true })}>{t("quota.clearFilters")}</button>}</div>}

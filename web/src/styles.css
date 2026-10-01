@@ -227,13 +227,14 @@ a.btn { text-decoration: none; color: var(--text); }
 .form-grid > label:not(.check-row),
 .field-row > label:not(.check-row),
 .model-form section.card > label,
-.model-import label {
+.model-import label:not(.check-row) {
   display: flex; flex-direction: column; gap: 6px; min-width: 0;
 }
 .field-label,
 .form-grid > label:not(.check-row),
 .field-row > label:not(.check-row),
 .model-form section.card > label,
+.upstream-row > label,
 .check-field legend {
   color: var(--text); font-size: 13px; font-weight: 600;
 }
@@ -306,26 +307,6 @@ td .mono, .mono { font-family: var(--mono); font-size: 12px; }
 
 .actions { display: flex; gap: 8px; flex-wrap: wrap; }
 .spacer { flex: 1; }
-
-/* Model picker — chips with panel SelectionCheckbox treatment */
-.picker-group { margin-bottom: 16px; }
-.picker-group .pg-head {
-  color: var(--muted); font-size: 11px; margin: 14px 0 8px;
-  font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase;
-}
-.picker-group .pg-models { display: flex; flex-wrap: wrap; gap: 8px; }
-.picker-group label {
-  display: inline-flex; align-items: center; gap: 6px;
-  background: var(--bg); border: 1px solid var(--border);
-  padding: 6px 11px; border-radius: var(--r-md);
-  cursor: pointer; font-size: 13px; font-weight: 500;
-  transition: border-color var(--t-fast), background-color var(--t-fast), box-shadow var(--t-fast);
-}
-.picker-group label input { accent-color: var(--accent); width: 14px; height: 14px; }
-.picker-group label:hover { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent-ring); }
-.picker-group label.active {
-  border-color: var(--accent); background: var(--accent-soft); color: var(--accent-3);
-}
 
 /* Modal — panel .modal-overlay / .modal */
 .modal-overlay {
@@ -799,27 +780,6 @@ td.strong { font-weight: 600; color: var(--text); }
 }
 .mmodels .mm-price.per_call { color: var(--accent); }
 
-/* .usage-hero-d: desktop summary hero on the KeyUsage page (3 stat tiles
- * + a usage progress bar). Mobile uses .usage-hero (ring chart) instead. */
-.usage-hero-d {
-  display: none;
-  background: var(--panel); border: 1px solid var(--border);
-  border-radius: var(--r-md); padding: 20px; margin-bottom: 16px;
-}
-.usage-hero-d .uhd-tiles { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin-bottom: 16px; }
-.usage-hero-d .uhd-tile { display: flex; flex-direction: column; gap: 4px; }
-.usage-hero-d .uhd-tk { font-size: 11px; font-weight: 700; letter-spacing: 0.05em; text-transform: uppercase; color: var(--muted); }
-.usage-hero-d .uhd-tv { font-size: 26px; font-weight: 700; line-height: 1.1; font-family: var(--mono); }
-.usage-hero-d .uhd-tv.accent { color: var(--accent); }
-.usage-hero-d .uhd-bar { height: 6px; border-radius: var(--r-full); background: var(--muted-bg); overflow: hidden; margin-bottom: 6px; }
-.usage-hero-d .uhd-bar > span { display: block; height: 100%; border-radius: var(--r-full); background: var(--accent); }
-.usage-hero-d .uhd-bar.over > span { background: var(--danger); }
-.usage-hero-d .uhd-barcap { display: flex; justify-content: space-between; font-size: 12px; color: var(--muted); }
-.usage-hero-d .uhd-barcap .over { color: var(--danger); font-weight: 600; }
-@media (min-width: 641px) {
-  .usage-hero-d { display: block; }
-}
-
 /* Login centered card (desktop). Mobile uses the compact .app + .header. */
 .login-page {
   min-height: 100vh; display: flex; flex-direction: column;
@@ -836,22 +796,6 @@ td.strong { font-weight: 600; color: var(--text); }
   /* On mobile, fall back to the standard .app shell layout for login. */
   .login-page { min-height: auto; justify-content: flex-start; padding: 0; }
 }
-
-/* Model picker standalone page (desktop + mobile). */
-.model-pick-page { display: flex; flex-direction: column; gap: 16px; }
-.model-pick-page .mp-head { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
-.model-pick-page .mp-head h1 { margin: 0; font-size: 20px; font-weight: 700; flex: 1; min-width: 0; }
-.model-pick-page .mp-sub { font-size: 12px; color: var(--muted); margin-top: -8px; }
-.model-pick-page .mp-search { position: relative; }
-.model-pick-page .mp-search .input { padding-left: 34px; }
-.model-pick-page .mp-search .mp-icon { position: absolute; left: 10px; top: 50%; transform: translateY(-50%); color: var(--muted); font-size: 16px; pointer-events: none; }
-.model-pick-page .mp-list { max-height: 60vh; overflow-y: auto; }
-.model-pick-page .mp-footer {
-  display: flex; align-items: center; justify-content: space-between; gap: 12px;
-  position: sticky; bottom: 0; background: var(--bg); padding: 12px 0; border-top: 1px solid var(--border);
-}
-.model-pick-page .mp-footer .mp-count { font-size: 13px; color: var(--muted); }
-.model-pick-page .mp-footer .mp-btns { display: flex; gap: 8px; }
 
 /* Desktop form page: keep 2-col grids, card surface, h1 + actions row. */
 .form-page .fp-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; }
@@ -898,7 +842,7 @@ td.strong { font-weight: 600; color: var(--text); }
 .sechead .sh-chevron { color: var(--muted); cursor: pointer; }
 
 /* Hide mobile-only blocks on desktop. .usage-hero stays hidden on desktop
- * because the desktop usage page uses .usage-hero-d instead. .seg is hidden
+ * on desktop. .seg is hidden
  * on desktop globally, but the KeyUsage header's toggle is un-hidden below
  * so the window switch still works on desktop. */
 @media (min-width: 641px) {
@@ -978,12 +922,10 @@ td.strong { font-weight: 600; color: var(--text); }
 }
 
 .audit-changes {
-  max-width: 460px;
-  white-space: normal;
   overflow-wrap: anywhere;
 }
 
-/* ===== model and credential-group management ===== */
+/* ===== model management ===== */
 .page { display: flex; flex-direction: column; gap: 16px; }
 .page-head-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .page-head,
@@ -1060,55 +1002,27 @@ td.strong { font-weight: 600; color: var(--text); }
   padding: 2px 8px; border: 1px solid var(--border); border-radius: var(--r-full);
   background: var(--muted-bg); color: var(--muted); font-size: 11px; font-weight: 600;
 }
-.chip-row { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
-.chip-row .chip {
-  display: inline-flex; align-items: center; max-width: 240px; padding: 3px 8px;
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-  border: 1px solid var(--border); border-radius: var(--r-sm);
-  background: var(--muted-bg); color: var(--muted); font-size: 11px;
-}
-.chip-row .chip.more { color: var(--text); font: inherit; font-size: 11px; font-weight: 600; cursor: pointer; }
 .model-import { display: flex; flex-direction: column; gap: 10px; }
-.model-import textarea { width: 100%; font-family: var(--mono); }
-.model-import-wizard, .import-rows { display: flex; flex-direction: column; gap: 12px; }
-.import-row { display: flex; flex-direction: column; gap: 8px; padding: 12px; border: 1px solid var(--border); border-radius: var(--r-md); }
-@media (max-width: 720px) {
-  .import-row .field-row { flex-direction: column; }
-}
 .model-form section.card { display: flex; flex-direction: column; gap: 16px; }
 .model-form section.card > p { margin: 0; }
 .model-table.card.table-wrap { overflow-x: auto; }
-.model-table table { min-width: 980px; }
+.model-table table { min-width: 860px; }
 .model-table th,
 .model-table td { vertical-align: middle; }
-.model-table .model-price { min-width: 180px; color: var(--muted); white-space: normal; }
-.model-table .chip-row { min-width: 220px; }
-.model-actions { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; }
-.model-actions .card-actions { flex-wrap: nowrap; }
-.action-reason { max-width: 180px; color: var(--muted); font-size: 11px; line-height: 1.3; }
+.model-table .model-price { min-width: 220px; white-space: normal; }
+.model-table .model-name { white-space: nowrap; }
 .field-row {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
   gap: 12px;
   align-items: end;
 }
-.rule-row {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  gap: 16px;
-  padding: 12px 0;
-  border-bottom: 1px solid var(--border);
-}
-.rule-row:last-child { border-bottom: 0; }
-.rule-preview-count { margin-top: 4px; color: var(--accent); font-size: 12px; }
 .row-actions,
 .card-actions { flex-wrap: wrap; }
 
 @media (max-width: 640px) {
   .page-head,
-  .section-title-row,
-  .rule-row { align-items: stretch; flex-direction: column; }
+  .section-title-row { align-items: stretch; flex-direction: column; }
   .page-head-actions > * { flex: 1; }
   .form-grid { grid-template-columns: 1fr; }
   .model-definition-toolbar { grid-template-columns: 1fr; align-items: stretch; }
@@ -1120,4 +1034,62 @@ td.strong { font-weight: 600; color: var(--text); }
   .model-limit-field { width: 100%; }
   .model-cards.mobile-only { display: flex !important; flex-direction: column; gap: 12px; }
   .row-actions .btn { flex: 1; }
+}
+
+/* ===== 1.0: notices, choice lists, import, price sync, audit ===== */
+.notice {
+  margin: 0; padding: 8px 12px; font-size: 13px; line-height: 1.5;
+  color: #8a6100; background: color-mix(in srgb, var(--warn) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--warn) 45%, transparent); border-radius: var(--r-md);
+}
+.notice-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.badge.warn { color: #8a6100; border-color: color-mix(in srgb, var(--warn) 45%, transparent); background: color-mix(in srgb, var(--warn) 12%, transparent); }
+.field-label .badge { margin-left: 8px; vertical-align: middle; }
+.model-price small { display: block; margin-top: 2px; }
+.upstream-row { display: grid; grid-template-columns: 1fr 1fr auto; gap: 12px; align-items: end; }
+.upstream-row > label { display: flex; flex-direction: column; gap: 6px; }
+.seg-inline { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
+.seg-inline .field-label { margin: 0; }
+.choice-list {
+  display: flex; flex-direction: column; max-height: min(56vh, 520px); overflow-y: auto;
+  border: 1px solid var(--border); border-radius: var(--r-md); background: var(--panel);
+}
+.choice-row, .import-item, .sync-item { border-bottom: 1px solid var(--border); }
+.choice-row:last-child, .import-item:last-child, .sync-item:last-child { border-bottom: 0; }
+.choice-row {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px; width: 100%;
+  padding: 10px 14px; border-left: 0; border-right: 0; border-top: 0; background: none;
+  color: var(--text); font: inherit; text-align: left; cursor: pointer;
+}
+.choice-row:hover { background: var(--row-hover); }
+.choice-row.active, .import-item.active, .sync-item.active { background: var(--accent-soft); }
+.import-toolbar { display: grid; grid-template-columns: 1fr auto auto; gap: 8px; align-items: center; }
+.import-item { display: grid; grid-template-columns: 1fr auto auto; gap: 12px; align-items: center; padding: 8px 14px; }
+.import-item.disabled { color: var(--muted); }
+.import-item .check-row { margin: 0; min-height: 36px; }
+.import-provider { width: auto; min-width: 140px; padding: 6px 10px; }
+.import-state { font-size: 12px; }
+.sync-item { display: flex; flex-direction: column; gap: 8px; padding: 12px 14px; }
+.sync-item .check-row { gap: 8px; flex-wrap: wrap; margin: 0; min-height: 0; }
+.model-import > .form-actions { margin-top: 4px; }
+.usage-chart-label { fill: var(--muted); font-size: 8px; }
+.keyusage-total td { font-weight: 600; border-top: 1px solid var(--border-strong); border-bottom: 0; }
+.topnav.embedded .topnav-inner { justify-content: flex-start; }
+.audit-page .fp-head { flex-direction: column; align-items: flex-start; gap: 4px; }
+.audit-page .fp-head p { margin: 0; }
+.audit-page .key-list-toolbar { display: flex; gap: 8px; align-items: center; }
+.audit-page .key-list-toolbar .input { flex: 1; }
+.audit-list { display: flex; flex-direction: column; gap: 10px; }
+.audit-item { padding: 12px 16px; }
+.audit-head { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+.audit-head time { margin-left: auto; font-size: 12px; }
+ul.audit-changes { margin: 8px 0 0; padding-left: 18px; color: var(--muted); font-size: 13px; line-height: 1.6; }
+@media (max-width: 640px) {
+  .upstream-row { grid-template-columns: 1fr; }
+  .import-toolbar { grid-template-columns: 1fr 1fr; }
+  .import-toolbar .input { grid-column: 1 / -1; }
+  .import-item { grid-template-columns: 1fr auto; }
+  .import-state { grid-column: 1 / -1; }
+  .notice-row { flex-direction: column; align-items: stretch; }
+  .audit-head time { margin-left: 0; }
 }

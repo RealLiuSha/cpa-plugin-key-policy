@@ -6,7 +6,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 )
 
 func TestConfigRejectsUnknownField(t *testing.T) {
@@ -22,15 +21,12 @@ func TestModelDefinitionValidation(t *testing.T) {
 		models []ModelDefinition
 		want   string
 	}{
-		{"empty name", []ModelDefinition{{Targets: valid.Targets, Free: true}}, "name is required"},
+		{"empty name", []ModelDefinition{{Provider: "codex", TargetModel: "gpt"}}, "name is required"},
 		{"duplicate name", []ModelDefinition{valid, freeTestModel("fast", "codex", "other")}, "duplicate model name"},
-		{"no target", []ModelDefinition{{Name: "x", Free: true}}, "at least one target"},
-		{"duplicate target", []ModelDefinition{{Name: "x", Free: true, Targets: []ModelTarget{{Provider: "codex", TargetModel: "gpt"}, {Provider: "CODEX", TargetModel: "GPT"}}}}, "duplicate target"},
-		{"bad dispatch", []ModelDefinition{{Name: "x", Free: true, Dispatch: "random", Targets: valid.Targets}}, "dispatch"},
-		{"negative price", []ModelDefinition{{Name: "x", Targets: valid.Targets, InputPricePerMillion: -1}}, "negative"},
-		{"unpriced tokens", []ModelDefinition{{Name: "x", Targets: valid.Targets}}, "positive token price"},
-		{"unpriced call", []ModelDefinition{{Name: "x", Targets: valid.Targets, BillingMode: "per_call"}}, "per_call_usd"},
-		{"free with price", []ModelDefinition{{Name: "x", Free: true, Targets: valid.Targets, InputPricePerMillion: 1}}, "all price fields must be zero"},
+		{"no upstream", []ModelDefinition{{Name: "x"}}, "provider and target_model are required"},
+		{"bad billing mode", []ModelDefinition{{Name: "x", Provider: "codex", TargetModel: "gpt", BillingMode: "monthly"}}, "billing_mode"},
+		{"negative price", []ModelDefinition{{Name: "x", Provider: "codex", TargetModel: "gpt", InputPricePerMillion: -1}}, "negative"},
+		{"multiplier below one", []ModelDefinition{{Name: "x", Provider: "codex", TargetModel: "gpt", BillingMultiplier: 0.5}}, "billing_multiplier"},
 	}
 	for _, test := range cases {
 		t.Run(test.name, func(t *testing.T) {
@@ -40,12 +36,38 @@ func TestModelDefinitionValidation(t *testing.T) {
 			}
 		})
 	}
-	cfg := Config{Models: []ModelDefinition{valid}, Keys: []KeyConfig{{ID: "k", Models: []KeyModelRef{{Name: " fast "}}}}}
+	unpriced := []ModelDefinition{valid, {Name: "image", Provider: "xai", TargetModel: "grok-imagine", BillingMode: "per_call"}}
+	cfg := Config{Models: unpriced, Keys: []KeyConfig{{ID: "k", Models: []KeyModelRef{{Name: " fast "}}}}}
 	if err := normalizeConfig(&cfg); err != nil {
+		t.Fatalf("zero prices must be accepted: %v", err)
+	}
+	if cfg.Models[0].Provider != "codex" || cfg.Models[0].BillingMultiplier != 1 || cfg.Keys[0].Models[0].Name != "Fast" {
+		t.Fatalf("normalization failed: %+v", cfg)
+	}
+}
+
+// An unchanged CPA config.yaml written for older releases must keep
+// registering; removed settings are ignored and seeds keep the first target.
+func TestLegacyConfigSeedsStillParse(t *testing.T) {
+	cfg, err := ParseConfig([]byte(`
+models:
+  - name: chat
+    dispatch: priority
+    free: true
+    targets:
+      - {provider: Codex, target_model: gpt-a, group: team}
+      - {provider: openai, target_model: gpt-b}
+classify_rules:
+  - {name: team, field: filename, pattern: team, group: team, enabled: true}
+`))
+	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Models[0].Targets[0].Provider != "codex" || cfg.Keys[0].Models[0].Name != "Fast" {
-		t.Fatalf("normalization failed: %+v", cfg)
+	if len(cfg.Models) != 1 || cfg.Models[0].Provider != "Codex" || cfg.Models[0].TargetModel != "gpt-a" {
+		t.Fatalf("seed projection = %+v", cfg.Models)
+	}
+	if _, err := ParseConfig([]byte("models:\n  - {name: x, provider: codex, target_model: a, targets: [{provider: codex, target_model: b}]}\n")); err == nil {
+		t.Fatal("a model with both upstream forms must be rejected")
 	}
 }
 
@@ -65,92 +87,24 @@ func TestKeyModelReferenceValidation(t *testing.T) {
 	}
 }
 
-func TestClassifyRuleValidation(t *testing.T) {
-	cfg := Config{ClassifyRules: []ClassifyRule{{Name: "team", Field: "filename", Pattern: "[", Group: "team", Enabled: true}}}
-	if err := normalizeConfig(&cfg); err == nil || !strings.Contains(err.Error(), "invalid regex") {
-		t.Fatalf("error = %v", err)
-	}
-	cfg = Config{ClassifyRules: []ClassifyRule{
-		{Name: "team", Field: "filename", Pattern: ".*", Group: "team"},
-		{Name: "TEAM", Field: "provider", Pattern: ".*", Group: "other"},
-	}}
-	if err := normalizeConfig(&cfg); err == nil || !strings.Contains(err.Error(), "duplicate classify rule") {
-		t.Fatalf("error = %v", err)
-	}
-}
-
-func TestRoundRobinDispatch(t *testing.T) {
-	store, plain := configuredDispatchStore(t, "round-robin")
-	headers := http.Header{"Authorization": {"Bearer " + plain}}
-	got := make([]string, 0, 4)
-	for i := 0; i < 4; i++ {
-		route, _, ok := store.Route(headers, nil, "chat")
-		if !ok {
-			t.Fatal("route not handled")
-		}
-		got = append(got, route.TargetModel)
-	}
-	want := []string{"gpt-a", "gpt-b", "gpt-a", "gpt-b"}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Fatalf("sequence = %v, want %v", got, want)
-		}
-	}
-}
-
-func TestPriorityDispatch(t *testing.T) {
-	store, plain := configuredDispatchStore(t, "priority")
-	headers := http.Header{"Authorization": {"Bearer " + plain}}
-	for i := 0; i < 3; i++ {
-		route, _, ok := store.Route(headers, nil, "chat")
-		if !ok || route.TargetModel != "gpt-a" {
-			t.Fatalf("route %d = %+v, ok=%v", i, route, ok)
-		}
-	}
-}
-
-func TestResponseModelLookupDoesNotAdvanceRoundRobin(t *testing.T) {
-	store, plain := configuredDispatchStore(t, "round-robin")
-	headers := http.Header{"Authorization": {"Bearer " + plain}}
-
-	firstDecision := store.Authenticate(http.MethodPost, "/v1/chat/completions", headers, nil, []byte(`{"model":"chat"}`))
-	if !firstDecision.Allowed {
-		t.Fatalf("first authentication = %+v", firstDecision)
-	}
-	firstRoute, _, ok := store.Route(headers, nil, "chat")
-	if !ok || firstRoute.TargetModel != "gpt-a" {
-		t.Fatalf("first route = %+v, ok=%v", firstRoute, ok)
-	}
-	if publicModel, ok := store.ResponseModel(headers, nil, "chat"); !ok || publicModel != "chat" {
-		t.Fatalf("response model = %q, ok=%v", publicModel, ok)
-	}
-
-	secondDecision := store.Authenticate(http.MethodPost, "/v1/chat/completions", headers, nil, []byte(`{"model":"chat"}`))
-	if !secondDecision.Allowed {
-		t.Fatalf("second authentication = %+v", secondDecision)
-	}
-	secondRoute, _, ok := store.Route(headers, nil, "chat")
-	if !ok || secondRoute.TargetModel != "gpt-b" {
-		t.Fatalf("response lookup advanced round-robin: second route = %+v, ok=%v", secondRoute, ok)
-	}
-}
-
-func configuredDispatchStore(t *testing.T, dispatch string) (*Store, string) {
-	t.Helper()
-	plain := "dispatch-key"
+func TestRouteResolvesTheModelUpstream(t *testing.T) {
+	plain := "route-key"
 	hash, _ := HashKey(plain)
-	model := ModelDefinition{
-		Name: "chat", Dispatch: dispatch, BillingMode: "tokens", Free: true,
-		Targets: []ModelTarget{{Provider: "codex", TargetModel: "gpt-a"}, {Provider: "codex", TargetModel: "gpt-b"}},
-	}
 	store := NewStore()
 	if err := store.Configure(Config{
-		Enabled: true, StateFile: filepath.Join(t.TempDir(), "state.json"), Models: []ModelDefinition{model},
-		Keys: []KeyConfig{{ID: "k", Enabled: true, KeyHash: hash, Models: modelRefs("chat")}},
+		Enabled: true, StateFile: filepath.Join(t.TempDir(), "state.json"),
+		Models: []ModelDefinition{freeTestModel("chat", "codex", "gpt-a"), freeTestModel("other", "codex", "gpt-b")},
+		Keys:   []KeyConfig{{ID: "k", Enabled: true, KeyHash: hash, Models: modelRefs("chat")}},
 	}); err != nil {
 		t.Fatal(err)
 	}
-	return store, plain
+	headers := http.Header{"Authorization": {"Bearer " + plain}}
+	if model, keyID, ok := store.Route(headers, nil, "CHAT"); !ok || keyID != "k" || model.Provider != "codex" || model.TargetModel != "gpt-a" {
+		t.Fatalf("route = %+v %q %v", model, keyID, ok)
+	}
+	if _, _, ok := store.Route(headers, nil, "other"); ok {
+		t.Fatal("a model the key does not reference must not route")
+	}
 }
 
 func TestUpsertAndDeleteModel(t *testing.T) {
@@ -173,7 +127,7 @@ func TestUpsertAndDeleteModel(t *testing.T) {
 	if err := store.UpsertModel(updated); err != nil {
 		t.Fatal(err)
 	}
-	if got := store.ModelsSnapshot(); len(got) != 1 || got[0].Name != "Fast" || got[0].Targets[0].TargetModel != "gpt-next" {
+	if got := store.ModelsSnapshot(); len(got) != 1 || got[0].Name != "Fast" || got[0].TargetModel != "gpt-next" {
 		t.Fatalf("case-insensitive update changed model identity: %+v", got)
 	}
 	if got := store.Keys()[0].Models[0].Name; got != "Fast" {
@@ -212,57 +166,8 @@ func TestModelMutationSaveFailureDoesNotPublishRuntimeIndex(t *testing.T) {
 		t.Fatal("model update unexpectedly succeeded with an invalid persistence path")
 	}
 	models := store.ModelsSnapshot()
-	if len(models) != 1 || models[0].Targets[0].Provider != "codex" || models[0].Targets[0].TargetModel != "gpt" {
+	if len(models) != 1 || models[0].Provider != "codex" || models[0].TargetModel != "gpt" {
 		t.Fatalf("failed persistence published a partial runtime model: %+v", models)
-	}
-}
-
-func TestClassifyRuleCRUDAndReorder(t *testing.T) {
-	store := NewStore()
-	if err := store.Configure(Config{Enabled: true, StateFile: filepath.Join(t.TempDir(), "state.json")}); err != nil {
-		t.Fatal(err)
-	}
-	for _, rule := range []ClassifyRule{
-		{Name: "one", Field: "filename", Pattern: "one", Group: "one", Enabled: true},
-		{Name: "two", Field: "filename", Pattern: "two", Group: "two", Enabled: true},
-		{Name: "three", Field: "filename", Pattern: "three", Group: "three", Enabled: true},
-	} {
-		if err := store.UpsertClassifyRule(rule); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := store.ReorderClassifyRules([]string{"three", "one"}); err != nil {
-		t.Fatal(err)
-	}
-	rules := store.ClassifyRulesSnapshot()
-	if rules[0].Name != "three" || rules[1].Name != "one" || rules[2].Name != "two" {
-		t.Fatalf("reordered rules = %+v", rules)
-	}
-	if err := store.DeleteClassifyRule("one"); err != nil {
-		t.Fatal(err)
-	}
-	if got := store.ClassifyRulesSnapshot(); len(got) != 2 {
-		t.Fatalf("rules after delete = %+v", got)
-	}
-}
-
-func TestClassifyRuleChangeCallbackCanReenterStore(t *testing.T) {
-	store := NewStore()
-	if err := store.Configure(Config{Enabled: true, StateFile: filepath.Join(t.TempDir(), "state.json")}); err != nil {
-		t.Fatal(err)
-	}
-	called := make(chan struct{}, 1)
-	store.SetOnClassifyRulesChanged(func() {
-		_ = store.ClassifyRulesSnapshot()
-		called <- struct{}{}
-	})
-	if err := store.UpsertClassifyRule(ClassifyRule{Name: "x", Field: "filename", Pattern: ".*", Group: "x", Enabled: true}); err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case <-called:
-	case <-time.After(time.Second):
-		t.Fatal("callback deadlocked while re-entering store")
 	}
 }
 

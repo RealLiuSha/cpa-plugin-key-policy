@@ -70,10 +70,7 @@ func (s *Store) keysSnapshotLocked() []KeyConfig {
 func (s *Store) modelsSnapshotLocked() []ModelDefinition {
 	models := make([]ModelDefinition, 0, len(s.models))
 	for _, model := range s.models {
-		copy := *model
-		copy.Targets = append([]ModelTarget(nil), model.Targets...)
-		copy.CacheWritePricePerMillion = cloneFloat64(model.CacheWritePricePerMillion)
-		models = append(models, copy)
+		models = append(models, cloneModel(*model))
 	}
 	sort.Slice(models, func(i, j int) bool { return strings.ToLower(models[i].Name) < strings.ToLower(models[j].Name) })
 	return models
@@ -136,16 +133,6 @@ func (s *Store) ModelRefKeys(name string) []string {
 	return append([]string(nil), keys...)
 }
 
-func (s *Store) classifyRulesSnapshotLocked() []ClassifyRule {
-	return append([]ClassifyRule(nil), s.classifyRules...)
-}
-
-func (s *Store) ClassifyRulesSnapshot() []ClassifyRule {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.classifyRulesSnapshotLocked()
-}
-
 func (s *Store) UsageSummaryFor(key KeyConfig) UsageSummary {
 	_, usage := s.runtimeComponents()
 	if usage == nil {
@@ -170,9 +157,7 @@ func (s *Store) ModelUsageFor(keyID string) (KeyConfig, []ModelUsageEntry, bool)
 	definitions := make([]ModelDefinition, 0, len(key.Models))
 	for _, ref := range key.Models {
 		if model := s.models[strings.ToLower(ref.Name)]; model != nil {
-			copy := *model
-			copy.Targets = append([]ModelTarget(nil), model.Targets...)
-			definitions = append(definitions, copy)
+			definitions = append(definitions, cloneModel(*model))
 		}
 	}
 	s.mu.RUnlock()
@@ -181,7 +166,7 @@ func (s *Store) ModelUsageFor(keyID string) (KeyConfig, []ModelUsageEntry, bool)
 		rows := make([]ModelUsageEntry, 0, len(definitions))
 		for _, model := range definitions {
 			rows = append(rows, ModelUsageEntry{
-				Name: model.Name, BillingMode: model.BillingMode, Free: model.Free,
+				Name: model.Name, BillingMode: model.BillingMode,
 				PerCallUSD: model.PerCallUSD, InConfig: true,
 			})
 		}

@@ -211,8 +211,8 @@ func TestRecordUsageBillsFromParsedTokens(t *testing.T) {
 	if len(history) != 1 || history[0].InputTokens != 1_000_000 || !nearly(history[0].TotalUSD, 1.1) {
 		t.Fatalf("multiplier changed tokens or missed history: %+v", history)
 	}
-	d := store.Authenticate("POST", "/v1/chat/completions", hdr, nil, []byte(`{"model":"fast"}`))
-	if d.Allowed || !d.CostLimited || d.Reason != "daily_exceeded" {
+	d := admitRequest(store, "POST", "/v1/chat/completions", hdr, []byte(`{"model":"fast"}`))
+	if d.Allowed || d.Reason != "daily_exceeded" {
 		t.Fatalf("streaming usage should be billed & block: %+v", d)
 	}
 }
@@ -271,8 +271,8 @@ func TestRecordUsageMatchesByID(t *testing.T) {
 	if !nearly(cost, 0.50) {
 		t.Fatalf("cost = %v, want 0.50", cost)
 	}
-	d := store.Authenticate("POST", "/v1/chat/completions", hdr, nil, []byte(`{"model":"fast"}`))
-	if d.Allowed || !d.CostLimited || d.Reason != "daily_exceeded" {
+	d := admitRequest(store, "POST", "/v1/chat/completions", hdr, []byte(`{"model":"fast"}`))
+	if d.Allowed || d.Reason != "daily_exceeded" {
 		t.Fatalf("ID-matched usage should bill & block: %+v", d)
 	}
 }

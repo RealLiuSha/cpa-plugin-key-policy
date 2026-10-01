@@ -17,64 +17,54 @@ import (
 type Store struct {
 	// Reconfiguration must not replace a ledger while authentication or billing
 	// still holds the previous runtime. Normal requests share this read lock.
-	lifecycleMu            sync.RWMutex
-	mu                     sync.RWMutex
-	updateMu               sync.Mutex
-	persistMu              sync.Mutex
-	enabled                bool
-	statePath              string
-	datasetID              string
-	keys                   map[string]*KeyConfig
-	keysByHash             map[string]*KeyConfig
-	models                 map[string]*ModelDefinition
-	classifyRules          []ClassifyRule
-	limiter                *RateLimiter
-	usage                  *usageLedger
-	auditLog               *audit.Log
-	flusher                *usageFlusher
-	rrCounters             map[string]int
-	pendingPicks           map[string][]pendingPick
-	precharges             map[string][]time.Time
-	onClassifyRulesChanged func()
+	lifecycleMu sync.RWMutex
+	mu          sync.RWMutex
+	updateMu    sync.Mutex
+	persistMu   sync.Mutex
+	enabled     bool
+	statePath   string
+	datasetID   string
+	keys        map[string]*KeyConfig
+	keysByHash  map[string]*KeyConfig
+	models      map[string]*ModelDefinition
+	limiter     *RateLimiter
+	usage       *usageLedger
+	auditLog    *audit.Log
+	flusher     *usageFlusher
+	precharges  map[string][]time.Time
 }
 
 var ErrInvalidUsageResetWindow = errors.New("invalid usage reset window")
 var ErrUsageResetChanged = errors.New("quota period or reset date changed")
 var ErrInvalidUsageResetExpectation = errors.New("expected quota period and reset date are required")
 
-type pendingPick struct {
-	route ResolvedModelRoute
-	at    time.Time
-}
-
-const pendingPickTTL = 30 * time.Second
-const pendingPickMaxQueue = 32
-
 type AuthDecision struct {
-	Known       bool
-	Allowed     bool
-	KeyID       string
-	Principal   string
-	Requested   string
-	Route       ResolvedModelRoute
-	Reason      string
-	ModelList   bool
-	RateLimited bool
-	CostLimited bool
-	PreCharged  bool
+	Known     bool
+	Allowed   bool
+	KeyID     string
+	Principal string
+	Requested string
+	// Model is the resolved public model; its Name is empty when the request
+	// names no model.
+	Model     ModelDefinition
+	Reason    string
+	ModelList bool
+	// Denial explains an RPM or quota rejection made during authentication.
+	Denial *Denial
+	// Deferred means RPM and quota are left to the request interceptor, which
+	// can answer with 429 instead of the host's generic 401.
+	Deferred bool
 }
 
 func NewStore() *Store {
 	return &Store{
-		enabled:      DefaultConfig().Enabled,
-		keys:         make(map[string]*KeyConfig),
-		keysByHash:   make(map[string]*KeyConfig),
-		models:       make(map[string]*ModelDefinition),
-		limiter:      NewRateLimiter(),
-		usage:        newUsageLedger(time.Now),
-		rrCounters:   make(map[string]int),
-		pendingPicks: make(map[string][]pendingPick),
-		precharges:   make(map[string][]time.Time),
+		enabled:    DefaultConfig().Enabled,
+		keys:       make(map[string]*KeyConfig),
+		keysByHash: make(map[string]*KeyConfig),
+		models:     make(map[string]*ModelDefinition),
+		limiter:    NewRateLimiter(),
+		usage:      newUsageLedger(time.Now),
+		precharges: make(map[string][]time.Time),
 	}
 }
 
@@ -125,7 +115,7 @@ func (s *Store) Configure(cfg Config) (err error) {
 
 	keys := cfg.Keys
 	models := cfg.Models
-	rules := cfg.ClassifyRules
+	var removedSettings []string
 	usage := make(map[string]*UsageState)
 	datasetID := ""
 	firstBoot := false
@@ -143,7 +133,7 @@ func (s *Store) Configure(cfg Config) (err error) {
 		stateVersion, usageVersion = state.Version, usageFile.Version
 		keys = state.Keys
 		models = state.Models
-		rules = state.ClassifyRules
+		removedSettings = state.RemovedSettings
 		usage = usageFile.Usage
 		datasetID = state.DatasetID
 	case errors.Is(stateErr, os.ErrNotExist):
@@ -163,7 +153,7 @@ func (s *Store) Configure(cfg Config) (err error) {
 
 	effective := Config{
 		Enabled: cfg.Enabled, StateFile: cfg.StateFile, UsageTimezone: cfg.UsageTimezone,
-		Keys: keys, Models: models, ClassifyRules: rules,
+		Keys: keys, Models: models,
 	}
 	if err := normalizeConfig(&effective); err != nil {
 		if firstBoot {
@@ -172,7 +162,7 @@ func (s *Store) Configure(cfg Config) (err error) {
 		return fmt.Errorf("validate state: %w", err)
 	}
 	cfg = effective
-	keys, models, rules = cfg.Keys, cfg.Models, cfg.ClassifyRules
+	keys, models = cfg.Keys, cfg.Models
 
 	now := clockNow().UTC()
 	nextKeys := make(map[string]*KeyConfig, len(keys))
@@ -194,9 +184,7 @@ func (s *Store) Configure(cfg Config) (err error) {
 	}
 	nextModels := make(map[string]*ModelDefinition, len(models))
 	for i := range models {
-		copy := models[i]
-		copy.Targets = append([]ModelTarget(nil), models[i].Targets...)
-		copy.CacheWritePricePerMillion = cloneFloat64(models[i].CacheWritePricePerMillion)
+		copy := cloneModel(models[i])
 		nextModels[strings.ToLower(copy.Name)] = &copy
 	}
 
@@ -219,7 +207,7 @@ func (s *Store) Configure(cfg Config) (err error) {
 		if err := SaveUsage(usagePath, datasetID, usage); err != nil {
 			return fmt.Errorf("seed usage: %w", err)
 		}
-		if err := SaveState(statePath, datasetID, keys, models, rules); err != nil {
+		if err := SaveState(statePath, datasetID, keys, models); err != nil {
 			_ = os.Remove(usagePath)
 			return fmt.Errorf("seed state: %w", err)
 		}
@@ -235,18 +223,33 @@ func (s *Store) Configure(cfg Config) (err error) {
 	s.datasetID = datasetID
 	s.keys = nextKeys
 	s.models = nextModels
-	s.classifyRules = rules
 	s.auditLog = audit.New(policyPersist.AuditPath(statePath), audit.DefaultMaxBytes, audit.DefaultBackups)
 	s.rebuildKeysByHashLocked()
-	s.rrCounters = make(map[string]int)
-	s.pendingPicks = make(map[string][]pendingPick)
 	s.precharges = make(map[string][]time.Time)
 	if s.limiter == nil {
 		s.limiter = NewRateLimiter()
 	}
 	s.usage = nextUsage
 	s.mu.Unlock()
+	if stateVersion < currentStateFileVersion {
+		s.reportRemovedSettings(stateVersion, removedSettings)
+	}
 	return nil
+}
+
+// reportRemovedSettings leaves a trace of what converting an older state file
+// dropped, so operators can review it after the upgrade.
+func (s *Store) reportRemovedSettings(fromVersion int, removed []string) {
+	for _, note := range removed {
+		log.Printf("cpa-key-policy: state version %d converted: %s", fromVersion, note)
+	}
+	if len(removed) == 0 {
+		return
+	}
+	s.recordAudit(audit.Event{Action: "migrate_state", Changes: map[string]audit.Change{
+		"version": {From: fromVersion, To: currentStateFileVersion},
+		"removed": {From: removed, To: nil},
+	}})
 }
 
 func (s *Store) Enabled() bool {
@@ -398,8 +401,7 @@ func (s *Store) modelForKey(key *KeyConfig, requested string) (ModelDefinition, 
 		s.mu.RUnlock()
 		return ModelDefinition{}, false
 	}
-	copy := *model
-	copy.Targets = append([]ModelTarget(nil), model.Targets...)
+	copy := cloneModel(*model)
 	s.mu.RUnlock()
 	return copy, true
 }
@@ -433,10 +435,10 @@ func (s *Store) FlushUsage() error {
 	return nil
 }
 
-func (s *Store) saveState(path, datasetID string, keys []KeyConfig, models []ModelDefinition, rules []ClassifyRule) error {
+func (s *Store) saveState(path, datasetID string, keys []KeyConfig, models []ModelDefinition) error {
 	s.persistMu.Lock()
 	defer s.persistMu.Unlock()
-	return SaveState(path, datasetID, keys, models, rules)
+	return SaveState(path, datasetID, keys, models)
 }
 
 func (s *Store) StartUsageFlusher() func() {

@@ -55,7 +55,6 @@ export default function KeyNew() {
           setPlain(response.plain_key);
         }}
       />
-      <p className="fp-note mobile-hidden">{t("login.memoryNote")}</p>
       {plain && (
         <PlainKeyModal
           plainKey={plain}

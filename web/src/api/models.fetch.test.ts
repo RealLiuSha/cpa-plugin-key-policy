@@ -31,7 +31,8 @@ function mockCurrentCPAGet(path: string, config?: { params?: { name?: string } }
   }
   if (path.startsWith("/v0/management/model-definitions/")) {
     const channel = path.slice(path.lastIndexOf("/") + 1);
-    return Promise.resolve({ data: { channel, models: [] } });
+    const models = channel === "codex" ? [{ id: "gpt-5.4" }, { id: "gpt-5.5" }] : channel === "xai" ? [{ id: "grok-4.6" }] : [];
+    return Promise.resolve({ data: { channel, models } });
   }
   return Promise.reject(new Error(`unexpected GET ${path}`));
 }
@@ -42,26 +43,15 @@ describe("fetchCatalog current CPA contract", () => {
     client.get.mockImplementation(mockCurrentCPAGet);
   });
 
-  it("uses the plugin catalog as the only auth-file grouping authority", async () => {
-    client.post.mockResolvedValue({
-      data: { entries: [{ provider: "codex", group: "team", models: ["gpt-5.4"] }] },
-    });
-
+  it("merges auth-file models with the configured channel definitions", async () => {
     await expect(fetchCatalog()).resolves.toEqual([
-      { provider: "codex", group: "team", model: "gpt-5.4" },
+      { provider: "codex", model: "gpt-5.4" },
+      { provider: "codex", model: "gpt-5.5" },
     ]);
-    expect(client.post).toHaveBeenCalledWith("/plugin/catalog", {
-      credentials: [{
-        id: "codex-team.json",
-        provider: "codex",
-        attributes: { plan_type: "team" },
-        models: ["gpt-5.4"],
-      }],
-    });
+    expect(client.post).not.toHaveBeenCalled();
   });
 
-  it("surfaces a plugin catalog failure", async () => {
-    client.post.mockRejectedValue(new Error("catalog unavailable"));
-    await expect(fetchCatalog()).rejects.toThrow("catalog unavailable");
+  it("keeps channels that existing models route to", async () => {
+    await expect(fetchCatalog(new Set(["XAI"]))).resolves.toContainEqual({ provider: "xai", model: "grok-4.6" });
   });
 });

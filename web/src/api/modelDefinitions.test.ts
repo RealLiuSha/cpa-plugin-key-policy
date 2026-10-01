@@ -60,36 +60,35 @@ describe("model definition management APIs", () => {
     client.post.mockResolvedValue({ data: { model: { name: "fast" } } });
     await upsertModelDefinition({
       name: "fast",
-      targets: [{ provider: "codex", target_model: "gpt" }],
-      dispatch: "round-robin",
+      provider: "codex",
+      target_model: "gpt",
       billing_mode: "tokens",
-      free: false,
       input_price_per_million: 1,
       output_price_per_million: 2,
       ref_count: 2,
       ref_keys: ["k1", "k2"],
     });
     expect(client.post).toHaveBeenCalledWith("/plugin/models", {
-      billing_multiplier: 1,
       name: "fast",
-      targets: [{ provider: "codex", target_model: "gpt" }],
-      dispatch: "round-robin",
+      provider: "codex",
+      target_model: "gpt",
       billing_mode: "tokens",
-      free: false,
+      billing_multiplier: 1,
       input_price_per_million: 1,
       output_price_per_million: 2,
-      cache_read_price_per_million: undefined,
-      per_call_usd: undefined,
+      cache_read_price_per_million: 0,
+      per_call_usd: 0,
     });
   });
 
-  it("narrows import apply results", async () => {
+  it("imports catalog models and narrows the result", async () => {
     client.post.mockResolvedValue({
-      data: { created: [{ name: "fast", action: "create" }], updated: [], skipped: [], conflicts: [], missing_price: [], affected_keys: ["k1"] },
+      data: { created: [{ name: "grok-4.7" }], skipped: [{ name: "grok-4.6", reason: "exists" }] },
     });
-    await expect(importModels({ dry_run: false, items: [{ name: "fast", targets: [{ provider: "codex", target_model: "gpt" }] }] })).resolves.toEqual({
-      created: [expect.objectContaining({ name: "fast", action: "create" })],
-      updated: [], skipped: [], conflicts: [], missing_price: [], affected_keys: ["k1"],
+    await expect(importModels([{ provider: "xai", target_model: "grok-4.7" }])).resolves.toEqual({
+      created: [{ name: "grok-4.7", reason: undefined }],
+      skipped: [{ name: "grok-4.6", reason: "exists" }],
     });
+    expect(client.post).toHaveBeenCalledWith("/plugin/models/import", { items: [{ provider: "xai", target_model: "grok-4.7" }] });
   });
 });

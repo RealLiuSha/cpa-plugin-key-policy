@@ -1,55 +1,32 @@
-import { modelPriceSummary } from "../components/modelPricing";
-import { useEffect, useId, useState } from "react";
+import { basePriceSummary, isUnpriced, modelPriceSummary } from "../components/modelPricing";
+import { useCallback, useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { deleteModelDefinition, fetchModelDefinitions } from "../api/modelDefinitions";
 import Modal, { ConfirmDialog } from "../components/Modal";
-import ModelImportWizard from "../components/ModelImportWizard";
-import ModelPriceImport from "../components/ModelPriceImport";
+import ModelImport from "../components/ModelImport";
+import PriceSync from "../components/PriceSync";
 import type { ModelDefinition } from "../types";
 import { extractApiError } from "../api/error";
 import { useT } from "../i18n";
 
-
 type Translate = (key: string, variables?: Record<string, string | number>) => string;
 
-function targetLabel(target: ModelDefinition["targets"][number]): string {
-  return `${target.provider}${target.group ? ` · ${target.group}` : ""} / ${target.target_model}`;
-}
-
-function TargetChips({ model, translate }: { model: ModelDefinition; translate: Translate }) {
-  const [expanded, setExpanded] = useState(false);
-  const visibleTargets = expanded ? model.targets : model.targets.slice(0, 3);
-  const hiddenCount = Math.max(0, model.targets.length - 3);
+function PriceCell({ model, translate }: { model: ModelDefinition; translate: Translate }) {
+  if (isUnpriced(model)) return <span className="badge warn">{translate("models.unpriced")}</span>;
+  const multiplier = model.billing_multiplier ?? 1;
   return (
-    <div className="chip-row">
-      {visibleTargets.map((target) => <span className="chip" key={`${target.provider}|${target.group ?? ""}|${target.target_model}`}>{targetLabel(target)}</span>)}
-      {hiddenCount > 0 && (
-        <button type="button" className="chip more" aria-expanded={expanded} onClick={() => setExpanded((current) => !current)}>
-          {expanded ? translate("models.showLessTargets") : translate("models.moreTargets", { count: hiddenCount })}
-        </button>
-      )}
+    <div className="model-price">
+      <div>{basePriceSummary(model, translate)}</div>
+      {model.billing_mode === "tokens" && multiplier !== 1 && <small className="muted">{translate("models.chargedPrices")}：{modelPriceSummary(model, translate)}</small>}
     </div>
   );
 }
 
 function ModelActions({ model, translate, onDelete }: { model: ModelDefinition; translate: Translate; onDelete: (model: ModelDefinition) => void }) {
-  const reasonID = useId();
-  const referenced = (model.ref_count ?? 0) > 0;
   return (
-    <div className="model-actions">
-      <div className="card-actions">
-        <Link className="btn sm" to={`/models/${encodeURIComponent(model.name)}/edit`}>{translate("models.edit")}</Link>
-        <button
-          type="button"
-          className="btn sm danger"
-          disabled={referenced}
-          aria-describedby={referenced ? reasonID : undefined}
-          onClick={() => onDelete(model)}
-        >
-          {translate("models.delete")}
-        </button>
-      </div>
-      {referenced && <small id={reasonID} className="action-reason">{translate("models.deleteBlocked", { count: model.ref_count ?? 0 })}</small>}
+    <div className="card-actions">
+      <Link className="btn sm" to={`/models/${encodeURIComponent(model.name)}/edit`}>{translate("models.edit")}</Link>
+      {!model.ref_count && <button type="button" className="btn sm danger-outline" onClick={() => onDelete(model)}>{translate("models.delete")}</button>}
     </div>
   );
 }
@@ -60,11 +37,11 @@ export default function Models() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [showImport, setShowImport] = useState(false);
-  const [showSync, setShowSync] = useState(false);
+  const [syncFor, setSyncFor] = useState<string[] | null>(null);
   const [pendingDelete, setPendingDelete] = useState<ModelDefinition | null>(null);
   const [deleting, setDeleting] = useState(false);
 
-  const load = async () => {
+  const load = useCallback(async () => {
     setLoading(true);
     setError("");
     try {
@@ -74,16 +51,15 @@ export default function Models() {
     } finally {
       setLoading(false);
     }
-  };
+  }, [t]);
 
-  useEffect(() => { void load(); }, []);
+  useEffect(() => { void load(); }, [load]);
 
   const remove = async () => {
     if (!pendingDelete) return;
-    const model = pendingDelete;
     setDeleting(true);
     try {
-      await deleteModelDefinition(model.name);
+      await deleteModelDefinition(pendingDelete.name);
       setPendingDelete(null);
       await load();
     } catch (reason) {
@@ -94,31 +70,46 @@ export default function Models() {
     }
   };
 
+  const unpriced = models.filter((model) => model.billing_mode === "tokens" && isUnpriced(model));
+  const billingLabel = (model: ModelDefinition) => model.billing_mode === "per_call" ? t("models.perCall") : t("models.tokens");
+  const multiplierLabel = (model: ModelDefinition) => model.billing_mode === "tokens" ? `×${model.billing_multiplier ?? 1}` : "—";
+  const refsLabel = (model: ModelDefinition) => model.ref_count ? t("models.refs", { count: model.ref_count }) : t("models.unreferenced");
+
   return (
     <div className="page models-page">
       <div className="page-head">
         <div><h1>{t("models.title")}</h1><p className="muted">{t("models.description")}</p></div>
         <div className="page-head-actions">
           <button type="button" className="btn" onClick={() => setShowImport(true)}>{t("models.importFromCpa")}</button>
-          <button type="button" className="btn" onClick={() => setShowSync(true)}>{t("models.syncPrices")}</button>
+          <button type="button" className="btn" onClick={() => setSyncFor([])}>{t("models.syncPrices")}</button>
           <Link className="btn primary" to="/models/new">{t("models.new")}</Link>
         </div>
       </div>
-      {error && <div className="error">{error}</div>}
+      {error && <div className="error" role="alert">{error}</div>}
+      {unpriced.length > 0 && (
+        <div className="notice notice-row" role="status">
+          <span>{t("models.unpricedNotice", { count: unpriced.length, names: unpriced.map((model) => model.name).join("、") })}</span>
+          <button type="button" className="btn sm" onClick={() => setSyncFor(unpriced.map((model) => model.name))}>{t("models.syncPrices")}</button>
+        </div>
+      )}
       {loading ? <div className="muted">{t("keys.loading")}</div> : models.length === 0 ? (
         <div className="card muted">{t("models.empty")}</div>
       ) : (
         <>
-          <div className="card table-wrap model-table mobile-hidden">
+          <div className="card table-wrap model-table">
             <table>
-              <thead><tr><th>{t("models.colName")}</th><th>{t("models.colDispatch")}</th><th>{t("models.colPrice")}</th><th>{t("models.colTargets")}</th><th>{t("models.colReferences")}</th><th>{t("models.colActions")}</th></tr></thead>
+              <thead><tr>
+                <th>{t("models.colName")}</th><th>{t("models.colUpstream")}</th><th>{t("models.colBilling")}</th>
+                <th>{t("models.colPrice")}</th><th>{t("models.colMultiplier")}</th><th>{t("models.colReferences")}</th><th>{t("models.colActions")}</th>
+              </tr></thead>
               <tbody>{models.map((model) => (
                 <tr key={model.name}>
-                  <td><strong>{model.name}</strong></td>
-                  <td><span className="badge">{model.dispatch === "priority" ? t("models.priority") : t("models.roundRobin")}</span></td>
-                  <td className="mono model-price">{modelPriceSummary(model, t)}</td>
-                  <td><TargetChips model={model} translate={t} /></td>
-                  <td>{model.ref_count ? t("models.refs", { count: model.ref_count }) : t("models.unreferenced")}</td>
+                  <td className="model-name"><strong>{model.name}</strong></td>
+                  <td><span className="mono">{model.provider} / {model.target_model}</span></td>
+                  <td><span className="badge">{billingLabel(model)}</span></td>
+                  <td><PriceCell model={model} translate={t} /></td>
+                  <td className="mono">{multiplierLabel(model)}</td>
+                  <td>{refsLabel(model)}</td>
                   <td><ModelActions model={model} translate={t} onDelete={setPendingDelete} /></td>
                 </tr>
               ))}</tbody>
@@ -127,10 +118,10 @@ export default function Models() {
           <div className="model-cards mobile-only">
             {models.map((model) => (
               <article className="card model-card" key={model.name}>
-                <div className="model-card-head"><h2>{model.name}</h2><span className="badge">{model.dispatch === "priority" ? t("models.priority") : t("models.roundRobin")}</span></div>
-                <p className="mono model-price">{modelPriceSummary(model, t)}</p>
-                <TargetChips model={model} translate={t} />
-                <p className="muted">{model.ref_count ? t("models.refs", { count: model.ref_count }) : t("models.unreferenced")}</p>
+                <div className="model-card-head"><h2>{model.name}</h2><span className="badge">{billingLabel(model)}</span></div>
+                <p className="mono muted">{model.provider} / {model.target_model} · {multiplierLabel(model)}</p>
+                <PriceCell model={model} translate={t} />
+                <p className="muted">{refsLabel(model)}</p>
                 <ModelActions model={model} translate={t} onDelete={setPendingDelete} />
               </article>
             ))}
@@ -139,12 +130,17 @@ export default function Models() {
       )}
       {showImport && (
         <Modal title={t("models.importFromCpaTitle")} closeLabel={t("models.close")} onClose={() => setShowImport(false)} wide>
-          <ModelImportWizard onApplied={load} />
+          <ModelImport
+            existing={models}
+            onImported={load}
+            onSyncPrices={(names) => { setShowImport(false); setSyncFor(names); }}
+            onDone={() => setShowImport(false)}
+          />
         </Modal>
       )}
-      {showSync && (
-        <Modal title={t("models.syncTitle")} closeLabel={t("models.close")} onClose={() => setShowSync(false)} wide>
-          <ModelPriceImport onApplied={load} />
+      {syncFor && (
+        <Modal title={t("models.syncTitle")} closeLabel={t("models.close")} onClose={() => setSyncFor(null)} wide>
+          <PriceSync preselect={syncFor} onApplied={load} onDone={() => setSyncFor(null)} />
         </Modal>
       )}
       {pendingDelete && (

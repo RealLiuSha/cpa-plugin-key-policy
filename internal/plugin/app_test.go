@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -177,39 +178,68 @@ func TestAppAuthenticationUnknownKeyIsUnhandled(t *testing.T) {
 	}
 }
 
-func TestAppAuthenticationRPMExceededIsDenied(t *testing.T) {
-	app, plain := configureTestApp(t)
-	headers := http.Header{"Authorization": {"Bearer " + plain}}
-	body := []byte(`{"model":"fast"}`)
-	for i := 0; i < 60; i++ {
-		decision := app.store.Authenticate("POST", "/v1/chat/completions", headers, nil, body)
-		if !decision.Allowed {
-			t.Fatalf("warmup request %d denied: %+v", i, decision)
-		}
-	}
-	authReq, _ := json.Marshal(FrontendAuthRequest{
-		Method:  "POST",
-		Path:    "/v1/chat/completions",
-		Headers: headers,
-		Body:    body,
+// interceptBefore sends request.intercept_before in CPA's wire shape (Go field
+// names, base64 body) and decodes the plugin's answer.
+func interceptBefore(t *testing.T, app *App, headers http.Header, model, sourceFormat, requestPath string) RequestInterceptResponse {
+	t.Helper()
+	raw, err := json.Marshal(map[string]any{
+		"RequestID": "req-1", "SourceFormat": sourceFormat, "Model": model, "RequestedModel": model,
+		"Headers": headers, "Body": []byte(`{"model":"` + model + `"}`),
+		"Metadata": map[string]any{"request_path": requestPath, "requested_model": model},
 	})
-	raw, err := app.HandleMethod(MethodFrontendAuthAuthenticate, authReq)
 	if err != nil {
 		t.Fatal(err)
 	}
 	var env Envelope
-	if err := json.Unmarshal(raw, &env); err != nil {
+	if err := json.Unmarshal(mustHandle(t, app, MethodRequestInterceptBefore, raw), &env); err != nil || !env.OK {
+		t.Fatalf("intercept_before envelope = %+v, err=%v", env, err)
+	}
+	var response RequestInterceptResponse
+	if err := json.Unmarshal(env.Result, &response); err != nil {
 		t.Fatal(err)
 	}
-	var authResp FrontendAuthResponse
-	if err := json.Unmarshal(env.Result, &authResp); err != nil {
-		t.Fatal(err)
+	return response
+}
+
+func TestAppRPMExceededTerminatesWith429(t *testing.T) {
+	app, plain := configureTestApp(t)
+	headers := http.Header{"Authorization": {"Bearer " + plain}}
+	authReq, _ := json.Marshal(FrontendAuthRequest{Method: "POST", Path: "/v1/chat/completions", Headers: headers, Body: []byte(`{"model":"fast"}`)})
+	for i := 0; i < 61; i++ {
+		var env Envelope
+		var authResp FrontendAuthResponse
+		if err := json.Unmarshal(mustHandle(t, app, MethodFrontendAuthAuthenticate, authReq), &env); err != nil {
+			t.Fatal(err)
+		}
+		if err := json.Unmarshal(env.Result, &authResp); err != nil || !authResp.Authenticated {
+			t.Fatalf("authentication %d = %+v; RPM belongs to the interceptor", i, authResp)
+		}
+		response := interceptBefore(t, app, headers, "fast", "openai", "/v1/chat/completions")
+		if i < 60 {
+			if response.Terminate {
+				t.Fatalf("request %d within the limit was terminated: %+v", i, response)
+			}
+			continue
+		}
+		if !response.Terminate || response.StatusCode != http.StatusTooManyRequests {
+			t.Fatalf("request over the limit = %+v, want 429", response)
+		}
+		if seconds, err := strconv.Atoi(response.ResponseHeaders.Get("Retry-After")); err != nil || seconds < 1 || seconds > 60 {
+			t.Fatalf("Retry-After = %q", response.ResponseHeaders.Get("Retry-After"))
+		}
+		var body struct {
+			Error struct{ Message, Type, Code string } `json:"error"`
+		}
+		if err := json.Unmarshal(response.ResponseBody, &body); err != nil || body.Error.Code != "rate_limit_exceeded" || !strings.Contains(body.Error.Message, "limit is 60 RPM") {
+			t.Fatalf("429 body = %s", response.ResponseBody)
+		}
+		if strings.Contains(string(response.ResponseBody), plain) {
+			t.Fatal("rejection leaked the plaintext key")
+		}
 	}
-	if authResp.Authenticated {
-		t.Fatalf("auth response = %+v, want rpm rejection", authResp)
-	}
-	if strings.Contains(string(env.Result), plain) {
-		t.Fatal("auth rejection leaked plaintext key")
+	afterRaw, _ := json.Marshal(map[string]any{"Headers": headers, "RequestedModel": "fast"})
+	if raw := mustHandle(t, app, MethodRequestInterceptAfter, afterRaw); !okEnvelope(t, raw) || strings.Contains(string(raw), "Terminate") {
+		t.Fatalf("intercept_after must pass requests through unchanged: %s", raw)
 	}
 }
 
@@ -597,11 +627,8 @@ func TestUsageHandleBills(t *testing.T) {
 		t.Fatalf("usage.handle should always return ok, got %s", raw)
 	}
 
-	// $1.00 spent == $1.00 daily limit → the next request is rejected.
-	d := app.Store().Authenticate("POST", "/v1/chat/completions", hdr, nil, []byte(`{"model":"fast"}`))
-	if d.Allowed || !d.CostLimited || d.Reason != "daily_exceeded" {
-		t.Fatalf("after usage.handle billing of $1.00, next request should be daily_exceeded: %+v", d)
-	}
+	// $1.00 spent == $1.00 daily limit: authentication still passes and the
+	// request interceptor answers the next request with 429.
 	authReq, _ := json.Marshal(FrontendAuthRequest{
 		Method: "POST", Path: "/v1/chat/completions", Headers: hdr, Body: []byte(`{"model":"fast"}`),
 	})
@@ -617,8 +644,26 @@ func TestUsageHandleBills(t *testing.T) {
 	if err := json.Unmarshal(env.Result, &authResp); err != nil {
 		t.Fatal(err)
 	}
-	if authResp.Authenticated {
-		t.Fatalf("quota rejection = %+v", authResp)
+	if !authResp.Authenticated {
+		t.Fatalf("quota must not turn into an authentication failure: %+v", authResp)
+	}
+	openAI := interceptBefore(t, app, hdr, "fast", "openai", "/v1/chat/completions")
+	var openAIBody struct {
+		Error struct{ Message, Type, Code string } `json:"error"`
+	}
+	if !openAI.Terminate || openAI.StatusCode != http.StatusTooManyRequests || json.Unmarshal(openAI.ResponseBody, &openAIBody) != nil || openAIBody.Error.Type != "insufficient_quota" || !strings.Contains(openAIBody.Error.Message, "Daily quota of $1.00") {
+		t.Fatalf("OpenAI rejection = %+v body=%s", openAI, openAI.ResponseBody)
+	}
+	if openAI.ResponseHeaders.Get("Retry-After") == "" || openAI.ResponseHeaders.Get("Content-Type") != "application/json" {
+		t.Fatalf("rejection headers = %v", openAI.ResponseHeaders)
+	}
+	claude := interceptBefore(t, app, hdr, "fast", "claude", "/v1/messages")
+	var claudeBody struct {
+		Type  string                         `json:"type"`
+		Error struct{ Type, Message string } `json:"error"`
+	}
+	if !claude.Terminate || json.Unmarshal(claude.ResponseBody, &claudeBody) != nil || claudeBody.Type != "error" || claudeBody.Error.Type != "rate_limit_error" {
+		t.Fatalf("Claude rejection body = %s", claude.ResponseBody)
 	}
 }
 
@@ -638,9 +683,8 @@ func TestUsageHandleRequestedModelFallsBackToResolvedModel(t *testing.T) {
 	if _, err := app.HandleMethod(MethodUsageHandle, req); err != nil {
 		t.Fatal(err)
 	}
-	d := app.Store().Authenticate("POST", "/v1/chat/completions", hdr, nil, []byte(`{"model":"fast"}`))
-	if d.Allowed || !d.CostLimited {
-		t.Fatalf("resolved-model fallback billing should block: %+v", d)
+	if denial := app.Store().AdmitIntercepted(hdr, "fast", "/v1/chat/completions"); denial == nil {
+		t.Fatal("resolved-model fallback billing should block")
 	}
 }
 
@@ -725,9 +769,8 @@ keys:
 
 	// $1.05 spent > $1.00 daily limit → next request rejected.
 	hdr := http.Header{"Authorization": {"Bearer cpa_cache"}}
-	d := app.Store().Authenticate("POST", "/v1/chat/completions", hdr, nil, []byte(`{"model":"sonnet"}`))
-	if d.Allowed || !d.CostLimited || d.Reason != "daily_exceeded" {
-		t.Fatalf("cache-billed usage should block at $1.05 > $1.00: %+v", d)
+	if denial := app.Store().AdmitIntercepted(hdr, "sonnet", "/v1/chat/completions"); denial == nil || denial.Reason != "daily_exceeded" {
+		t.Fatalf("cache-billed usage should block at $1.05 > $1.00: %+v", denial)
 	}
 }
 
@@ -790,9 +833,8 @@ keys:
 	}
 
 	// Next auth rejected on daily limit. CallCount = 2 (failed didn't count).
-	d := app.Store().Authenticate("POST", "/v1/chat/completions", hdr, nil, []byte(`{"model":"fast"}`))
-	if d.Allowed || !d.CostLimited || d.Reason != "daily_exceeded" {
-		t.Fatalf("after two per_call charges, next should be daily_exceeded: %+v", d)
+	if denial := app.Store().AdmitIntercepted(hdr, "fast", "/v1/chat/completions"); denial == nil || denial.Reason != "daily_exceeded" {
+		t.Fatalf("after two per_call charges, next should be daily_exceeded: %+v", denial)
 	}
 	keys := app.Store().Keys()
 	var key policy.KeyConfig
@@ -985,7 +1027,9 @@ func mustHandle(t *testing.T, app *App, method string, req []byte) []byte {
 // This reproduces the 502 bug: CPA calls model.route and the plugin must
 // return Handled=true with a valid Target/TargetModel for each round-robin
 // rotation.
-func TestAppMultiTargetModelRoute(t *testing.T) {
+// A config.yaml written for older releases may still seed a model with several
+// targets; it keeps registering and routes every request to the first target.
+func TestAppLegacyMultiTargetSeedRoutesToFirstTarget(t *testing.T) {
 	app := NewApp()
 	plain := "cpa_multi_target_test"
 	hash := hashForTest(t, plain)
@@ -1012,35 +1056,13 @@ keys:
 	if _, err := app.HandleMethod(MethodPluginReconfigure, req); err != nil {
 		t.Fatalf("configure: %v", err)
 	}
-
-	hdr := http.Header{}
-	hdr.Set("Authorization", "Bearer "+plain)
-
-	// Route should return Handled=true and alternate between the two targets.
-	targetsSeen := map[string]bool{}
-	for i := 0; i < 4; i++ {
-		routeReq, _ := json.Marshal(ModelRouteRequest{
-			RequestedModel: "mymulti",
-			Headers:        hdr,
-		})
-		raw, err := app.HandleMethod(MethodModelRoute, routeReq)
-		if err != nil {
-			t.Fatalf("route call %d: %v", i, err)
+	hdr := http.Header{"Authorization": {"Bearer " + plain}}
+	for i := 0; i < 3; i++ {
+		routeReq, _ := json.Marshal(ModelRouteRequest{RequestedModel: "mymulti", Headers: hdr, AvailableProviders: []string{"openai-compatible-opencode"}})
+		resp := routeResponseFromEnvelope(t, mustHandle(t, app, MethodModelRoute, routeReq))
+		if !resp.Handled || resp.Target != "openai-compatible-opencode" || resp.TargetModel != "glm-5.2" {
+			t.Fatalf("call %d route = %+v", i, resp)
 		}
-		resp := routeResponseFromEnvelope(t, raw)
-		if !resp.Handled {
-			t.Fatalf("call %d: expected Handled=true, got false", i)
-		}
-		if resp.Target == "" || resp.TargetModel == "" {
-			t.Fatalf("call %d: empty Target/TargetModel: %+v", i, resp)
-		}
-		key := resp.Target + "/" + resp.TargetModel
-		targetsSeen[key] = true
-		t.Logf("call %d: %s", i, key)
-	}
-	// After 4 calls with 2 targets, both should have been seen (round-robin).
-	if len(targetsSeen) != 2 {
-		t.Fatalf("expected 2 distinct targets via round-robin, got %d: %v", len(targetsSeen), targetsSeen)
 	}
 }
 
@@ -1116,7 +1138,7 @@ func TestUsageHandleTransportJSONSnapshot(t *testing.T) {
 
 func TestRegistrationReportsCurrentReleaseMetadata(t *testing.T) {
 	registration := NewApp().registration()
-	if registration.SchemaVersion != 2 || registration.Metadata.Version != "0.6.0" {
+	if registration.SchemaVersion != 2 || registration.Metadata.Version != Version {
 		t.Fatalf("registration version metadata = %+v", registration)
 	}
 	if registration.Metadata.GitHubRepository != "https://github.com/RealLiuSha/cpa-plugin-key-policy" {

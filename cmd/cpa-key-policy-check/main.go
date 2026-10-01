@@ -3,6 +3,7 @@
 package main
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"time"
 
 	"cpa-key-policy/internal/policy"
@@ -87,8 +89,10 @@ func run(source, zone, at string) error {
 	if err != nil {
 		return err
 	}
-	if before.DatasetID != after.DatasetID || !reflect.DeepEqual(before.Models, after.Models) || !reflect.DeepEqual(before.ClassifyRules, after.ClassifyRules) {
-		return fmt.Errorf("dataset identity, models or classification rules changed")
+	// LoadState already projects older formats, so the source must read back
+	// exactly as the migrated models; what the projection drops is reported.
+	if before.DatasetID != after.DatasetID || !reflect.DeepEqual(before.Models, after.Models) {
+		return fmt.Errorf("dataset identity or models changed")
 	}
 	keys := make(map[string]policy.KeyConfig)
 	for _, key := range store.Keys() {
@@ -169,10 +173,51 @@ func run(source, zone, at string) error {
 	if !reflect.DeepEqual(newUsage.Usage, reloaded.Usage) {
 		return fmt.Errorf("restarting reapplied migration or changed quota state")
 	}
+	digest, err := policyDigest(after)
+	if err != nil {
+		return err
+	}
+	removed := before.RemovedSettings
+	if removed == nil {
+		removed = []string{}
+	}
+	// Public names that differ from the upstream id rely on the response
+	// interceptor's model-name rewrite.
+	renamed := []string{}
+	for _, model := range after.Models {
+		if model.Name != model.TargetModel {
+			renamed = append(renamed, model.Name+" -> "+model.Provider+"/"+model.TargetModel)
+		}
+	}
 	report := map[string]any{
 		"result": "passed", "source_state_version": before.Version, "source_usage_version": oldUsage.Version,
 		"target_version": after.Version, "keys": len(keys), "models": len(after.Models), "preserved_history_days": preserved,
 		"opening_balances_preserved": true, "restart_idempotent": true, "source_read_only": true, "checked_at": now,
+		"policy_sha256": digest, "removed_settings": removed, "renamed_models": renamed,
 	}
 	return json.NewEncoder(os.Stdout).Encode(report)
+}
+
+// The publisher compares normalized policy before and after activation. Keep
+// normalization in the policy package; timestamps and serialization order are
+// not policy and may legitimately change during a legacy migration.
+func policyDigest(state *policy.State) (string, error) {
+	keys := append([]policy.KeyConfig(nil), state.Keys...)
+	for i := range keys {
+		keys[i].CreatedAt = time.Time{}
+		keys[i].UpdatedAt = time.Time{}
+		keys[i].LimitsChangedAt = time.Time{}
+	}
+	sort.Slice(keys, func(i, j int) bool { return keys[i].ID < keys[j].ID })
+	models := append([]policy.ModelDefinition(nil), state.Models...)
+	sort.Slice(models, func(i, j int) bool { return models[i].Name < models[j].Name })
+	raw, err := json.Marshal(struct {
+		DatasetID string                   `json:"dataset_id"`
+		Keys      []policy.KeyConfig       `json:"keys"`
+		Models    []policy.ModelDefinition `json:"models"`
+	}{state.DatasetID, keys, models})
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%x", sha256.Sum256(raw)), nil
 }
