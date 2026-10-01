@@ -36,24 +36,25 @@ func (s *Store) recordUsage(apiKeyOrID, requestedModel, targetModel string, fail
 		return 0
 	}
 	publicModel = model.Name
-	target := model.Targets[0]
-	for _, candidate := range model.Targets {
-		if strings.EqualFold(candidate.TargetModel, targetModel) {
-			target = candidate
-			break
-		}
-	}
-	route := resolveModelRoute(model, target)
 	_, usageLedger := s.runtimeComponents()
 
-	if route.BillingMode == "per_call" {
+	if model.BillingMode == "per_call" {
+		var prepaidAt time.Time
+		prepaid := false
+		if consumePrecharge {
+			prepaidAt, prepaid = s.consumePrecharge(key.ID, publicModel)
+		}
 		if failed {
+			// A failed generation delivered nothing, so its precharge is returned.
+			if prepaid && usageLedger != nil {
+				usageLedger.ReturnCost(key.ID, publicModel, model.PerCallUSD, prepaidAt)
+			}
 			return 0
 		}
-		if consumePrecharge && s.consumePrecharge(key.ID, publicModel) {
+		if prepaid {
 			return 0
 		}
-		cost := route.PerCallUSD
+		cost := model.PerCallUSD
 		if usageLedger != nil {
 			usageLedger.RecordCost(key.ID, publicModel, cost, 0, 0, 0, 0, 0, 0, 1)
 		}
@@ -64,17 +65,17 @@ func (s *Store) recordUsage(apiKeyOrID, requestedModel, targetModel string, fail
 		return 0
 	}
 	breakdown := ComputeCacheCostBreakdown(
-		route.Provider,
-		route.InputPricePerMillion,
-		route.OutputPricePerMillion,
-		route.CacheReadPricePerMillion,
-		route.CacheWritePricePerMillion,
+		model.Provider,
+		model.InputPricePerMillion,
+		model.OutputPricePerMillion,
+		model.CacheReadPricePerMillion,
+		model.CacheWritePricePerMillion,
 		true,
 		detail,
 	)
-	breakdown.TotalCost *= route.BillingMultiplier
-	breakdown.CacheReadCost *= route.BillingMultiplier
-	breakdown.CacheWriteCost *= route.BillingMultiplier
+	breakdown.TotalCost *= model.BillingMultiplier
+	breakdown.CacheReadCost *= model.BillingMultiplier
+	breakdown.CacheWriteCost *= model.BillingMultiplier
 	if usageLedger != nil {
 		usageLedger.RecordCost(key.ID, publicModel, breakdown.TotalCost, breakdown.CacheReadCost, breakdown.CacheReadTokens, breakdown.CacheWriteCost, breakdown.CacheWriteTokens, breakdown.InputTokens, detail.OutputTokens, 1)
 	}
@@ -117,10 +118,12 @@ func (s *Store) rememberPrecharge(keyID, model string) {
 	s.mu.Unlock()
 }
 
-func (s *Store) consumePrecharge(keyID, model string) bool {
+// consumePrecharge takes the oldest live precharge for the key and model and
+// reports when it was charged.
+func (s *Store) consumePrecharge(keyID, model string) (time.Time, bool) {
 	key := prechargeKey(keyID, model)
 	if key == "\x00" {
-		return false
+		return time.Time{}, false
 	}
 	now := s.billingNow()
 	s.mu.Lock()
@@ -134,14 +137,15 @@ func (s *Store) consumePrecharge(keyID, model string) bool {
 	queue = queue[first:]
 	if len(queue) == 0 {
 		delete(s.precharges, key)
-		return false
+		return time.Time{}, false
 	}
 	// TRADEOFF: FIFO key-model matching can pair concurrent requests imprecisely, revisit when usage.handle exposes a stable request id
+	chargedAt := queue[0]
 	queue = queue[1:]
 	if len(queue) == 0 {
 		delete(s.precharges, key)
 	} else {
 		s.precharges[key] = queue
 	}
-	return true
+	return chargedAt, true
 }

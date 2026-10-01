@@ -19,7 +19,11 @@ type migrationBackup struct {
 	Usage     []byte `json:"usage"`
 }
 
-func MigrationBackupPath(statePath string) string { return statePath + ".before-v5.json" }
+// MigrationBackupPath names the recovery pair saved before converting a
+// dataset to the current format. Earlier releases wrote ".before-v5.json".
+func MigrationBackupPath(statePath string) string {
+	return fmt.Sprintf("%s.before-v%d.json", statePath, currentStateFileVersion)
+}
 
 func backupBeforeMigration(statePath, datasetID string) error {
 	stateRaw, err := os.ReadFile(statePath)
@@ -52,7 +56,7 @@ func backupBeforeMigration(statePath, datasetID string) error {
 		if stateErr != nil || usageErr != nil {
 			return fmt.Errorf("invalid migration backup (state: %v; usage: %v); restore a valid recovery pair", stateErr, usageErr)
 		}
-		if backup.DatasetID != datasetID || backupState.DatasetID != datasetID || backupUsage.DatasetID != datasetID || backupState.Version >= 5 || backupUsage.Version >= 5 {
+		if backup.DatasetID != datasetID || backupState.DatasetID != datasetID || backupUsage.DatasetID != datasetID || backupState.Version >= currentStateFileVersion || backupUsage.Version >= currentUsageFileVersion {
 			return errors.New("existing migration backup does not match this dataset")
 		}
 		if usage.Version == currentUsageFileVersion {
@@ -99,20 +103,20 @@ func migrateStorage(statePath, datasetID string, stateVersion, usageVersion int,
 		return nil
 	}
 	if stateVersion == currentStateFileVersion && usageVersion < currentUsageFileVersion {
-		return errors.New("v5 state is paired with legacy usage; restore the matching pair before starting")
+		return fmt.Errorf("state version %d is paired with older usage version %d; restore the matching pair before starting", stateVersion, usageVersion)
 	}
 	if err := backupBeforeMigration(statePath, datasetID); err != nil {
 		return err
 	}
-	// Persist cycle anchors first. If the state write fails, the next start reads
-	// this v5 ledger and finishes migration without reapplying opening balances.
+	// Persist usage first. If the state write fails, the next start reads the
+	// converted ledger and finishes migration without reapplying opening balances.
 	if usageVersion < currentUsageFileVersion {
 		if err := SaveUsage(persist.UsagePath(statePath), datasetID, usage); err != nil {
 			return fmt.Errorf("migrate usage: %w", err)
 		}
 	}
 	if stateVersion < currentStateFileVersion {
-		if err := SaveState(statePath, datasetID, cfg.Keys, cfg.Models, cfg.ClassifyRules); err != nil {
+		if err := SaveState(statePath, datasetID, cfg.Keys, cfg.Models); err != nil {
 			return fmt.Errorf("migrate state (usage is recoverable on restart): %w", err)
 		}
 	}

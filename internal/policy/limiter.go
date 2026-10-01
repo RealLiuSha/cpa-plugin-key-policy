@@ -31,9 +31,12 @@ func NewRateLimiterWithClock(now func() time.Time) *RateLimiter {
 	return limiter
 }
 
-func (l *RateLimiter) Allow(id string, rpm int) bool {
+// Allow counts one request in the key's one-minute window, which starts at the
+// first request after the previous window ended. A denied request reports
+// when the current window ends.
+func (l *RateLimiter) Allow(id string, rpm int) (bool, time.Time) {
 	if rpm <= 0 {
-		return true
+		return true, time.Time{}
 	}
 	now := l.now().UTC()
 	l.mu.Lock()
@@ -44,11 +47,11 @@ func (l *RateLimiter) Allow(id string, rpm int) bool {
 	}
 	if bucket.count >= rpm {
 		l.buckets[id] = bucket
-		return false
+		return false, bucket.windowStart.Add(time.Minute)
 	}
 	bucket.count++
 	l.buckets[id] = bucket
-	return true
+	return true, time.Time{}
 }
 
 func (l *RateLimiter) Reset(id string) {

@@ -22,10 +22,9 @@ import KeyEdit from "./KeyEdit";
 
 const models: ModelDefinition[] = ["fast", "slow"].map((name) => ({
   name,
-  targets: [{ provider: "codex", target_model: name }],
-  dispatch: "round-robin",
+  provider: "codex",
+  target_model: name,
   billing_mode: "tokens",
-  free: true,
 }));
 
 const key: KeyPublic = {

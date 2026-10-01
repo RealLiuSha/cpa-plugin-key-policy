@@ -1,4 +1,4 @@
-# Example CLIProxyAPI snippet for cpa-key-policy v0.6.
+# Example CLIProxyAPI snippet for cpa-key-policy 1.0.
 # Replace placeholders. Never commit real keys or production paths.
 
 plugins:
@@ -9,35 +9,28 @@ plugins:
       enabled: true
       priority: 10
       # State and usage are a paired dataset. The lists below seed first boot;
-      # after state exists, managed keys/models/rules come only from state.
+      # after state exists, keys and models come only from state.
       state_file: "cpa-key-policy-state.json"
       usage_timezone: "Asia/Shanghai"
 
+      # A public model routes to one CPA capability. Prices are USD; omitted
+      # prices are $0. billing_multiplier scales token charges (default 1).
       models:
         - name: "fast"
-          targets:
-            - provider: "codex"
-              target_model: "gpt-5.6"
-              group: "team"
-            - provider: "openai"
-              target_model: "gpt-5.6"
-          dispatch: "round-robin"
+          provider: "codex"
+          target_model: "gpt-5.6"
           billing_mode: "tokens"
-          free: false
-          billing_multiplier: 1
+          billing_multiplier: 1.2
           input_price_per_million: 1
           output_price_per_million: 2
           cache_read_price_per_million: 0.1
           cache_write_price_per_million: 0.3
 
-        - name: "community"
-          targets:
-            - provider: "codex"
-              target_model: "community-model"
-              group: "free"
-          dispatch: "priority"
-          billing_mode: "tokens"
-          free: true
+        - name: "grok-imagine-image"
+          provider: "xai"
+          target_model: "grok-imagine-image"
+          billing_mode: "per_call"
+          per_call_usd: 0.07
 
       # Seed keys are used only when state_file does not exist. Afterwards,
       # create and edit keys through the Web UI or management API.
@@ -54,11 +47,4 @@ plugins:
           models:
             - name: "fast"
               daily_limit_usd: 5
-            - name: "community"
-
-      classify_rules:
-        - name: "team"
-          field: "plan_type"
-          pattern: "^team$"
-          group: "team"
-          enabled: true
+            - name: "grok-imagine-image"

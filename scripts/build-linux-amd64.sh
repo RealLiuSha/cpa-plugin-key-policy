@@ -3,6 +3,8 @@ set -euo pipefail
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 artifact="${1:-${repo_root}/dist/cpa-key-policy_linux_amd64.so}"
+# An optional checker is shipped by publish.py to rehearse the stopped dataset.
+checker="${2:-}"
 # Debian 12 is the oldest supported runtime; building on a newer distribution
 # can introduce libc symbols unavailable on the deployed CPA image.
 builder="${CPAKP_BUILD_IMAGE:-golang:1.25-bookworm@sha256:3b4a11519ad929d1e1d261a12cff056f0c85b735253d7d861346b9c6f8b36437}"
@@ -11,15 +13,24 @@ output_dir="$(cd -- "$(dirname -- "${artifact}")" && pwd)"
 artifact="${output_dir}/$(basename -- "${artifact}")"
 staging="$(mktemp -d "${output_dir}/.cpa-build.XXXXXX")"
 cleanup() {
+  if [[ -f "${staging}/container.id" ]]; then
+    docker rm -f "$(cat "${staging}/container.id")" >/dev/null 2>&1 || true
+  fi
   rm -f -- "${staging}/plugin.so" "${staging}/plugin.h" \
     "${staging}/elf.txt" "${staging}/symbols.txt" "${staging}/ldd.txt" \
-    "${staging}/abi-smoke.c" "${staging}/abi-smoke" "${staging}/build-info.txt"
+    "${staging}/abi-smoke.c" "${staging}/abi-smoke" "${staging}/build-info.txt" \
+    "${staging}/migration-check" "${staging}/container.id"
   rmdir -- "${staging}"
 }
 trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
-docker_args=(--rm -i --platform linux/amd64
+docker_args=(--rm -i --platform linux/amd64 --cidfile "${staging}/container.id"
   -v "${repo_root}:/src:ro" -v "${staging}:/out" -w /src)
+if [[ -n "${checker}" ]]; then
+  docker_args+=(-e CPAKP_BUILD_CHECKER=1)
+fi
 if [[ -n "${CPAKP_GOMODCACHE:-}" ]]; then
   [[ -d "${CPAKP_GOMODCACHE}" ]] || { echo 'CPAKP_GOMODCACHE must be an existing module cache directory' >&2; exit 1; }
   docker_args+=(-v "${CPAKP_GOMODCACHE}:/go/pkg/mod:ro")
@@ -30,6 +41,10 @@ set -euo pipefail
 export CGO_ENABLED=1 GOOS=linux GOARCH=amd64
 go build -trimpath -buildvcs=false -tags cshared -buildmode=c-shared \
   -ldflags '-s -w' -o /out/plugin.so ./cmd/cpa-key-policy
+if [[ "${CPAKP_BUILD_CHECKER:-}" == 1 ]]; then
+  CGO_ENABLED=0 go build -trimpath -buildvcs=false -ldflags '-s -w' \
+    -o /out/migration-check ./cmd/cpa-key-policy-check
+fi
 readelf -h /out/plugin.so > /out/elf.txt
 grep -Eq 'Class:.*ELF64' /out/elf.txt
 grep -Eq 'Machine:.*X86-64' /out/elf.txt
@@ -68,15 +83,18 @@ gcc -Wall -Wextra -Werror /out/abi-smoke.c -ldl -o /out/abi-smoke
 /out/abi-smoke
 {
   go version
-  ldd --version | head -1
+  # Consume all output so ldd cannot receive SIGPIPE under pipefail.
+  ldd --version | sed -n '1p'
 } > /out/build-info.txt
 BUILD
 
 version="$(sed -n 's/^[[:space:]]*Version[[:space:]]*=[[:space:]]*"\([^"]*\)"/\1/p' "${repo_root}/internal/plugin/types.go")"
 {
   printf 'plugin_version=%s\n' "${version}"
-  printf 'source_commit=%s\n' "$(git -C "${repo_root}" rev-parse HEAD)"
-  if [[ -n "$(git -C "${repo_root}" status --porcelain)" ]]; then
+  printf 'source_commit=%s\n' "${CPAKP_SOURCE_COMMIT:-$(git -C "${repo_root}" rev-parse HEAD)}"
+  if [[ -n "${CPAKP_SOURCE_DIRTY:-}" ]]; then
+    printf 'source_dirty=%s\n' "${CPAKP_SOURCE_DIRTY}"
+  elif [[ -n "$(git -C "${repo_root}" status --porcelain)" ]]; then
     printf 'source_dirty=true\n'
   else
     printf 'source_dirty=false\n'
@@ -85,6 +103,10 @@ version="$(sed -n 's/^[[:space:]]*Version[[:space:]]*=[[:space:]]*"\([^"]*\)"/\1
   cat "${staging}/build-info.txt"
 } > "${artifact}.build-info.txt"
 mv -f -- "${staging}/plugin.so" "${artifact}"
+if [[ -n "${checker}" ]]; then
+  mkdir -p -- "$(dirname -- "${checker}")"
+  mv -f -- "${staging}/migration-check" "${checker}"
+fi
 (
   cd -- "${output_dir}"
   if command -v sha256sum >/dev/null; then

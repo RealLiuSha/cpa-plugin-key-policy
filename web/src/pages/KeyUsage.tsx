@@ -44,42 +44,50 @@ function BillingTag({ mode }: { mode?: string }) {
   );
 }
 
+// The chart's own axes: the dollar scale on the left (top = the larger of the
+// daily limit and the busiest day) and every fifth date along the bottom.
 export function UsageHistoryChart({ history, dailyLimit }: { history: KeyHistoryResponse | null; dailyLimit: number }) {
   const t = useT();
   const days = history?.days ?? [];
   const width = 640;
-  const height = 180;
-  const plotTop = 16;
-  const plotBottom = 150;
+  const height = 196;
+  const left = 52;
+  const plotTop = 12;
+  const plotBottom = 160;
   const plotHeight = plotBottom - plotTop;
-  const maxValue = Math.max(1, dailyLimit, ...days.map((day) => day.total_usd ?? 0));
-  const slot = days.length > 0 ? width / days.length : width;
+  const plotWidth = width - left;
+  const maxValue = Math.max(dailyLimit, ...days.map((day) => day.total_usd ?? 0)) || 1;
+  const slot = days.length > 0 ? plotWidth / days.length : plotWidth;
   const limitY = plotBottom - (dailyLimit / maxValue) * plotHeight;
+  const total = days.reduce((sum, day) => sum + (day.total_usd ?? 0), 0);
   return (
     <div className="card usage-history-card" data-testid="usage-history-chart">
       <div className="usage-history-title">
         <strong>{t("keyUsage.historyTitle")}</strong>
-        <span className="muted">{history?.timezone ?? "Asia/Shanghai"}</span>
+        <span className="muted">{t("keyUsage.historyTotal", { amount: fmtUsd(total) })} · {history?.timezone ?? "Asia/Shanghai"}</span>
       </div>
       <svg viewBox={`0 0 ${width} ${height}`} role="img" aria-label={t("keyUsage.historyTitle")}>
-        <line x1="0" x2={width} y1={plotBottom} y2={plotBottom} className="usage-chart-axis" />
+        <text x={left - 6} y={plotTop + 4} textAnchor="end" className="usage-chart-label">{fmtUsd(maxValue)}</text>
+        <text x={left - 6} y={plotBottom} textAnchor="end" className="usage-chart-label">$0</text>
+        <line x1={left} x2={width} y1={plotBottom} y2={plotBottom} className="usage-chart-axis" />
         {dailyLimit > 0 && (
-          <line x1="0" x2={width} y1={limitY} y2={limitY} className="usage-chart-limit" data-testid="usage-history-limit-line" />
+          <line x1={left} x2={width} y1={limitY} y2={limitY} className="usage-chart-limit" data-testid="usage-history-limit-line">
+            <title>{t("keyUsage.dailyLimitLine", { amount: fmtUsd(dailyLimit) })}</title>
+          </line>
         )}
         {days.map((day, index) => {
           const value = day.total_usd ?? 0;
           const barHeight = (value / maxValue) * plotHeight;
+          const x = left + index * slot;
           return (
-            <rect
-              key={day.date}
-              x={index * slot + slot * 0.16}
-              y={plotBottom - barHeight}
-              width={Math.max(1, slot * 0.68)}
-              height={barHeight}
-              className="usage-chart-bar"
-            >
-              <title>{day.date}: {fmtUsd(value)}</title>
-            </rect>
+            <g key={day.date}>
+              <rect x={x + slot * 0.16} y={plotBottom - barHeight} width={Math.max(1, slot * 0.68)} height={barHeight} className="usage-chart-bar">
+                <title>{day.date}: {fmtUsd(value)} · {t("keys.mobile.callCount", { n: fmtInt(day.call_count ?? 0) })}</title>
+              </rect>
+              {(index % 5 === 0 || index === days.length - 1) && (
+                <text x={index === days.length - 1 ? width : x + slot / 2} y={height - 18} textAnchor={index === days.length - 1 ? "end" : "middle"} className="usage-chart-label">{day.date.slice(5)}</text>
+              )}
+            </g>
           );
         })}
       </svg>
@@ -204,37 +212,6 @@ export default function KeyUsage() {
       {data.usage && <section className="card quota-detail"><h2>{t("quota.currentPeriods")}</h2><QuotaUsage usage={data.usage} all /></section>}
       <UsageHistoryChart history={history} dailyLimit={data.daily_limit_usd} />
 
-      {/* Desktop: hero summary + per-model table. */}
-      <div className="usage-hero-d">
-        <div className="uhd-tiles">
-          <div className="uhd-tile">
-            <span className="uhd-tk">
-              {win === "daily" ? t("keyUsage.mobile.todaySpend") : win === "weekly" ? t("keyUsage.mobile.weekSpend") : t("keyUsage.mobile.monthSpend")}
-            </span>
-            <span className={"uhd-tv" + (heroLimit > 0 && heroUsd >= heroLimit ? " accent" : "")}>{fmtUsd(heroUsd)}</span>
-          </div>
-          <div className="uhd-tile">
-            <span className="uhd-tk">{t("keyUsage.colCalls")}</span>
-            <span className="uhd-tv">{fmtInt(heroCalls)}</span>
-          </div>
-          <div className="uhd-tile">
-            <span className="uhd-tk">{t("keyUsage.mobile.limit")}</span>
-            <span className="uhd-tv">{heroLimit > 0 ? fmtUsd(heroLimit) : t("keyUsage.mobile.noLimit")}</span>
-          </div>
-        </div>
-        {heroLimit > 0 && (
-          <>
-            <div className={"uhd-bar" + (heroUsd >= heroLimit ? " over" : "")}>
-              <span style={{ width: Math.min(100, heroPct) + "%" }} />
-            </div>
-            <div className="uhd-barcap">
-              <span>{fmtUsd(heroUsd)} / {fmtUsd(heroLimit)}</span>
-              <span className={heroUsd >= heroLimit ? "over" : ""}>{Math.round(heroPct)}%</span>
-            </div>
-          </>
-        )}
-      </div>
-
       <div className="card table-wrap">
         {!hasUsage && <div className="muted keyusage-empty">{t("keyUsage.empty")}</div>}
         <table>
@@ -282,6 +259,19 @@ export default function KeyUsage() {
               })
             )}
           </tbody>
+          {models.length > 1 && (
+            <tfoot>
+              <tr className="keyusage-total">
+                <td>{t("keyUsage.total")}</td>
+                <td />
+                <td className="num strong">{fmtUsd(heroUsd)}</td>
+                <td className="num mono">{fmtInt(heroCalls)}</td>
+                <td className="num mono">{fmtInt(heroInput)}</td>
+                <td className="num mono">{fmtInt(heroOutput)}</td>
+                <td colSpan={3} />
+              </tr>
+            </tfoot>
+          )}
         </table>
       </div>
 

@@ -1,16 +1,11 @@
-export interface ModelTarget {
+// A public model routes to one CPA capability (provider + target_model).
+// All-zero prices are valid and bill $0 until prices are synced.
+export interface ModelDefinition {
+  name: string;
   provider: string;
   target_model: string;
-  group?: string;
-}
-
-export interface ModelDefinition {
-	 billing_multiplier?: number;
-  name: string;
-  targets: ModelTarget[];
-  dispatch: "round-robin" | "priority";
   billing_mode: "tokens" | "per_call";
-  free: boolean;
+  billing_multiplier?: number;
   input_price_per_million?: number;
   output_price_per_million?: number;
   cache_read_price_per_million?: number;
@@ -128,7 +123,6 @@ export interface UsageWindow {
 export interface ModelUsageEntry {
   name: string;
   billing_mode?: "tokens" | "per_call";
-  free: boolean;
   per_call_usd?: number;
   in_config: boolean;
   daily: UsageWindow;
@@ -148,7 +142,6 @@ export interface KeyUsageResponse {
 
 export interface CatalogModel {
   provider: string;
-  group?: string;
   model: string;
 }
 
@@ -160,14 +153,6 @@ export interface StatusResponse {
   model_count?: number;
   rpm_usage?: Record<string, unknown>;
   usage?: Record<string, UsageSummary>;
-}
-
-export interface ClassifyRule {
-  name: string;
-  field: string;
-  pattern: string;
-  group: string;
-  enabled: boolean;
 }
 
 export interface UsageBucket {
@@ -269,45 +254,17 @@ export interface PricingPreview {
 }
 
 export interface ModelImportItem {
-  name: string;
-  targets: ModelTarget[];
-  dispatch?: "round-robin" | "priority";
-  free?: boolean;
-  overwrite?: boolean;
-  input_price_per_million?: number;
-  output_price_per_million?: number;
-  cache_read_price_per_million?: number;
-  cache_write_price_per_million?: number;
-  missing_price?: boolean;
-  price_conflict?: boolean;
+  name?: string;
+  provider: string;
+  target_model: string;
 }
 
 export interface ModelImportRow {
   name: string;
-  action: string;
-  reason?: string;
-  affected_keys?: string[];
-  duplicate?: boolean;
-  missing_price?: boolean;
-  price_conflict?: boolean;
+  reason?: "exists" | "duplicate" | string;
 }
 
 export interface ModelImportResult {
   created: ModelImportRow[];
-  updated: ModelImportRow[];
   skipped: ModelImportRow[];
-  conflicts: ModelImportRow[];
-  missing_price: ModelImportRow[];
-  affected_keys: string[];
-}
-
-export interface CredentialDescriptor {
-  id: string;
-  provider: string;
-  attributes?: Record<string, string>;
-}
-
-export interface ClassifyPreviewResponse {
-  groups: Record<string, string[]>;
-  group_counts: Record<string, number>;
 }

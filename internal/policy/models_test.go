@@ -35,6 +35,12 @@ func TestExtractRequestedModel(t *testing.T) {
 			path: "/v1beta/models/gemini-2.5-pro:generateContent",
 			want: "gemini-2.5-pro",
 		},
+		{
+			name: "gemini path over nested content",
+			path: "/v1beta/models/grok-4.7:generateContent",
+			body: []byte(`{"contents":[{"role":"model","parts":[{"functionCall":{"name":"pick","args":{"model":"gpt-4o"}}}]}]}`),
+			want: "grok-4.7",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

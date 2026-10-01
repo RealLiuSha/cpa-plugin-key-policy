@@ -6,21 +6,32 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"gopkg.in/yaml.v3"
 )
 
 type Config struct {
-	Enabled       bool              `yaml:"enabled" json:"enabled"`
-	StateFile     string            `yaml:"state_file" json:"state_file"`
-	UsageTimezone string            `yaml:"usage_timezone,omitempty" json:"usage_timezone,omitempty"`
-	Keys          []KeyConfig       `yaml:"keys" json:"keys"`
-	Models        []ModelDefinition `yaml:"models" json:"models"`
-	ClassifyRules []ClassifyRule    `yaml:"classify_rules,omitempty" json:"classify_rules,omitempty"`
+	Enabled       bool
+	StateFile     string
+	UsageTimezone string
+	Keys          []KeyConfig
+	Models        []ModelDefinition
 	usageLocation *time.Location
+}
+
+// configDocument is the YAML accepted at plugin registration. Model seeds and
+// classify_rules still accept the settings removed in data format 6, so a CPA
+// config.yaml written for older releases keeps registering.
+type configDocument struct {
+	Enabled       bool          `yaml:"enabled"`
+	StateFile     string        `yaml:"state_file"`
+	UsageTimezone string        `yaml:"usage_timezone,omitempty"`
+	Keys          []KeyConfig   `yaml:"keys"`
+	Models        []compatModel `yaml:"models"`
+	ClassifyRules []compatRule  `yaml:"classify_rules,omitempty"`
 }
 
 type KeyConfig struct {
@@ -38,19 +49,6 @@ type KeyConfig struct {
 	LimitsChangedAt     time.Time     `yaml:"limits_changed_at,omitempty" json:"limits_changed_at,omitempty"`
 	CreatedAt           time.Time     `yaml:"created_at,omitempty" json:"created_at,omitempty"`
 	UpdatedAt           time.Time     `yaml:"updated_at,omitempty" json:"updated_at,omitempty"`
-}
-
-type ClassifyRule struct {
-	Name     string `yaml:"name" json:"name"`
-	Field    string `yaml:"field" json:"field"`
-	Pattern  string `yaml:"pattern" json:"pattern"`
-	Group    string `yaml:"group" json:"group"`
-	Enabled  bool   `yaml:"enabled" json:"enabled"`
-	compiled *regexp.Regexp
-}
-
-func (r *ClassifyRule) Compiled() *regexp.Regexp {
-	return r.compiled
 }
 
 type UsageBucket struct {
@@ -83,12 +81,13 @@ type UsageWindow struct {
 }
 
 type State struct {
-	Version       int               `json:"version"`
-	DatasetID     string            `json:"dataset_id"`
-	Keys          []KeyConfig       `json:"keys"`
-	Models        []ModelDefinition `json:"models"`
-	ClassifyRules []ClassifyRule    `json:"classify_rules,omitempty"`
-	UpdatedAt     time.Time         `json:"updated_at"`
+	Version   int
+	DatasetID string
+	Keys      []KeyConfig
+	Models    []ModelDefinition
+	UpdatedAt time.Time
+	// RemovedSettings describes what reading a pre-format-6 file dropped.
+	RemovedSettings []string
 }
 
 func DefaultConfig() Config {
@@ -118,9 +117,10 @@ func ParseConfig(raw []byte) (Config, error) {
 	if len(bytes.TrimSpace(raw)) == 0 {
 		return cfg, nil
 	}
+	document := configDocument{Enabled: cfg.Enabled, StateFile: cfg.StateFile, UsageTimezone: cfg.UsageTimezone}
 	decoder := yaml.NewDecoder(bytes.NewReader(raw))
 	decoder.KnownFields(true)
-	if err := decoder.Decode(&cfg); err != nil {
+	if err := decoder.Decode(&document); err != nil {
 		return Config{}, err
 	}
 	var trailing any
@@ -130,10 +130,33 @@ func ParseConfig(raw []byte) (Config, error) {
 		}
 		return Config{}, err
 	}
+	models, _, err := projectCompatModels(document.Models, document.ClassifyRules)
+	if err != nil {
+		return Config{}, err
+	}
+	if len(document.ClassifyRules) > 0 || usesRemovedModelSettings(document.Models) {
+		// CPA registers and reconfigures a plugin several times while starting.
+		removedSettingsWarning.Do(func() {
+			log.Printf("cpa-key-policy: config.yaml still sets classify_rules or model targets/dispatch/free, which this release no longer supports; seeds keep only the first target and the rest is ignored")
+		})
+	}
+	cfg.Enabled, cfg.StateFile, cfg.UsageTimezone = document.Enabled, document.StateFile, document.UsageTimezone
+	cfg.Keys, cfg.Models = document.Keys, models
 	if strings.TrimSpace(cfg.StateFile) == "" {
 		cfg.StateFile = DefaultConfig().StateFile
 	}
 	return cfg, nil
+}
+
+var removedSettingsWarning sync.Once
+
+func usesRemovedModelSettings(models []compatModel) bool {
+	for _, model := range models {
+		if model.usesRemovedSettings() {
+			return true
+		}
+	}
+	return false
 }
 
 func normalizeConfig(cfg *Config) error {
@@ -200,25 +223,5 @@ func normalizeConfig(cfg *Config) error {
 		}
 	}
 
-	ruleSeen := make(map[string]struct{}, len(cfg.ClassifyRules))
-	for i := range cfg.ClassifyRules {
-		rule := &cfg.ClassifyRules[i]
-		rule.Name = strings.TrimSpace(rule.Name)
-		rule.Field = strings.TrimSpace(rule.Field)
-		rule.Pattern = strings.TrimSpace(rule.Pattern)
-		rule.Group = strings.TrimSpace(rule.Group)
-		if rule.Name == "" || rule.Field == "" || rule.Pattern == "" || rule.Group == "" {
-			return fmt.Errorf("classify rule %d requires name, field, pattern, and group", i)
-		}
-		if _, exists := ruleSeen[strings.ToLower(rule.Name)]; exists {
-			return fmt.Errorf("duplicate classify rule name %q", rule.Name)
-		}
-		ruleSeen[strings.ToLower(rule.Name)] = struct{}{}
-		compiled, compileErr := regexp.Compile(rule.Pattern)
-		if compileErr != nil {
-			return fmt.Errorf("classify rule %q: invalid regex %q: %w", rule.Name, rule.Pattern, compileErr)
-		}
-		rule.compiled = compiled
-	}
 	return nil
 }

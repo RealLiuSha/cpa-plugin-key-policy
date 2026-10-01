@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -47,7 +48,7 @@ func TestMigrationResumesAfterUsageWasPersisted(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if persisted.Version != 5 {
+	if persisted.Version != currentUsageFileVersion {
 		t.Fatal("cycle ledger was not persisted before state")
 	}
 	now = now.Add(time.Hour)
@@ -213,5 +214,91 @@ func TestCycleScheduleSurvivesManualResetAndDowntime(t *testing.T) {
 	summary := ledger.Summary("key", quotaLimits{WeeklyUSD: 10, MonthlyUSD: 20})
 	if summary.Cycles[1].ResetsAt.Day() != 13 || summary.Cycles[2].ResetsAt.Day() != 12 || summary.MonthlyUSD != 5 {
 		t.Fatalf("downtime shifted independent schedules: %+v", summary)
+	}
+}
+
+// Format 6 drops multi-target routing, credential groups and rules, and the
+// free flag. Converting a v5 dataset must keep every key, price, multiplier
+// and quota cycle, keep the original pair as a backup, and record the drops.
+func TestV5DatasetConvertsToCurrentFormat(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	stateRaw := mustReadSchemaFixture(t, "testdata/schema-v5/state.json")
+	usageRaw := mustReadSchemaFixture(t, "testdata/schema-v5/usage.json")
+	if err := os.WriteFile(path, stateRaw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(persist.UsagePath(path), usageRaw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	before, err := LoadUsage(persist.UsagePath(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 9, 20, 15, 0, 0, 0, mustShanghai(t))
+	store := NewStore()
+	store.SetClock(func() time.Time { return now })
+	if err := store.Configure(Config{Enabled: true, StateFile: path, UsageTimezone: "Asia/Shanghai"}); err != nil {
+		t.Fatal(err)
+	}
+	state, err := LoadState(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	usage, err := LoadUsage(persist.UsagePath(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Version != currentStateFileVersion || usage.Version != currentUsageFileVersion || len(state.RemovedSettings) != 0 {
+		t.Fatalf("converted versions = %d/%d, removed=%v", state.Version, usage.Version, state.RemovedSettings)
+	}
+	models := map[string]ModelDefinition{}
+	for _, model := range state.Models {
+		models[model.Name] = model
+	}
+	chat, community := models["Chat"], models["Community"]
+	if chat.Provider != "codex" || chat.TargetModel != "gpt-5.6" || chat.BillingMultiplier != 1.2 || chat.InputPricePerMillion != 1 || chat.CacheWritePricePerMillion == nil || *chat.CacheWritePricePerMillion != 0.3 {
+		t.Fatalf("Chat = %+v", chat)
+	}
+	if community.Provider != "codex" || community.InputPricePerMillion != 0 || community.OutputPricePerMillion != 0 {
+		t.Fatalf("Community = %+v", community)
+	}
+	key := state.Keys[0]
+	if key.KeyHash != "sha256:"+strings.Repeat("a", 64) || key.DailyLimitUSD != 10 || len(key.Models) != 2 || key.Models[0].DailyLimitUSD != 5 {
+		t.Fatalf("key = %+v", key)
+	}
+	if !reflect.DeepEqual(before.Usage, usage.Usage) {
+		t.Fatal("conversion changed usage history or quota cycles")
+	}
+	backupRaw, err := os.ReadFile(MigrationBackupPath(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var backup migrationBackup
+	if err := json.Unmarshal(backupRaw, &backup); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(backup.State, stateRaw) || !bytes.Equal(backup.Usage, usageRaw) {
+		t.Fatal("backup does not hold the original v5 pair")
+	}
+	events, err := store.AuditEvents("", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 || events[0].Action != "migrate_state" {
+		t.Fatalf("audit = %+v, want one migrate_state event", events)
+	}
+	removed, _ := json.Marshal(events[0].Changes["removed"].From)
+	for _, want := range []string{"keeps upstream codex/gpt-5.6; removed openai/gpt-5.6", `credential group \"team\"`, `\"Community\": removed the free flag`, "1 credential classification rule(s): team"} {
+		if !strings.Contains(string(removed), want) {
+			t.Errorf("removed settings %s lack %q", removed, want)
+		}
+	}
+	reloaded := NewStore()
+	reloaded.SetClock(func() time.Time { return now })
+	if err := reloaded.Configure(Config{Enabled: true, StateFile: path, UsageTimezone: "Asia/Shanghai"}); err != nil {
+		t.Fatal(err)
+	}
+	if again, _ := reloaded.AuditEvents("", 10); len(again) != 1 {
+		t.Fatalf("restart repeated the conversion report: %+v", again)
 	}
 }

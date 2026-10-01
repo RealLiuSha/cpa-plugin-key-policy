@@ -15,25 +15,26 @@ func TestConfigExampleContainsValidCurrentPluginConfig(t *testing.T) {
 	}
 	var document struct {
 		Plugins struct {
-			Enabled bool              `yaml:"enabled"`
-			Dir     string            `yaml:"dir"`
-			Configs map[string]Config `yaml:"configs"`
+			Configs map[string]map[string]any `yaml:"configs"`
 		} `yaml:"plugins"`
 	}
 	if err := yaml.Unmarshal(raw, &document); err != nil {
 		t.Fatal(err)
 	}
-	config, exists := document.Plugins.Configs["cpa-key-policy"]
+	section, exists := document.Plugins.Configs["cpa-key-policy"]
 	if !exists {
 		t.Fatal("cpa-key-policy example config is missing")
 	}
-	if err := normalizeConfig(&config); err != nil {
+	delete(section, "priority") // host-owned, stripped at the plugin boundary
+	pluginYAML, err := yaml.Marshal(section)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config, err := DecodeConfig(pluginYAML)
+	if err != nil {
 		t.Fatalf("invalid current example: %v", err)
 	}
-	if len(config.Models) != 2 || len(config.Models[0].Targets) != 2 || len(config.Keys) != 1 || len(config.Keys[0].Models) != 2 {
-		t.Fatalf("example does not cover multi-target models and key references: %+v", config)
-	}
-	if !config.Models[1].Free {
-		t.Fatal("example must include an explicit free model")
+	if len(config.Models) != 2 || config.Models[1].BillingMode != "per_call" || len(config.Keys) != 1 || len(config.Keys[0].Models) != 2 {
+		t.Fatalf("example does not cover token and per-call models with key references: %+v", config)
 	}
 }

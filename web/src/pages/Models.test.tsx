@@ -20,36 +20,22 @@ vi.mock("../api/models", () => ({
 const { translate } = vi.hoisted(() => ({ translate: (key: string) => key }));
 vi.mock("../i18n", () => ({ useT: () => translate }));
 
-import { deleteModelDefinition, fetchModelDefinitions, importModelPrices, previewModelPrices } from "../api/modelDefinitions";
+import { deleteModelDefinition, fetchModelDefinitions, importModelPrices, importModels, previewModelPrices } from "../api/modelDefinitions";
 import { fetchCatalog } from "../api/models";
 import Models from "./Models";
 
 const models: ModelDefinition[] = [
   {
-    name: "fast",
-    targets: [
-      { provider: "codex", group: "team", target_model: "gpt-5" },
-      { provider: "xai", target_model: "grok" },
-      { provider: "openai", target_model: "gpt-4.1" },
-      { provider: "anthropic", target_model: "claude" },
-    ],
-    dispatch: "round-robin",
-    billing_mode: "tokens",
-    free: false,
-    input_price_per_million: 1,
-    output_price_per_million: 2,
-    ref_count: 1,
-    ref_keys: ["team-a"],
+    name: "fast", provider: "codex", target_model: "gpt-5", billing_mode: "tokens", billing_multiplier: 1.2,
+    input_price_per_million: 1, output_price_per_million: 2, ref_count: 1, ref_keys: ["team-a"],
   },
-  {
-    name: "free-model",
-    targets: [{ provider: "openai", target_model: "small" }],
-    dispatch: "priority",
-    billing_mode: "tokens",
-    free: true,
-    ref_count: 0,
-  },
+  { name: "fresh", provider: "openai", target_model: "small", billing_mode: "tokens", billing_multiplier: 1, ref_count: 0 },
 ];
+
+const match = (model: string, input: number) => ({
+  model, matched_model: model, match_type: "index_exact", source: "Models.dev", source_url: "https://models.dev/api.json",
+  source_provider_id: "openai", source_provider_name: "OpenAI", prompt_price_per_1m: input, completion_price_per_1m: input * 4, cache_read_price_per_1m: 0,
+});
 
 const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
 let container: HTMLDivElement;
@@ -62,19 +48,15 @@ beforeEach(() => {
   vi.mocked(deleteModelDefinition).mockResolvedValue(undefined);
   vi.mocked(importModelPrices).mockResolvedValue({ applied: [], unchanged: [], skipped: [], affected_keys: [] });
   vi.mocked(previewModelPrices).mockResolvedValue({
-    source: "Models.dev", source_url: "https://models.dev/api.json", metadata_models: 1,
-    matches: [{
-      model: "gpt-5", matched_model: "gpt-5", match_type: "index_exact", source: "Models.dev",
-      source_url: "https://models.dev/api.json", source_provider_id: "openai", source_provider_name: "OpenAI",
-      prompt_price_per_1m: 3, completion_price_per_1m: 12, cache_read_price_per_1m: 0.75, cache_write_price_per_1m: 3.75,
-    }, {
-      model: "small", matched_model: "small", match_type: "index_exact", source: "Models.dev",
-      source_url: "https://models.dev/api.json", source_provider_id: "openai", source_provider_name: "OpenAI",
-      prompt_price_per_1m: 0.15, completion_price_per_1m: 0.6, cache_read_price_per_1m: 0.075,
-    }],
-    unmatched_models: [],
+    source: "Models.dev", source_url: "https://models.dev/api.json", metadata_models: 2,
+    matches: [match("gpt-5", 3), match("small", 0.15)], unmatched_models: [],
   });
-  vi.mocked(fetchCatalog).mockResolvedValue([]);
+  vi.mocked(fetchCatalog).mockResolvedValue([
+    { provider: "codex", model: "gpt-5" },
+    { provider: "xai", model: "grok-4.7" },
+    { provider: "openai", model: "grok-4.7" },
+  ]);
+  vi.mocked(importModels).mockResolvedValue({ created: [{ name: "grok-4.7" }], skipped: [] });
 });
 
 afterEach(() => {
@@ -92,61 +74,66 @@ async function renderPage() {
   });
 }
 
+const button = (label: string, scope: ParentNode = container) =>
+  [...scope.querySelectorAll<HTMLButtonElement>("button")].find((candidate) => candidate.textContent === label)!;
+
 describe("Models management", () => {
-  it("shows targets, prices and reference protection", async () => {
+  it("shows the upstream, base price, multiplier and unpriced state", async () => {
     await renderPage();
-    expect(container.textContent).toContain("codex · team / gpt-5");
-    expect(container.textContent).toContain("models.priceTokenSummary");
-    expect(container.querySelectorAll(".model-table tbody tr")).toHaveLength(2);
+    const rows = container.querySelectorAll(".model-table tbody tr");
+    expect(rows).toHaveLength(2);
+    expect(rows[0].textContent).toContain("codex / gpt-5");
+    expect(rows[0].textContent).toContain("×1.2");
+    expect(rows[0].textContent).toContain("models.chargedPrices");
+    expect(rows[1].textContent).toContain("models.unpriced");
+    expect(container.querySelector(".notice-row")?.textContent).toContain("models.unpricedNotice");
     const cards = container.querySelectorAll(".model-card");
-    expect(cards).toHaveLength(2);
-    expect(cards[0].querySelector<HTMLButtonElement>("button.danger")?.disabled).toBe(true);
-    expect(cards[0].textContent).toContain("models.refs");
-    expect(cards[1].querySelector<HTMLButtonElement>("button.danger")?.disabled).toBe(false);
-    const moreTargets = cards[0].querySelector<HTMLButtonElement>(".chip.more")!;
-    expect(moreTargets.getAttribute("aria-expanded")).toBe("false");
-    await act(async () => moreTargets.click());
-    expect(cards[0].textContent).toContain("anthropic / claude");
-    expect(moreTargets.textContent).toBe("models.showLessTargets");
+    expect(cards[0].querySelector("button.danger-outline")).toBeNull();
+    expect(cards[1].querySelector("button.danger-outline")).not.toBeNull();
   });
 
-  it("previews and applies Models.dev price sync, then refreshes model definitions", async () => {
+  it("syncs prices for the unpriced models in one step", async () => {
     await renderPage();
-    expect(container.querySelector(".model-import")).toBeNull();
-    const openSync = [...container.querySelectorAll<HTMLButtonElement>("button")].find((button) => button.textContent === "models.syncPrices")!;
-    await act(async () => { openSync.click(); await tick(); });
-    expect(container.querySelector('[role="dialog"]')).not.toBeNull();
-    const preview = [...container.querySelectorAll<HTMLButtonElement>(".model-import button")].find((button) => button.textContent === "models.pricingPreview")!;
-    await act(async () => { preview.click(); await tick(); await tick(); });
-    expect(previewModelPrices).toHaveBeenCalled();
-    const buttons = [...container.querySelectorAll<HTMLButtonElement>(".model-import button")];
-    const selections = container.querySelectorAll<HTMLInputElement>('.model-import input[type="checkbox"]');
-    expect(selections).toHaveLength(2);
-    await act(async () => selections[1].click());
-    await act(async () => { buttons[1].click(); await tick(); });
-    expect(importModelPrices).toHaveBeenNthCalledWith(1, expect.objectContaining({
-      dry_run: true,
-      matches: [expect.objectContaining({ model: "gpt-5" })],
-    }));
-    const priceInput = container.querySelector<HTMLInputElement>('.model-import input[type="number"]')!;
-    await act(async () => Simulate.change(priceInput, { target: { value: "4" } } as never));
-    expect(buttons[2].disabled).toBe(true);
-    await act(async () => { buttons[1].click(); await tick(); });
-    await act(async () => { buttons[2].click(); await tick(); });
-    expect(importModelPrices).toHaveBeenNthCalledWith(3, expect.objectContaining({ dry_run: false }));
+    await act(async () => { button("models.syncPrices", container.querySelector(".notice-row")!).click(); await tick(); await tick(); });
+    expect(previewModelPrices).toHaveBeenCalledWith(["gpt-5", "fast", "small", "fresh"]);
+    const items = container.querySelectorAll(".sync-item");
+    expect(items).toHaveLength(1);
+    expect(items[0].textContent).toContain("fresh");
+    const price = items[0].querySelector<HTMLInputElement>('input[type="number"]')!;
+    await act(async () => Simulate.change(price, { target: { value: "0.2" } } as never));
+    await act(async () => { button("models.applyCount").click(); await tick(); });
+    expect(importModelPrices).toHaveBeenCalledWith({
+      dry_run: false,
+      matches: [expect.objectContaining({ model: "small", prompt_price_per_1m: 0.2, completion_price_per_1m: 0.6 })],
+    });
     expect(fetchModelDefinitions).toHaveBeenCalledTimes(3);
+  });
+
+  it("imports only the chosen catalog models, then offers price sync", async () => {
+    await renderPage();
+    await act(async () => { button("models.importFromCpa").click(); await tick(); await tick(); });
+    const items = container.querySelectorAll(".import-item");
+    expect(items).toHaveLength(2);
+    expect(items[0].querySelector<HTMLInputElement>("input")!.disabled).toBe(true);
+    expect(container.querySelectorAll<HTMLInputElement>('.import-item input[type="checkbox"]:checked')).toHaveLength(0);
+    await act(async () => items[1].querySelector<HTMLInputElement>("input")!.click());
+    const provider = items[1].querySelector<HTMLSelectElement>("select")!;
+    await act(async () => Simulate.change(provider, { target: { value: "openai" } } as never));
+    await act(async () => { button("models.importCount").click(); await tick(); });
+    expect(importModels).toHaveBeenCalledWith([{ provider: "openai", target_model: "grok-4.7" }]);
+    expect(container.textContent).toContain("models.importDone");
+    await act(async () => { button("models.syncImported").click(); await tick(); await tick(); });
+    expect(container.querySelector('[role="dialog"] h2')?.textContent).toBe("models.syncTitle");
   });
 
   it("deletes an unreferenced model only after confirmation", async () => {
     await renderPage();
     const cards = container.querySelectorAll(".model-card");
-    const deleteButton = cards[1].querySelector<HTMLButtonElement>("button.danger")!;
-    await act(async () => deleteButton.click());
+    await act(async () => cards[1].querySelector<HTMLButtonElement>("button.danger-outline")!.click());
     expect(container.querySelector('[role="dialog"]')?.textContent).toContain("models.deleteConfirm");
     expect(deleteModelDefinition).not.toHaveBeenCalled();
-    const confirmDelete = [...container.querySelectorAll<HTMLButtonElement>('[role="dialog"] button')].find((button) => button.textContent === "models.confirmDelete")!;
-    await act(async () => { confirmDelete.click(); await tick(); });
-    expect(deleteModelDefinition).toHaveBeenCalledWith("free-model");
+    await act(async () => { button("models.confirmDelete", container.querySelector('[role="dialog"]')!).click(); await tick(); });
+    expect(deleteModelDefinition).toHaveBeenCalledWith("fresh");
     expect(fetchModelDefinitions).toHaveBeenCalledTimes(2);
   });
 });

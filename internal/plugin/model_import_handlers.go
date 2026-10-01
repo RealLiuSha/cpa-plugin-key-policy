@@ -31,8 +31,7 @@ func (a *App) previewModelPrices(raw []byte) ManagementResponse {
 }
 
 type modelImportRequest struct {
-	DryRun bool                     `json:"dry_run"`
-	Items  []policy.ModelImportItem `json:"items"`
+	Items []policy.ModelImportItem `json:"items"`
 }
 
 func (a *App) importModels(raw []byte) ManagementResponse {
@@ -40,10 +39,7 @@ func (a *App) importModels(raw []byte) ManagementResponse {
 	if err := decodeStrictBody(raw, &req); err != nil {
 		return jsonError(http.StatusBadRequest, "bad_request", err.Error())
 	}
-	if req.Items == nil {
-		req.Items = []policy.ModelImportItem{}
-	}
-	result, err := a.store.ImportModels(req.Items, req.DryRun)
+	result, err := a.store.ImportModels(req.Items)
 	if err != nil {
 		if errors.Is(err, policy.ErrInvalidModelImport) {
 			return jsonError(http.StatusBadRequest, "validation_error", err.Error())

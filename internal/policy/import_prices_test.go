@@ -133,21 +133,15 @@ func TestImportModelPricesApplyAffectsAllKeysAndPersists(t *testing.T) {
 	}
 }
 
-func TestImportModelPricesMatchingConflictAndNoMatch(t *testing.T) {
-	perCall := perCallTestModel("paid-call", "openai", "call-model", 0.5)
-	multi := tokenTestModel("multi", "openai", "model-a", 1, 2)
-	multi.Targets = append(multi.Targets, ModelTarget{Provider: "openai", TargetModel: "model-b"})
+func TestImportModelPricesMatchingAndNoMatch(t *testing.T) {
 	store := configureImportStore(t, []ModelDefinition{
 		tokenTestModel("fast", "openai", "gpt-4o", 1, 2),
 		tokenTestModel("special-name", "openai", "totally-other", 1, 2),
-		multi,
-		perCall,
+		perCallTestModel("paid-call", "openai", "call-model", 0.5),
 	}, nil)
 	result, err := store.ImportModelPrices([]PriceImportMatch{
 		{Model: "gpt-4o", PromptPricePer1M: fptr(5), CompletionPricePer1M: fptr(30)},
 		{Model: "special-name", PromptPricePer1M: fptr(2), CompletionPricePer1M: fptr(4)},
-		{Model: "model-a", PromptPricePer1M: fptr(1), CompletionPricePer1M: fptr(2)},
-		{Model: "model-b", PromptPricePer1M: fptr(9), CompletionPricePer1M: fptr(9)},
 		{Model: "call-model", PromptPricePer1M: fptr(3), CompletionPricePer1M: fptr(6)},
 		{Model: "no-such-model", PromptPricePer1M: fptr(1), CompletionPricePer1M: fptr(1)},
 	}, false)
@@ -159,7 +153,7 @@ func TestImportModelPricesMatchingConflictAndNoMatch(t *testing.T) {
 		applied[model.Model] = model
 	}
 	if _, ok := applied["fast"]; !ok {
-		t.Fatalf("missing target match: %+v", result)
+		t.Fatalf("missing upstream match: %+v", result)
 	}
 	if _, ok := applied["special-name"]; !ok {
 		t.Fatalf("missing name fallback: %+v", result)
@@ -167,47 +161,20 @@ func TestImportModelPricesMatchingConflictAndNoMatch(t *testing.T) {
 	if applied["paid-call"].Note == "" {
 		t.Fatalf("per-call note missing: %+v", result.Applied)
 	}
-	conflict, noMatch := false, false
-	for _, skipped := range result.Skipped {
-		conflict = conflict || (skipped.Model == "multi" && skipped.Reason == "target_price_conflict")
-		noMatch = noMatch || (skipped.MatchModel == "no-such-model" && skipped.Reason == "no_match")
-	}
-	if !conflict || !noMatch {
+	if len(result.Skipped) != 1 || result.Skipped[0].MatchModel != "no-such-model" || result.Skipped[0].Reason != "no_match" {
 		t.Fatalf("skipped = %+v", result.Skipped)
 	}
 }
 
-func TestImportModelPricesRejectsPartialMultiTargetMatch(t *testing.T) {
-	multi := tokenTestModel("multi", "openai", "model-a", 1, 2)
-	multi.Targets = append(multi.Targets, ModelTarget{Provider: "openai", TargetModel: "model-b"})
-	store := configureImportStore(t, []ModelDefinition{multi}, nil)
-
-	result, err := store.ImportModelPrices([]PriceImportMatch{{
-		Model: "model-a", PromptPricePer1M: fptr(9), CompletionPricePer1M: fptr(10),
-	}}, false)
+// Imported models start at $0; syncing prices must be able to price them.
+func TestImportModelPricesPricesZeroPricedModels(t *testing.T) {
+	store := configureImportStore(t, []ModelDefinition{freeTestModel("fresh", "openai", "fresh")}, nil)
+	result, err := store.ImportModelPrices([]PriceImportMatch{{Model: "fresh", PromptPricePer1M: fptr(1)}}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(result.Applied) != 0 || len(result.Skipped) != 1 || result.Skipped[0].Reason != "target_price_conflict" {
-		t.Fatalf("partial multi-target result = %+v", result)
-	}
-	got := store.ModelsSnapshot()[0]
-	if got.InputPricePerMillion != 1 || got.OutputPricePerMillion != 2 {
-		t.Fatalf("partial match changed shared prices: %+v", got)
-	}
-}
-
-func TestImportModelPricesProtectsFreeModels(t *testing.T) {
-	store := configureImportStore(t, []ModelDefinition{freeTestModel("free", "openai", "free")}, nil)
-	result, err := store.ImportModelPrices([]PriceImportMatch{{Model: "free", PromptPricePer1M: fptr(1)}}, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(result.Skipped) != 1 || result.Skipped[0].Reason != "free_model" {
+	if len(result.Applied) != 1 || store.ModelsSnapshot()[0].InputPricePerMillion != 1 {
 		t.Fatalf("result = %+v", result)
-	}
-	if !store.ModelsSnapshot()[0].Free {
-		t.Fatal("price import changed free state")
 	}
 }
 

@@ -1,0 +1,69 @@
+{
+  "version": 5,
+  "dataset_id": "55555555555555555555555555555555",
+  "usage": {
+    "team-a": {
+      "days": {
+        "2026-09-20": {
+          "total_usd": 1.5,
+          "call_count": 2,
+          "input_tokens": 1000,
+          "output_tokens": 200
+        }
+      },
+      "by_model": {
+        "Chat": {
+          "2026-09-20": {
+            "total_usd": 1.5,
+            "call_count": 2,
+            "input_tokens": 1000,
+            "output_tokens": 200
+          }
+        }
+      },
+      "cycles": {
+        "timezone": "Asia/Shanghai",
+        "daily": {
+          "started_at": "2026-09-20T00:00:00+08:00",
+          "resets_at": "2026-09-21T00:00:00+08:00",
+          "reset_kind": "automatic",
+          "by_model": {
+            "Chat": {
+              "total_usd": 1.5,
+              "call_count": 2,
+              "input_tokens": 1000,
+              "output_tokens": 200
+            }
+          }
+        },
+        "weekly": {
+          "started_at": "2026-09-15T00:00:00+08:00",
+          "resets_at": "2026-09-22T00:00:00+08:00",
+          "reset_kind": "automatic",
+          "by_model": {
+            "Chat": {
+              "total_usd": 1.5,
+              "call_count": 2,
+              "input_tokens": 1000,
+              "output_tokens": 200
+            }
+          }
+        },
+        "monthly": {
+          "started_at": "2026-09-01T00:00:00+08:00",
+          "resets_at": "2026-10-01T00:00:00+08:00",
+          "reset_kind": "initial",
+          "by_model": {
+            "Chat": {
+              "total_usd": 1.5,
+              "call_count": 2,
+              "input_tokens": 1000,
+              "output_tokens": 200
+            }
+          }
+        }
+      }
+    }
+  },
+  "updated_at": "2026-09-20T12:00:00Z"
+}

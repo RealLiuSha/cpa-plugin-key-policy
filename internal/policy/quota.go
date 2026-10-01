@@ -1,6 +1,7 @@
 package policy
 
 import (
+	"math"
 	"sort"
 	"strings"
 	"sync"
@@ -244,6 +245,46 @@ func (l *usageLedger) RecordCost(id, model string, amount, cacheCost float64, ca
 	l.markDirtyLocked()
 }
 
+// ReturnCost reverses one per-call charge made at chargedAt. History is
+// adjusted on the charge's own date and quota cycles only while they still
+// cover that moment, so a reset in between never produces negative counters.
+func (l *usageLedger) ReturnCost(id, model string, amount float64, chargedAt time.Time) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	state := l.entries[id]
+	if state == nil {
+		return
+	}
+	date := l.dateKey(chargedAt)
+	if bucket, ok := state.ByModel[model][date]; ok {
+		returned := returnableCost(bucket, amount)
+		state.ByModel[model][date] = subtractCost(bucket, returned)
+		state.Days[date] = subtractCost(state.Days[date], returned)
+	}
+	if state.Cycles != nil {
+		for _, window := range quotaWindows {
+			cycle := state.Cycles.cycle(window)
+			if chargedAt.Before(cycle.StartedAt) || !chargedAt.Before(cycle.ResetsAt) {
+				continue
+			}
+			if bucket, ok := cycle.ByModel[model]; ok {
+				cycle.ByModel[model] = subtractCost(bucket, returnableCost(bucket, amount))
+			}
+		}
+	}
+	l.markDirtyLocked()
+}
+
+func returnableCost(bucket UsageBucket, amount float64) UsageBucket {
+	return UsageBucket{TotalUSD: math.Min(amount, bucket.TotalUSD), CallCount: min(1, bucket.CallCount)}
+}
+
+func subtractCost(bucket, returned UsageBucket) UsageBucket {
+	bucket.TotalUSD = math.Max(0, bucket.TotalUSD-returned.TotalUSD)
+	bucket.CallCount -= returned.CallCount
+	return bucket
+}
+
 type UsageSummary struct {
 	Cycles                   []QuotaCycleSummary `json:"cycles"`
 	Status                   string              `json:"status"`
@@ -421,6 +462,29 @@ func (l *usageLedger) OverLimit(keyID, requestedModel string, limits quotaLimits
 	return "", UsageSummary{}
 }
 
+// quotaDenial describes an exhausted quota. When several cycles are exhausted
+// at once, the one that resets last decides when requests can resume, so the
+// denial names that cycle.
+func (l *usageLedger) quotaDenial(keyID, requestedModel string, limits quotaLimits) *Denial {
+	reason, summary := l.OverLimit(keyID, requestedModel, limits)
+	if reason == "" {
+		return nil
+	}
+	denial := &Denial{Reason: reason, Timezone: summary.Timezone}
+	for _, cycle := range summary.Cycles {
+		if reason == "model_daily_exceeded" {
+			if cycle.Window == UsageResetDaily {
+				denial.Model, denial.Limit, denial.RetryAt = requestedModel, modelHardLimit(limits, requestedModel), cycle.ResetsAt
+			}
+			continue
+		}
+		if cycle.LimitUSD > 0 && cycle.UsedUSD >= cycle.LimitUSD && !cycle.ResetsAt.Before(denial.RetryAt) {
+			denial.Reason, denial.Limit, denial.RetryAt = string(cycle.Window)+"_exceeded", cycle.LimitUSD, cycle.ResetsAt
+		}
+	}
+	return denial
+}
+
 func (l *usageLedger) removeKeyUsage(id string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -479,7 +543,6 @@ func (l *usageLedger) resetWindowAndPersist(id string, window UsageResetWindow, 
 type ModelUsageEntry struct {
 	Name        string      `json:"name"`
 	BillingMode string      `json:"billing_mode,omitempty"`
-	Free        bool        `json:"free"`
 	PerCallUSD  float64     `json:"per_call_usd,omitempty"`
 	InConfig    bool        `json:"in_config"`
 	Daily       UsageWindow `json:"daily"`
@@ -514,7 +577,7 @@ func (l *usageLedger) ModelUsage(keyID string, models []ModelDefinition) []Model
 		lower := strings.ToLower(model.Name)
 		canonical[lower] = model.Name
 		byModel[model.Name] = ModelUsageEntry{
-			Name: model.Name, BillingMode: model.BillingMode, Free: model.Free,
+			Name: model.Name, BillingMode: model.BillingMode,
 			PerCallUSD: model.PerCallUSD, InConfig: true,
 		}
 	}

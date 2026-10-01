@@ -46,6 +46,13 @@ interface Props {
   onDanger?: () => void;
 }
 
+// A new key without an ID gets a short random one; IDs never change later.
+export function generatedKeyID(): string {
+  const bytes = new Uint8Array(4);
+  crypto.getRandomValues(bytes);
+  return "key-" + [...bytes].map((value) => value.toString(16).padStart(2, "0")).join("");
+}
+
 function parseNumber(value: string): number {
   const parsed = Number.parseFloat(value);
   return Number.isFinite(parsed) ? parsed : 0;
@@ -169,17 +176,14 @@ export default function KeyForm({
   const submit = async (event: React.FormEvent) => {
     event.preventDefault();
     setLocalError("");
-    if (!id.trim()) {
-      setLocalError(t("keyForm.idRequired"));
-      return;
-    }
     if ([rpm, dailyLimit, weeklyLimit, monthlyLimit, ...selected.map((ref) => ref.daily_limit_usd ?? 0)].some((value) => value < 0)) {
       setLocalError(t("keyForm.modelLimitInvalid"));
       return;
     }
     setBusy(true);
     try {
-      await onSubmit(currentValues());
+      const values = currentValues();
+      await onSubmit(values.id ? values : { ...values, id: generatedKeyID() });
     } catch (reason) {
       setLocalError(extractApiError(reason, t("keyForm.submitFailed")));
     } finally {
@@ -208,19 +212,19 @@ export default function KeyForm({
         <h2>{t("keyForm.mobile.sectionLimits")}</h2>
         <div className="form-grid">
           <label>
-            <span className="field-label">{t("keyForm.dailyLimitLabel")}</span>
+            <span className="field-label">{t("keyForm.dailyLimitLabel")}{dailyLimit === 0 && <span className="badge">{t("keyForm.unlimited")}</span>}</span>
             <input className="input" type="number" min="0" step="0.01" value={dailyLimit} onChange={(event) => setDailyLimit(parseNumber(event.target.value))} />
             <small className="field-hint">{t("keyForm.dailyLimitHint")}</small>
             {showCurrentUsage && initial && <small className="kf-current-usage">{t("keyForm.currentUsage", { amount: initial.usage.daily_usd.toFixed(2) })}</small>}
           </label>
           <label>
-            <span className="field-label">{t("keyForm.weeklyLimitLabel")}</span>
+            <span className="field-label">{t("keyForm.weeklyLimitLabel")}{weeklyLimit === 0 && <span className="badge">{t("keyForm.unlimited")}</span>}</span>
             <input className="input" type="number" min="0" step="0.01" value={weeklyLimit} onChange={(event) => setWeeklyLimit(parseNumber(event.target.value))} />
             <small className="field-hint">{t("keyForm.weeklyLimitHint")}</small>
             {showCurrentUsage && initial && <small className="kf-current-usage">{t("keyForm.currentUsage", { amount: initial.usage.weekly_usd.toFixed(2) })}</small>}
           </label>
           <label>
-            <span className="field-label">{t("keyForm.monthlyLimitLabel")}</span>
+            <span className="field-label">{t("keyForm.monthlyLimitLabel")}{monthlyLimit === 0 && <span className="badge">{t("keyForm.unlimited")}</span>}</span>
             <input className="input" type="number" min="0" step="0.01" value={monthlyLimit} onChange={(event) => setMonthlyLimit(parseNumber(event.target.value))} />
             <small className="field-hint">{t("keyForm.monthlyLimitHint")}</small>
             {showCurrentUsage && initial && <small className="kf-current-usage">{t("keyForm.currentUsage", { amount: (initial.usage.monthly_usd ?? 0).toFixed(2) })}</small>}

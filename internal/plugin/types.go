@@ -26,16 +26,13 @@ const (
 
 	MethodModelRoute = "model.route"
 
-	MethodResponseInterceptAfter = "response.intercept_after"
+	// Request interceptors run before CPA contacts upstream. intercept_before
+	// fires once per model execution and may terminate it with any HTTP status;
+	// intercept_after fires again for every credential attempt.
+	MethodRequestInterceptBefore = "request.intercept_before"
+	MethodRequestInterceptAfter  = "request.intercept_after"
 
-	// MethodSchedulerPick is the host->plugin call that asks this plugin to
-	// choose an auth candidate among those available for a routed provider,
-	// before the host's built-in scheduler runs. We use it to honor a model target's
-	// Group: when a downstream key pinned a tier (e.g. codex "team"), we filter
-	// candidates by their plan_type attribute so the request only ever lands on
-	// an auth file of that tier. Returning Handled=false falls back to the host
-	// scheduler, so providers without a tier concept behave as before.
-	MethodSchedulerPick = "scheduler.pick"
+	MethodResponseInterceptAfter = "response.intercept_after"
 
 	// MethodUsageHandle is the host->plugin call that delivers a finalized
 	// usage record (tokens already parsed by CPA) after a request completes.
@@ -51,7 +48,7 @@ const (
 const (
 	PluginID   = "cpa-key-policy"
 	PluginName = "cpa-key-policy"
-	Version    = "0.6.0"
+	Version    = "0.9.0"
 )
 
 type Envelope struct {
@@ -98,7 +95,7 @@ type Capabilities struct {
 	FrontendAuthProvider          bool `json:"frontend_auth_provider"`
 	FrontendAuthProviderExclusive bool `json:"frontend_auth_provider_exclusive,omitempty"`
 	ModelRouter                   bool `json:"model_router"`
-	Scheduler                     bool `json:"scheduler,omitempty"`
+	RequestInterceptor            bool `json:"request_interceptor"`
 	ResponseInterceptor           bool `json:"response_interceptor"`
 	UsagePlugin                   bool `json:"usage_plugin"`
 	ManagementAPI                 bool `json:"management_api"`
@@ -122,13 +119,15 @@ type FrontendAuthResponse struct {
 	Metadata      map[string]string `json:"Metadata,omitempty"`
 }
 
+// ModelRouteRequest mirrors CPA's pluginapi.ModelRouteRequest without the
+// request body the host also sends: routing never reads it, and leaving it out
+// spares decoding a copy of every request.
 type ModelRouteRequest struct {
 	SourceFormat       string         `json:"SourceFormat"`
 	RequestedModel     string         `json:"RequestedModel"`
 	Stream             bool           `json:"Stream"`
 	Headers            http.Header    `json:"Headers"`
 	Query              url.Values     `json:"Query"`
-	Body               []byte         `json:"Body"`
 	Metadata           map[string]any `json:"Metadata"`
 	AvailableProviders []string       `json:"AvailableProviders"`
 }
@@ -141,42 +140,30 @@ type ModelRouteResponse struct {
 	Reason      string `json:"Reason,omitempty"`
 }
 
-// SchedulerPickRequest is the payload of the host->plugin scheduler.pick call.
-// It mirrors pluginapi.SchedulerPickRequest. The plugin only needs Provider,
-// Model, Options.Metadata (carrying the group we stamped at authenticate time)
-// and Candidates[].Attributes (codex plan_type etc.).
-type SchedulerPickRequest struct {
-	Provider   string                   `json:"Provider,omitempty"`
-	Providers  []string                 `json:"Providers,omitempty"`
-	Model      string                   `json:"Model"`
-	Stream     bool                     `json:"Stream,omitempty"`
-	Options    SchedulerPickOptions     `json:"Options"`
-	Candidates []SchedulerAuthCandidate `json:"Candidates"`
+// RequestInterceptRequest is the part of CPA's pluginapi.RequestInterceptRequest
+// this plugin reads. Headers are a clone of the inbound request headers; there
+// is no query string. Metadata carries request_path, the matched CPA route.
+type RequestInterceptRequest struct {
+	SourceFormat   string         `json:"SourceFormat"`
+	RequestedModel string         `json:"RequestedModel"`
+	Headers        http.Header    `json:"Headers"`
+	Metadata       map[string]any `json:"Metadata"`
 }
 
-type SchedulerPickOptions struct {
-	Headers  map[string][]string `json:"Headers,omitempty"`
-	Metadata map[string]any      `json:"Metadata,omitempty"`
+// RequestInterceptResponse mirrors pluginapi.RequestInterceptResponse. An empty
+// response leaves the request unchanged. ResponseBody must stay []byte: the
+// host decodes it as base64 and lets the request through when it cannot.
+type RequestInterceptResponse struct {
+	Terminate       bool        `json:"Terminate,omitempty"`
+	StatusCode      int         `json:"StatusCode,omitempty"`
+	ResponseHeaders http.Header `json:"ResponseHeaders,omitempty"`
+	ResponseBody    []byte      `json:"ResponseBody,omitempty"`
 }
 
-// SchedulerAuthCandidate describes one selectable auth record.
-type SchedulerAuthCandidate struct {
-	ID         string            `json:"ID"`
-	Provider   string            `json:"Provider"`
-	Priority   int               `json:"Priority,omitempty"`
-	Status     string            `json:"Status,omitempty"`
-	Attributes map[string]string `json:"Attributes,omitempty"`
-	Metadata   map[string]any    `json:"Metadata,omitempty"`
-}
-
-type SchedulerPickResponse struct {
-	// AuthID picks a specific candidate; leave empty and set Handled=false to
-	// defer to the host scheduler.
-	AuthID string `json:"AuthID,omitempty"`
-	// Handled reports whether the plugin made a scheduling decision.
-	Handled bool `json:"Handled"`
-}
-
+// ResponseInterceptRequest mirrors CPA's pluginapi.ResponseInterceptRequest
+// without the original and translated request bodies the host repeats: the
+// model rewrite only reads the response body, and leaving them out spares
+// decoding both on every non-streaming response.
 type ResponseInterceptRequest struct {
 	SourceFormat    string         `json:"SourceFormat"`
 	Model           string         `json:"Model"`
@@ -184,8 +171,6 @@ type ResponseInterceptRequest struct {
 	Stream          bool           `json:"Stream"`
 	RequestHeaders  http.Header    `json:"RequestHeaders"`
 	ResponseHeaders http.Header    `json:"ResponseHeaders"`
-	OriginalRequest []byte         `json:"OriginalRequest"`
-	RequestBody     []byte         `json:"RequestBody"`
 	Body            []byte         `json:"Body"`
 	StatusCode      int            `json:"StatusCode"`
 	Metadata        map[string]any `json:"Metadata"`

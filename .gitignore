@@ -41,6 +41,8 @@ nul
 
 /scripts/*
 !/scripts/build-linux-amd64.sh
+!/scripts/publish.py
+!/scripts/test_publish.py
 
 # docs
 goals

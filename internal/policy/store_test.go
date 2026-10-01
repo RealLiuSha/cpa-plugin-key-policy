@@ -50,7 +50,7 @@ func TestStoreAuthenticateAllowedAndRoute(t *testing.T) {
 	store, plain := newTestStore(t)
 	headers := http.Header{"Authorization": {"Bearer " + plain}}
 	decision := store.Authenticate("POST", "/v1/chat/completions", headers, nil, []byte(`{"model":"fast"}`))
-	if !decision.Known || !decision.Allowed || decision.Route.TargetModel != "gpt-5-codex" {
+	if !decision.Known || !decision.Allowed || decision.Model.TargetModel != "gpt-5-codex" {
 		t.Fatalf("decision = %+v, want allowed", decision)
 	}
 	rule, keyID, ok := store.Route(headers, nil, "fast")
@@ -78,10 +78,31 @@ func TestStoreAuthenticateRejectsModelsEndpoint(t *testing.T) {
 func TestStoreAuthenticateRateLimits(t *testing.T) {
 	store, plain := newTestStore(t)
 	headers := http.Header{"Authorization": {"Bearer " + plain}}
-	_ = store.Authenticate("POST", "/v1/chat/completions", headers, nil, []byte(`{"model":"fast"}`))
-	decision := store.Authenticate("POST", "/v1/chat/completions", headers, nil, []byte(`{"model":"fast"}`))
-	if !decision.RateLimited || decision.Allowed {
-		t.Fatalf("decision = %+v, want rate limited", decision)
+	if first := admitRequest(store, "POST", "/v1/chat/completions", headers, []byte(`{"model":"fast"}`)); !first.Allowed || !first.Deferred {
+		t.Fatalf("first request = %+v, want admitted by the interceptor", first)
+	}
+	second := admitRequest(store, "POST", "/v1/chat/completions", headers, []byte(`{"model":"fast"}`))
+	if second.Allowed || second.Reason != "rpm_exceeded" || second.Denial.Limit != 1 || second.Denial.RetryAt.IsZero() {
+		t.Fatalf("second request = %+v, want rpm_exceeded with a retry time", second)
+	}
+}
+
+// Requests the interceptor cannot answer with 429 keep their limits in
+// authentication: keys passed in the query string, and paths CPA does not
+// intercept. WebSocket handshakes check quota but leave RPM to each turn.
+func TestAdmissionStaysInAuthenticationWhereInterceptorCannotReject(t *testing.T) {
+	store, plain := newTestStore(t)
+	query := map[string][]string{"key": {plain}}
+	_ = store.Authenticate("POST", "/v1beta/models/fast:generateContent", nil, query, nil)
+	if decision := store.Authenticate("POST", "/v1beta/models/fast:generateContent", nil, query, nil); decision.Allowed || decision.Deferred || decision.Reason != "rpm_exceeded" {
+		t.Fatalf("query-key request = %+v, want rpm_exceeded in authentication", decision)
+	}
+	headers := http.Header{"Authorization": {"Bearer " + plain}}
+	if decision := store.Authenticate("POST", "/v1/realtime/calls", headers, nil, nil); decision.Allowed || decision.Reason != "rpm_exceeded" {
+		t.Fatalf("realtime request = %+v, want rpm_exceeded in authentication", decision)
+	}
+	if decision := store.Authenticate("GET", "/v1/responses", headers, nil, nil); !decision.Allowed || decision.Deferred {
+		t.Fatalf("websocket handshake = %+v, want admitted without counting RPM", decision)
 	}
 }
 
@@ -127,12 +148,11 @@ func imgTeamKey(store *Store) KeyConfig {
 	return *k
 }
 
-func TestAuthenticatePerCallImagePreCharged(t *testing.T) {
+func TestAdmissionPrechargesPerCallImage(t *testing.T) {
 	store, plain := perCallImageStore(t)
 	headers := http.Header{"Authorization": {"Bearer " + plain}}
-	decision := store.Authenticate("POST", "/v1/images/generations", headers, nil, []byte(`{"model":"grok-imagine-image-quality","prompt":"a boat"}`))
-	if !decision.Allowed || !decision.PreCharged {
-		t.Fatalf("decision = %+v, want Allowed+PreCharged", decision)
+	if admission := admitRequest(store, "POST", "/v1/images/generations", headers, []byte(`{"model":"grok-imagine-image-quality","prompt":"a boat"}`)); !admission.Allowed {
+		t.Fatalf("admission = %+v", admission)
 	}
 	sum := store.UsageSummaryFor(imgTeamKey(store))
 	if sum.DailyUSD != 2 || sum.DailyCallCount != 1 {
@@ -145,9 +165,8 @@ func TestPerCallPrechargeConsumesOneUsageReport(t *testing.T) {
 	now := time.Date(2026, 8, 8, 12, 0, 0, 0, time.UTC)
 	store.SetClock(func() time.Time { return now })
 	headers := http.Header{"Authorization": {"Bearer " + plain}}
-	decision := store.Authenticate("POST", "/v1/images/generations", headers, nil, []byte(`{"model":"grok-imagine-image-quality"}`))
-	if !decision.PreCharged {
-		t.Fatalf("decision = %+v", decision)
+	if admission := admitRequest(store, "POST", "/v1/images/generations", headers, []byte(`{"model":"grok-imagine-image-quality"}`)); !admission.Allowed {
+		t.Fatalf("admission = %+v", admission)
 	}
 	if cost := store.RecordUsage("img-team", "grok-imagine-image-quality", "grok-imagine-image-quality", false, UsageDetail{}); cost != 0 {
 		t.Fatalf("matching usage report cost = %v, want deduped 0", cost)
@@ -166,6 +185,18 @@ func TestPerCallPrechargeConsumesOneUsageReport(t *testing.T) {
 	}
 }
 
+func TestFailedPerCallGenerationReturnsPrecharge(t *testing.T) {
+	store, plain := perCallImageStore(t)
+	headers := http.Header{"Authorization": {"Bearer " + plain}}
+	if admission := admitRequest(store, "POST", "/v1/images/generations", headers, []byte(`{"model":"grok-imagine-image-quality"}`)); !admission.Allowed {
+		t.Fatalf("admission = %+v", admission)
+	}
+	_ = store.RecordUsage("img-team", "grok-imagine-image-quality", "grok-imagine-image-quality", true, UsageDetail{})
+	if sum := store.UsageSummaryFor(imgTeamKey(store)); sum.DailyUSD != 0 || sum.DailyCallCount != 0 {
+		t.Fatalf("summary after failed generation = %+v, want the precharge returned", sum)
+	}
+}
+
 func TestPerCallPrechargeQueueIsBounded(t *testing.T) {
 	store := NewStore()
 	now := time.Date(2026, 8, 8, 12, 0, 0, 0, time.UTC)
@@ -181,73 +212,63 @@ func TestPerCallPrechargeQueueIsBounded(t *testing.T) {
 	}
 }
 
-func TestAuthenticatePerCallVideoPreCharged(t *testing.T) {
+// A generated video was paid for when it was requested, so retrieving it is
+// neither charged again nor blocked by an exhausted quota.
+func TestVideoRetrievalIsNotChargedOrQuotaBlocked(t *testing.T) {
 	store, plain := perCallImageStore(t)
-	headers := http.Header{"Authorization": {"Bearer " + plain}}
-	body := []byte(`{"model":"grok-imagine-image-quality","prompt":"a clip"}`)
-	// Path-parameter video subresource (/v1/videos/<id>) must also pre-charge.
-	decision := store.Authenticate("GET", "/v1/videos/req_123", headers, nil, body)
-	if !decision.Allowed || !decision.PreCharged {
-		t.Fatalf("decision = %+v, want Allowed+PreCharged on video subresource", decision)
+	key := imgTeamKey(store)
+	key.DailyLimitUSD = 2
+	if err := store.UpsertKey(key, true); err != nil {
+		t.Fatal(err)
 	}
-	sum := store.UsageSummaryFor(imgTeamKey(store))
-	if sum.DailyUSD != 2 {
-		t.Fatalf("summary.DailyUSD = %v, want 2", sum.DailyUSD)
+	headers := http.Header{"Authorization": {"Bearer " + plain}}
+	if admission := admitRequest(store, "POST", "/v1/videos", headers, []byte(`{"model":"grok-imagine-image-quality"}`)); !admission.Allowed {
+		t.Fatalf("generation = %+v", admission)
+	}
+	if admission := admitRequest(store, "POST", "/v1/videos", headers, []byte(`{"model":"grok-imagine-image-quality"}`)); admission.Reason != "daily_exceeded" {
+		t.Fatalf("second generation = %+v, want daily_exceeded", admission)
+	}
+	if admission := admitRequest(store, "GET", "/v1/videos/req_123", headers, nil); !admission.Allowed {
+		t.Fatalf("retrieval = %+v, want admitted", admission)
+	}
+	if denial := store.AdmitIntercepted(headers, "grok-imagine-image-quality", "/v1/videos/:request_id"); denial != nil {
+		t.Fatalf("intercepted retrieval = %+v, want admitted", denial)
+	}
+	if sum := store.UsageSummaryFor(imgTeamKey(store)); sum.DailyUSD != 2 || sum.DailyCallCount != 1 {
+		t.Fatalf("summary = %+v, want only the generation charged", sum)
 	}
 }
 
-func TestAuthenticatePerCallChatNotPreCharged(t *testing.T) {
+func TestAdmissionDoesNotPrechargeChatOrTokenModels(t *testing.T) {
 	store, plain := perCallImageStore(t)
 	headers := http.Header{"Authorization": {"Bearer " + plain}}
-	// Same per_call model, but on a chat endpoint — must NOT pre-charge. Chat
-	// is billed via usage.handle (CPA emits a record there), and pre-charging
-	// would double-bill.
-	decision := store.Authenticate("POST", "/v1/chat/completions", headers, nil, []byte(`{"model":"grok-imagine-image-quality"}`))
-	if !decision.Allowed || decision.PreCharged {
-		t.Fatalf("decision = %+v, want Allowed and NOT PreCharged on chat path", decision)
+	// A per-call model on a chat endpoint is billed by usage.handle, and a
+	// token model on an image endpoint is billed by tokens; neither precharges.
+	for _, request := range []struct{ path, body string }{
+		{"/v1/chat/completions", `{"model":"grok-imagine-image-quality"}`},
+		{"/v1/images/generations", `{"model":"fast","prompt":"x"}`},
+	} {
+		if admission := admitRequest(store, "POST", request.path, headers, []byte(request.body)); !admission.Allowed {
+			t.Fatalf("%s admission = %+v", request.path, admission)
+		}
 	}
-	sum := store.UsageSummaryFor(imgTeamKey(store))
-	if sum.DailyUSD != 0 {
-		t.Fatalf("summary.DailyUSD = %v, want 0 (chat not pre-charged)", sum.DailyUSD)
+	if sum := store.UsageSummaryFor(imgTeamKey(store)); sum.DailyUSD != 0 {
+		t.Fatalf("summary.DailyUSD = %v, want 0", sum.DailyUSD)
 	}
 }
 
-func TestAuthenticateTokenModeImageNotPreCharged(t *testing.T) {
-	store, plain := perCallImageStore(t)
-	headers := http.Header{"Authorization": {"Bearer " + plain}}
-	// Image endpoint, but the model is token-billed ("fast") — pre-charge only
-	// applies to per_call models. Token-mode images would be billed by tokens
-	// if CPA reported usage, and pre-charging a fixed USD would be wrong.
-	decision := store.Authenticate("POST", "/v1/images/generations", headers, nil, []byte(`{"model":"fast","prompt":"x"}`))
-	if !decision.Allowed || decision.PreCharged {
-		t.Fatalf("decision = %+v, want Allowed and NOT PreCharged for token-mode model", decision)
-	}
-	sum := store.UsageSummaryFor(imgTeamKey(store))
-	if sum.DailyUSD != 0 {
-		t.Fatalf("summary.DailyUSD = %v, want 0 (token mode not pre-charged)", sum.DailyUSD)
-	}
-}
-
-func TestIsImageVideoEndpoint(t *testing.T) {
-	cases := []struct {
-		path string
-		want bool
-	}{
-		{"/v1/images/generations", true},
-		{"/v1/images/edits", true},
-		{"/openai/v1/images/generations", true},
-		{"/v1/videos", true},
-		{"/v1/videos/generations", true},
-		{"/v1/videos/req_abc", true},
-		{"/openai/v1/videos/extensions", true},
-		{"/v1/chat/completions", false},
-		{"/v1/models", false},
-		{"/v1/responses", false},
-		{"", false},
-	}
-	for _, c := range cases {
-		if got := IsImageVideoEndpoint(c.path); got != c.want {
-			t.Errorf("IsImageVideoEndpoint(%q) = %v, want %v", c.path, got, c.want)
+func TestMediaPaths(t *testing.T) {
+	for path, want := range map[string][2]bool{
+		"/v1/images/generations":              {true, false},
+		"/openai/v1/videos":                   {true, false},
+		"/v1/videos/extensions":               {true, false},
+		"/v1/videos/req_abc":                  {false, true},
+		"/v1/videos/:request_id":              {false, true},
+		"/openai/v1/videos/:video_id/content": {false, true},
+		"/v1/chat/completions":                {false, false},
+	} {
+		if got := [2]bool{isMediaGenerationPath(path), isMediaResultPath(path)}; got != want {
+			t.Errorf("%s: generation/result = %v, want %v", path, got, want)
 		}
 	}
 }
@@ -282,7 +303,7 @@ func TestConfigureDoesNotResurrectKeysMissingFromState(t *testing.T) {
 	s1.mu.RLock()
 	datasetID := s1.datasetID
 	s1.mu.RUnlock()
-	if err := SaveState(path, datasetID, []KeyConfig{{ID: "on-disk", Enabled: true, KeyHash: onDiskHash, Models: modelRefs("fast")}}, models, nil); err != nil {
+	if err := SaveState(path, datasetID, []KeyConfig{{ID: "on-disk", Enabled: true, KeyHash: onDiskHash, Models: modelRefs("fast")}}, models); err != nil {
 		t.Fatal(err)
 	}
 	// Reconfigure with the same path. The persisted state lacks "in-mem", so it
@@ -302,39 +323,23 @@ func TestConfigureDoesNotResurrectKeysMissingFromState(t *testing.T) {
 	}
 }
 
-func TestConfigureUsesPersistedModelsAndClassifyRulesAfterFirstBoot(t *testing.T) {
+func TestConfigureUsesPersistedModelsAfterFirstBoot(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "state.json")
-	persistedModel := freeTestModel("persisted", "codex", "gpt-persisted")
-	persistedRule := ClassifyRule{
-		Name: "persisted-rule", Field: "provider", Pattern: "^codex$", Group: "team", Enabled: true,
-	}
-
 	store := NewStore()
 	if err := store.Configure(Config{
-		Enabled: true, StateFile: path,
-		Models: []ModelDefinition{persistedModel}, ClassifyRules: []ClassifyRule{persistedRule},
+		Enabled: true, StateFile: path, Models: []ModelDefinition{freeTestModel("persisted", "codex", "gpt-persisted")},
 	}); err != nil {
 		t.Fatal(err)
 	}
-
 	if err := store.Configure(Config{
-		Enabled: true, StateFile: path,
-		Models: []ModelDefinition{{Name: "stale-yaml"}},
-		ClassifyRules: []ClassifyRule{{
-			Name: "stale-rule", Field: "provider", Pattern: "[", Group: "free", Enabled: true,
-		}},
+		Enabled: true, StateFile: path, Models: []ModelDefinition{{Name: "stale-yaml"}},
 	}); err != nil {
 		t.Fatal(err)
 	}
-
 	models := store.ModelsSnapshot()
-	if len(models) != 1 || models[0].Name != "persisted" || models[0].Targets[0].TargetModel != "gpt-persisted" {
+	if len(models) != 1 || models[0].Name != "persisted" || models[0].TargetModel != "gpt-persisted" {
 		t.Fatalf("models after reconfigure = %+v, want persisted state", models)
-	}
-	rules := store.ClassifyRulesSnapshot()
-	if len(rules) != 1 || rules[0].Name != "persisted-rule" || rules[0].Group != "team" {
-		t.Fatalf("classify rules after reconfigure = %+v, want persisted state", rules)
 	}
 }
 

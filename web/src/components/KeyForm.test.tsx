@@ -17,20 +17,18 @@ import KeyForm, { keyWriteRequestFromForm, type KeyFormValues } from "./KeyForm"
 const definitions: ModelDefinition[] = [
   {
     name: "fast",
-    targets: [{ provider: "codex", target_model: "gpt-5" }],
-    dispatch: "round-robin",
+    provider: "codex",
+    target_model: "gpt-5",
     billing_mode: "tokens",
-    free: false,
     input_price_per_million: 1,
     output_price_per_million: 2,
     cache_read_price_per_million: 0.2,
   },
   {
     name: "community",
-    targets: [{ provider: "openai", target_model: "small" }],
-    dispatch: "priority",
+    provider: "openai",
+    target_model: "small",
     billing_mode: "tokens",
-    free: true,
   },
 ];
 
@@ -163,7 +161,7 @@ describe("KeyForm current model references", () => {
     await flush();
 
     expect(container.textContent).toContain("models.priceTokenSummary");
-    expect(container.textContent).toContain("models.free");
+    expect(container.textContent).toContain("models.unpriced");
     const modelChecks = container.querySelectorAll<HTMLInputElement>(".model-definition-main input");
     expect(modelChecks).toHaveLength(2);
     expect(modelChecks[0].checked).toBe(true);

@@ -8,10 +8,9 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"sort"
 	"strconv"
 	"strings"
-	"sync"
+	"time"
 
 	"cpa-key-policy/internal/plugin/web"
 	"cpa-key-policy/internal/policy"
@@ -19,16 +18,12 @@ import (
 )
 
 type App struct {
-	store         *policy.Store
-	pricing       *pricingmetadata.Client
-	classifyMu    sync.RWMutex
-	classifyCache map[string][]string
+	store   *policy.Store
+	pricing *pricingmetadata.Client
 }
 
-const classifyCacheCapacity = 4096
-
 func NewApp() *App {
-	return &App{store: policy.NewStore(), pricing: pricingmetadata.NewClient(), classifyCache: make(map[string][]string)}
+	return &App{store: policy.NewStore(), pricing: pricingmetadata.NewClient()}
 }
 
 func (a *App) SetPricingClient(client *pricingmetadata.Client) {
@@ -57,8 +52,10 @@ func (a *App) handleMethod(method string, request []byte) ([]byte, error) {
 		return a.authenticate(request)
 	case MethodModelRoute:
 		return a.routeModel(request)
-	case MethodSchedulerPick:
-		return a.pickScheduler(request)
+	case MethodRequestInterceptBefore:
+		return a.interceptRequest(request)
+	case MethodRequestInterceptAfter:
+		return OKEnvelope(RequestInterceptResponse{})
 	case MethodResponseInterceptAfter:
 		return a.interceptResponse(request)
 	case MethodUsageHandle:
@@ -103,11 +100,6 @@ func (a *App) configure(raw []byte) error {
 	if err := a.store.Configure(cfg); err != nil {
 		return err
 	}
-	// Register the classify cache clear callback, then clear once for safety.
-	a.store.SetOnClassifyRulesChanged(func() {
-		a.clearClassifyCache()
-	})
-	a.clearClassifyCache()
 	a.store.StartUsageFlusher()
 	return nil
 }
@@ -130,15 +122,14 @@ func (a *App) registration() Registration {
 				{Name: "state_file", Type: "string", Description: "JSON state file used for key policy changes made through the Management API."},
 				{Name: "usage_timezone", Type: "string", Description: "IANA timezone used for natural-day usage buckets. Defaults to Asia/Shanghai."},
 				{Name: "keys", Type: "array", Description: "First-boot downstream key seeds. State is authoritative after initialization."},
-				{Name: "models", Type: "array", Description: "First-boot public model seeds with upstream targets and global pricing."},
-				{Name: "classify_rules", Type: "array", Description: "First-boot credential classification rule seeds."},
+				{Name: "models", Type: "array", Description: "First-boot public model seeds: name, provider, target_model and prices."},
 			},
 		},
 		Capabilities: Capabilities{
 			FrontendAuthProvider:          true,
 			FrontendAuthProviderExclusive: false,
 			ModelRouter:                   true,
-			Scheduler:                     true,
+			RequestInterceptor:            true,
 			ResponseInterceptor:           true,
 			UsagePlugin:                   true,
 			ManagementAPI:                 true,
@@ -163,16 +154,10 @@ func (a *App) authenticate(raw []byte) ([]byte, error) {
 		"key_id":          decision.KeyID,
 		"requested_model": decision.Requested,
 	}
-	if decision.Route.PublicModel != "" {
-		meta["public_model"] = decision.Route.PublicModel
-		meta["target_provider"] = decision.Route.Provider
-		meta["target_model"] = decision.Route.TargetModel
-		if decision.Route.Group != "" {
-			// Group lets our Scheduler (scheduler.pick) restrict auth-file
-			// selection to a tier/plan (codex plan_type, antigravity tier).
-			// Empty keeps the provider's default credential selection.
-			meta["group"] = decision.Route.Group
-		}
+	if decision.Model.Name != "" {
+		meta["public_model"] = decision.Model.Name
+		meta["target_provider"] = decision.Model.Provider
+		meta["target_model"] = decision.Model.TargetModel
 	}
 	return OKEnvelope(FrontendAuthResponse{
 		Authenticated: true,
@@ -181,20 +166,35 @@ func (a *App) authenticate(raw []byte) ([]byte, error) {
 	})
 }
 
+// interceptRequest admits a request whose RPM and quota checks authentication
+// deferred, terminating it with 429 when the key is over a limit.
+func (a *App) interceptRequest(raw []byte) ([]byte, error) {
+	var req RequestInterceptRequest
+	if err := json.Unmarshal(raw, &req); err != nil {
+		return nil, err
+	}
+	requestPath, _ := req.Metadata["request_path"].(string)
+	denial := a.store.AdmitIntercepted(req.Headers, req.RequestedModel, requestPath)
+	if denial == nil {
+		return OKEnvelope(RequestInterceptResponse{})
+	}
+	return OKEnvelope(rejectionResponse(req.SourceFormat, denial, time.Now()))
+}
+
 func (a *App) routeModel(raw []byte) ([]byte, error) {
 	var req ModelRouteRequest
 	if err := json.Unmarshal(raw, &req); err != nil {
 		return nil, err
 	}
-	route, keyID, ok := a.store.Route(req.Headers, req.Query, req.RequestedModel)
+	model, keyID, ok := a.store.Route(req.Headers, req.Query, req.RequestedModel)
 	if !ok {
 		return OKEnvelope(ModelRouteResponse{Handled: false})
 	}
 	return OKEnvelope(ModelRouteResponse{
 		Handled:     true,
 		TargetKind:  "provider",
-		Target:      resolveProviderKey(route.Provider, req.AvailableProviders),
-		TargetModel: route.TargetModel,
+		Target:      resolveProviderKey(model.Provider, req.AvailableProviders),
+		TargetModel: model.TargetModel,
 		Reason:      "cpa-key-policy:" + keyID,
 	})
 }
@@ -259,228 +259,6 @@ func (a *App) interceptResponse(raw []byte) ([]byte, error) {
 	return OKEnvelope(ResponseInterceptResponse{Body: body})
 }
 
-// pickScheduler implements the scheduler.pick host->plugin call. When the
-// routed model target had a Group (codex plan_type / antigravity tier), restrict
-// candidate auths to those whose Attributes carry a matching identity. Any
-// Group "" or a group we can't recognize → defer to the host scheduler
-// (Handled=false), preserving the provider's default credential selection.
-//
-// The plugin never sees the resolved route directly here; the group was
-// stamped into request metadata by authenticate(), and the host forwards it as
-// Options.Metadata["group"]. We read it defensively as either string or any.
-//
-// Candidate filtering, in order:
-//  1. Keep candidates whose Attributes["plan_type"] (codex) equals the group.
-//     Also accept Attributes["tier"] (antigravity) to match the same group.
-//  2. A group of "supported" means "codex without an id_token plan" — match
-//     candidates whose plan_type we cannot read (treat unknown plan as that
-//     bucket), so a supported-but-untiered auth file serves them rather than
-//     any tiered one.
-//
-// Among filtered candidates, pick the host's highest-priority one (ties broken
-// by lowest ID for determinism). We do not have access to the model-capability
-// registry here (it's a separate pluginapi capability), so the host still owns
-// the final "is this auth able to serve this model" check via delegate; if a
-// chosen candidate can't serve the model the host falls back. This is the same
-// trust boundary the built-in scheduler operates under.
-func (a *App) pickScheduler(raw []byte) ([]byte, error) {
-	var req SchedulerPickRequest
-	if err := json.Unmarshal(raw, &req); err != nil {
-		return nil, err
-	}
-	group := schedulerGroupFromMetadata(req.Options.Metadata)
-	if group == "" {
-		// No tier narrowed by this downstream key → let the host pick freely.
-		return OKEnvelope(SchedulerPickResponse{Handled: false})
-	}
-	if len(req.Candidates) == 0 {
-		return OKEnvelope(SchedulerPickResponse{Handled: false})
-	}
-
-	matched := make([]SchedulerAuthCandidate, 0, len(req.Candidates))
-	for _, cand := range req.Candidates {
-		if !schedulerCandidateUsable(cand.Status) {
-			continue
-		}
-		if a.candidateMatchesGroup(cand, group) {
-			matched = append(matched, cand)
-		}
-	}
-	if len(matched) == 0 {
-		// No candidate of this tier is available: do not silently degrade to a
-		// different tier (that would break the isolation guarantee). Returning
-		// Handled=false would let the host pick ANY auth including other tiers.
-		// Instead we report an explicit "auth_not_found" so the caller sees the
-		// intent honored (no available tier-matching auth) rather than a leak.
-		return ErrorEnvelope("auth_not_found", "cpa-key-policy: no eligible auth candidate for requested group", http.StatusServiceUnavailable), nil
-	}
-
-	best := matched[0]
-	for _, cand := range matched[1:] {
-		if cand.Priority > best.Priority ||
-			(cand.Priority == best.Priority && cand.ID < best.ID) {
-			best = cand
-		}
-	}
-	return OKEnvelope(SchedulerPickResponse{Handled: true, AuthID: best.ID})
-}
-
-func schedulerCandidateUsable(status string) bool {
-	status = strings.ToLower(strings.TrimSpace(status))
-	status = strings.NewReplacer("-", "_", " ", "_").Replace(status)
-	switch status {
-	case "disabled", "error", "expired", "revoked", "invalid", "unavailable", "cooldown", "cooling_down", "quota_exhausted", "exhausted", "blocked":
-		return false
-	default:
-		return true
-	}
-}
-
-// candidateMatchesGroup reports whether a candidate auth belongs to the
-// requested group. It first evaluates user-defined ClassifyRules (which can
-// override built-in detection — a candidate may belong to multiple groups).
-// If no custom rule matches, it falls back to the built-in plan_type/tier
-// detection. Uses an ID-level cache for performance with large auth-file sets.
-func (a *App) candidateMatchesGroup(cand SchedulerAuthCandidate, group string) bool {
-	groups := a.candidateGroups(cand)
-	for _, g := range groups {
-		if g == group {
-			return true
-		}
-	}
-	return false
-}
-
-// candidateGroups returns all groups a candidate belongs to. Custom rules are
-// evaluated first (multi-group: a candidate can match multiple rules). If no
-// custom rule matches, the built-in plan_type/tier detection runs. Results are
-// cached by candidate ID; the cache is cleared on reconfigure.
-func (a *App) candidateGroups(cand SchedulerAuthCandidate) []string {
-	cacheKey := candidateClassifyCacheKey(cand)
-	// Check cache.
-	a.classifyMu.RLock()
-	if cached, ok := a.classifyCache[cacheKey]; ok {
-		a.classifyMu.RUnlock()
-		return cached
-	}
-	a.classifyMu.RUnlock()
-
-	var groups []string
-	// 1. Evaluate custom classify rules (multi-group: collect all matches).
-	// Group names are stored bare on the rule but stamped/matched with the
-	// classify: prefix so they never collide with built-in plan_type values.
-	for _, rule := range a.store.ClassifyRulesSnapshot() {
-		if !rule.Enabled || rule.Compiled() == nil {
-			continue
-		}
-		val := candidateFieldValue(cand, rule.Field)
-		if val != "" && rule.Compiled().MatchString(val) {
-			if g := policy.FormatClassifyGroup(rule.Group); g != "" {
-				groups = append(groups, g)
-			}
-		}
-	}
-	// 2. If no custom rule matched, fall back to built-in plan_type/tier.
-	if len(groups) == 0 {
-		if g := builtInGroup(cand); g != "" {
-			groups = append(groups, g)
-		}
-	}
-
-	// Cache the result.
-	a.classifyMu.Lock()
-	if a.classifyCache == nil || len(a.classifyCache) >= classifyCacheCapacity {
-		a.classifyCache = make(map[string][]string)
-	}
-	a.classifyCache[cacheKey] = groups
-	a.classifyMu.Unlock()
-	return groups
-}
-
-func (a *App) clearClassifyCache() {
-	a.classifyMu.Lock()
-	a.classifyCache = make(map[string][]string)
-	a.classifyMu.Unlock()
-}
-
-func candidateClassifyCacheKey(cand SchedulerAuthCandidate) string {
-	keys := make([]string, 0, len(cand.Attributes))
-	for key := range cand.Attributes {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	var builder strings.Builder
-	builder.WriteString(cand.ID)
-	builder.WriteByte(0)
-	builder.WriteString(cand.Provider)
-	for _, key := range keys {
-		builder.WriteByte(0)
-		builder.WriteString(key)
-		builder.WriteByte('=')
-		builder.WriteString(cand.Attributes[key])
-	}
-	return builder.String()
-}
-
-// candidateFieldValue extracts the value of a named field from the candidate.
-// Supported fields: "filename" (cand.ID), "provider" (cand.Provider),
-// "plan_type" (cand.Attributes["plan_type"]), "tier" (cand.Attributes["tier"]),
-// or any custom attribute key.
-func candidateFieldValue(cand SchedulerAuthCandidate, field string) string {
-	field = strings.ToLower(strings.TrimSpace(field))
-	switch field {
-	case "filename", "id":
-		return cand.ID
-	case "provider":
-		return cand.Provider
-	default:
-		if cand.Attributes != nil {
-			return cand.Attributes[field]
-		}
-	}
-	return ""
-}
-
-// builtInGroup returns the built-in plan_type/tier group for a candidate,
-// or "supported" if no recognizable claim is present (untiered bucket).
-func builtInGroup(cand SchedulerAuthCandidate) string {
-	if cand.Attributes == nil {
-		return "supported"
-	}
-	plan := strings.ToLower(strings.TrimSpace(cand.Attributes["plan_type"]))
-	tier := strings.ToLower(strings.TrimSpace(cand.Attributes["tier"]))
-	if plan != "" {
-		return plan
-	}
-	if tier != "" {
-		return tier
-	}
-	return "supported"
-}
-
-// schedulerGroupFromMetadata reads the group stamped at authenticate time out
-// of request-provided scheduler options. Tolerates string or any-typed values.
-func schedulerGroupFromMetadata(meta map[string]any) string {
-	if meta == nil {
-		return ""
-	}
-	raw, ok := meta["group"]
-	if !ok || raw == nil {
-		return ""
-	}
-	switch v := raw.(type) {
-	case string:
-		return strings.ToLower(strings.TrimSpace(v))
-	default:
-		return strings.ToLower(strings.TrimSpace(fmt.Sprintf("%v", v)))
-	}
-}
-
-// finalized, already-parsed token record here after every request completes —
-// streaming and non-streaming alike. This is the billing path that covers
-// streaming (the host never invokes response.intercept_after on streams).
-// Fire-and-forget: we always return an empty success envelope regardless of
-// whether we actually billed (best-effort; unknown keys or models cost nothing).
 func (a *App) handleUsage(raw []byte) ([]byte, error) {
 	var req UsageHandleRequest
 	// A malformed record must never break the request path: bill nothing.
@@ -523,13 +301,7 @@ func (a *App) managementRegistration() ManagementRegistrationResponse {
 			{Method: http.MethodDelete, Path: base + "/models", Description: "Delete a public model definition by name."},
 			{Method: http.MethodPost, Path: base + "/models/import-prices", Description: "Batch-import token prices for existing models (dry_run supported)."},
 			{Method: http.MethodPost, Path: base + "/models/pricing-preview", Description: "Preview Models.dev prices for selected CPA models without writing state."},
-			{Method: http.MethodPost, Path: base + "/models/import", Description: "Preview or atomically apply a batch of public model imports."},
-			{Method: http.MethodGet, Path: base + "/classify-rules", Description: "List credential classification rules."},
-			{Method: http.MethodPost, Path: base + "/classify-rules", Description: "Create or update a classification rule."},
-			{Method: http.MethodDelete, Path: base + "/classify-rules", Description: "Delete a classification rule by name."},
-			{Method: http.MethodPost, Path: base + "/classify-rules/reorder", Description: "Reorder classification rules."},
-			{Method: http.MethodPost, Path: base + "/classify-preview", Description: "Preview credential classification results for given descriptors."},
-			{Method: http.MethodPost, Path: base + "/catalog", Description: "Build auth-file model picker catalog with classify + built-in groups."},
+			{Method: http.MethodPost, Path: base + "/models/import", Description: "Create public models for CPA capabilities at $0; existing names are skipped."},
 		},
 		Resources: []ResourceRoute{
 			// TRADEOFF: host menu is static Chinese only, revisit when CPA supports locale maps
@@ -597,18 +369,6 @@ func (a *App) handleManagement(raw []byte) ([]byte, error) {
 		return OKEnvelope(a.previewModelPrices(req.Body))
 	case req.Method == http.MethodPost && path == base+"/models/import":
 		return OKEnvelope(a.importModels(req.Body))
-	case req.Method == http.MethodGet && path == base+"/classify-rules":
-		return OKEnvelope(jsonResponse(http.StatusOK, map[string]any{"rules": a.store.ClassifyRulesSnapshot()}))
-	case req.Method == http.MethodPost && path == base+"/classify-rules":
-		return OKEnvelope(a.upsertClassifyRule(req.Body))
-	case req.Method == http.MethodDelete && path == base+"/classify-rules":
-		return OKEnvelope(a.deleteClassifyRule(req.Body))
-	case req.Method == http.MethodPost && path == base+"/classify-rules/reorder":
-		return OKEnvelope(a.reorderClassifyRules(req.Body))
-	case req.Method == http.MethodPost && path == base+"/classify-preview":
-		return OKEnvelope(a.classifyPreview(req.Body))
-	case req.Method == http.MethodPost && path == base+"/catalog":
-		return OKEnvelope(a.buildCatalog(req.Body))
 	default:
 		return OKEnvelope(jsonError(http.StatusNotFound, "not_found", "unknown management route"))
 	}

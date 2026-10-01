@@ -18,50 +18,78 @@ func (s *Store) UpsertModel(input ModelDefinition) error {
 	s.mu.RLock()
 	keys := s.keysSnapshotLocked()
 	models := s.modelsSnapshotLocked()
-	rules := s.classifyRulesSnapshotLocked()
 	path, datasetID := s.statePath, s.datasetID
 	s.mu.RUnlock()
-	found := false
-	previousMultiplier := 1.0
+	var previous *ModelDefinition
 	for i := range models {
 		if strings.EqualFold(models[i].Name, input.Name) {
-			previousMultiplier = models[i].BillingMultiplier
+			stored := cloneModel(models[i])
+			previous = &stored
 			input.Name = models[i].Name
 			models[i] = input
-			found = true
 			break
 		}
 	}
-	if !found {
+	if previous == nil {
 		models = append(models, input)
 	}
-	cfg := Config{Enabled: true, Keys: keys, Models: models, ClassifyRules: rules}
+	cfg := Config{Enabled: true, Keys: keys, Models: models}
 	if err := normalizeConfig(&cfg); err != nil {
 		return err
 	}
-	canonicalName := strings.TrimSpace(input.Name)
+	if err := s.saveState(path, datasetID, cfg.Keys, cfg.Models); err != nil {
+		return err
+	}
+	s.publishModels(cfg.Models)
+	var saved ModelDefinition
 	for _, model := range cfg.Models {
-		if strings.EqualFold(model.Name, canonicalName) {
-			canonicalName = model.Name
+		if strings.EqualFold(model.Name, input.Name) {
+			saved = model
 			break
 		}
 	}
-	if err := s.saveState(path, datasetID, cfg.Keys, cfg.Models, cfg.ClassifyRules); err != nil {
-		return err
-	}
-	s.publishModels(cfg.Models, true)
 	action := "create_model"
-	if found {
+	if previous != nil {
 		action = "update_model"
 	}
-	changes := map[string]audit.Change{"model": {From: canonicalName, To: canonicalName}}
-	for _, model := range cfg.Models {
-		if model.Name == canonicalName && model.BillingMultiplier != previousMultiplier {
-			changes["billing_multiplier"] = audit.Change{From: previousMultiplier, To: model.BillingMultiplier}
-		}
-	}
+	changes := modelChanges(previous, saved)
 	s.recordAudit(audit.Event{Action: action, Changes: changes})
 	return nil
+}
+
+// modelChanges records what an upsert changed. "model" always names the
+// subject; an update lists only the fields whose values differ.
+func modelChanges(before *ModelDefinition, after ModelDefinition) map[string]audit.Change {
+	changes := map[string]audit.Change{"model": {From: after.Name, To: after.Name}}
+	prior := ModelDefinition{}
+	if before == nil {
+		changes["model"] = audit.Change{From: "", To: after.Name}
+	} else {
+		prior = *before
+	}
+	record := func(field string, from, to any) {
+		if from != to {
+			changes[field] = audit.Change{From: from, To: to}
+		}
+	}
+	record("upstream", upstreamLabel(prior), upstreamLabel(after))
+	record("billing_mode", prior.BillingMode, after.BillingMode)
+	record("billing_multiplier", prior.BillingMultiplier, after.BillingMultiplier)
+	record("input_price_per_million", prior.InputPricePerMillion, after.InputPricePerMillion)
+	record("output_price_per_million", prior.OutputPricePerMillion, after.OutputPricePerMillion)
+	record("cache_read_price_per_million", prior.CacheReadPricePerMillion, after.CacheReadPricePerMillion)
+	if !pricePointersEqual(prior.CacheWritePricePerMillion, after.CacheWritePricePerMillion) {
+		changes["cache_write_price_per_million"] = audit.Change{From: prior.CacheWritePricePerMillion, To: after.CacheWritePricePerMillion}
+	}
+	record("per_call_usd", prior.PerCallUSD, after.PerCallUSD)
+	return changes
+}
+
+func upstreamLabel(model ModelDefinition) string {
+	if model.Provider == "" && model.TargetModel == "" {
+		return ""
+	}
+	return model.Provider + "/" + model.TargetModel
 }
 
 func (s *Store) DeleteModel(name string) error {
@@ -74,7 +102,6 @@ func (s *Store) DeleteModel(name string) error {
 	s.mu.RLock()
 	keys := s.keysSnapshotLocked()
 	models := s.modelsSnapshotLocked()
-	rules := s.classifyRulesSnapshotLocked()
 	path, datasetID := s.statePath, s.datasetID
 	refs := s.modelRefIndexLocked()[strings.ToLower(name)]
 	s.mu.RUnlock()
@@ -93,10 +120,10 @@ func (s *Store) DeleteModel(name string) error {
 	if !found {
 		return errors.New("model not found")
 	}
-	if err := s.saveState(path, datasetID, keys, filtered, rules); err != nil {
+	if err := s.saveState(path, datasetID, keys, filtered); err != nil {
 		return err
 	}
-	s.publishModels(filtered, false)
+	s.publishModels(filtered)
 	s.recordAudit(audit.Event{Action: "delete_model", Changes: map[string]audit.Change{"model": {From: name, To: ""}}})
 	return nil
 }
@@ -145,9 +172,6 @@ func (patch importPricePatch) empty() bool {
 func pricePointersEqual(left, right *float64) bool {
 	return (left == nil && right == nil) || (left != nil && right != nil && *left == *right)
 }
-func importPatchesEqual(left, right importPricePatch) bool {
-	return pricePointersEqual(left.input, right.input) && pricePointersEqual(left.output, right.output) && pricePointersEqual(left.cache, right.cache) && pricePointersEqual(left.cacheWrite, right.cacheWrite)
-}
 
 func (s *Store) ImportModelPrices(matches []PriceImportMatch, dryRun bool) (PriceImportResult, error) {
 	result := PriceImportResult{Applied: []PriceImportApplied{}, Unchanged: []PriceImportUnchanged{}, Skipped: []PriceImportSkipped{}, AffectedKeys: []string{}}
@@ -170,7 +194,6 @@ func (s *Store) ImportModelPrices(matches []PriceImportMatch, dryRun bool) (Pric
 	s.mu.RLock()
 	keys := s.keysSnapshotLocked()
 	models := s.modelsSnapshotLocked()
-	rules := s.classifyRulesSnapshotLocked()
 	refs := s.modelRefIndexLocked()
 	path, datasetID := s.statePath, s.datasetID
 	s.mu.RUnlock()
@@ -179,56 +202,30 @@ func (s *Store) ImportModelPrices(matches []PriceImportMatch, dryRun bool) (Pric
 	changed := false
 	for i := range models {
 		model := &models[i]
-		var hits []importPricePatch
-		var hitNames []string
-		for _, target := range model.Targets {
-			name := strings.ToLower(target.TargetModel)
-			if patch, exists := patches[name]; exists {
-				hits = append(hits, patch)
-				hitNames = append(hitNames, name)
-			}
+		// Upstream ids are what pricing sources know; the public name is the
+		// fallback for models whose upstream id differs from any match.
+		hitName := strings.ToLower(model.TargetModel)
+		patch, exists := patches[hitName]
+		if !exists {
+			hitName = strings.ToLower(model.Name)
+			patch, exists = patches[hitName]
 		}
-		targetMatched := len(hits) > 0
-		if !targetMatched {
-			name := strings.ToLower(model.Name)
-			if patch, exists := patches[name]; exists {
-				hits = []importPricePatch{patch}
-				hitNames = []string{name}
-			}
-		}
-		if len(hits) == 0 {
+		if !exists {
 			continue
 		}
-		for _, name := range hitNames {
-			matched[name] = struct{}{}
-		}
-		if model.Free {
-			result.Skipped = append(result.Skipped, PriceImportSkipped{Model: model.Name, Reason: "free_model"})
-			continue
-		}
-		conflict := false
-		for _, patch := range hits[1:] {
-			if !importPatchesEqual(hits[0], patch) {
-				conflict = true
-				break
-			}
-		}
-		if conflict || (targetMatched && len(hits) != len(model.Targets)) {
-			result.Skipped = append(result.Skipped, PriceImportSkipped{Model: model.Name, Reason: "target_price_conflict"})
-			continue
-		}
+		matched[hitName] = struct{}{}
 		oldInput, oldOutput, oldCache, oldWrite := model.InputPricePerMillion, model.OutputPricePerMillion, model.CacheReadPricePerMillion, model.CacheWritePricePerMillion
-		if hits[0].input != nil {
-			model.InputPricePerMillion = *hits[0].input
+		if patch.input != nil {
+			model.InputPricePerMillion = *patch.input
 		}
-		if hits[0].output != nil {
-			model.OutputPricePerMillion = *hits[0].output
+		if patch.output != nil {
+			model.OutputPricePerMillion = *patch.output
 		}
-		if hits[0].cache != nil {
-			model.CacheReadPricePerMillion = *hits[0].cache
+		if patch.cache != nil {
+			model.CacheReadPricePerMillion = *patch.cache
 		}
-		if hits[0].cacheWrite != nil {
-			model.CacheWritePricePerMillion = cloneFloat64(hits[0].cacheWrite)
+		if patch.cacheWrite != nil {
+			model.CacheWritePricePerMillion = cloneFloat64(patch.cacheWrite)
 		}
 		if oldInput == model.InputPricePerMillion && oldOutput == model.OutputPricePerMillion && oldCache == model.CacheReadPricePerMillion && pricePointersEqual(oldWrite, model.CacheWritePricePerMillion) {
 			result.Unchanged = append(result.Unchanged, PriceImportUnchanged{Model: model.Name})
@@ -259,17 +256,17 @@ func (s *Store) ImportModelPrices(matches []PriceImportMatch, dryRun bool) (Pric
 	if !changed {
 		return result, nil
 	}
-	cfg := Config{Enabled: true, Keys: keys, Models: models, ClassifyRules: rules}
+	cfg := Config{Enabled: true, Keys: keys, Models: models}
 	if err := normalizeConfig(&cfg); err != nil {
 		return result, fmt.Errorf("%w: %v", ErrInvalidModelPriceImport, err)
 	}
 	if dryRun {
 		return result, nil
 	}
-	if err := s.saveState(path, datasetID, cfg.Keys, cfg.Models, cfg.ClassifyRules); err != nil {
+	if err := s.saveState(path, datasetID, cfg.Keys, cfg.Models); err != nil {
 		return result, err
 	}
-	s.publishModels(cfg.Models, false)
+	s.publishModels(cfg.Models)
 	for _, applied := range result.Applied {
 		s.recordAudit(audit.Event{Action: "import_update_prices", Changes: map[string]audit.Change{
 			"model":                         {From: applied.Model, To: applied.Model},
@@ -282,19 +279,13 @@ func (s *Store) ImportModelPrices(matches []PriceImportMatch, dryRun bool) (Pric
 	return result, nil
 }
 
-func (s *Store) publishModels(models []ModelDefinition, resetPicks bool) {
+func (s *Store) publishModels(models []ModelDefinition) {
 	index := make(map[string]*ModelDefinition, len(models))
 	for i := range models {
-		copy := models[i]
-		copy.Targets = append([]ModelTarget(nil), models[i].Targets...)
-		copy.CacheWritePricePerMillion = cloneFloat64(models[i].CacheWritePricePerMillion)
+		copy := cloneModel(models[i])
 		index[strings.ToLower(copy.Name)] = &copy
 	}
 	s.mu.Lock()
 	s.models = index
-	s.rrCounters = make(map[string]int)
-	if resetPicks {
-		s.pendingPicks = make(map[string][]pendingPick)
-	}
 	s.mu.Unlock()
 }

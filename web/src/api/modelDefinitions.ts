@@ -14,17 +14,16 @@ export async function fetchModelDefinitions(): Promise<ModelDefinition[]> {
 }
 
 export async function upsertModelDefinition(model: ModelDefinition): Promise<ModelDefinition> {
-  const body: ModelDefinition = {
+  const body = {
     name: model.name,
-    targets: model.targets,
-    dispatch: model.dispatch,
+    provider: model.provider,
+    target_model: model.target_model,
     billing_mode: model.billing_mode,
-    free: model.free,
     billing_multiplier: model.billing_multiplier ?? 1,
-    input_price_per_million: model.input_price_per_million,
-    output_price_per_million: model.output_price_per_million,
-    cache_read_price_per_million: model.cache_read_price_per_million,
-    per_call_usd: model.per_call_usd,
+    input_price_per_million: model.input_price_per_million ?? 0,
+    output_price_per_million: model.output_price_per_million ?? 0,
+    cache_read_price_per_million: model.cache_read_price_per_million ?? 0,
+    per_call_usd: model.per_call_usd ?? 0,
     ...(model.cache_write_price_per_million === undefined ? {} : { cache_write_price_per_million: model.cache_write_price_per_million }),
   };
   const { data } = await apiClient().post<{ model: ModelDefinition }>(pluginPath("/models"), body);
@@ -91,30 +90,16 @@ export async function previewModelPrices(models: string[]): Promise<PricingPrevi
   };
 }
 
-export async function importModels(body: { dry_run: boolean; items: ModelImportItem[] }): Promise<ModelImportResult> {
-  const { data } = await apiClient().post<unknown>(pluginPath("/models/import"), body);
+// Import creates models at $0 and never overwrites an existing name.
+export async function importModels(items: ModelImportItem[]): Promise<ModelImportResult> {
+  const { data } = await apiClient().post<unknown>(pluginPath("/models/import"), { items });
   const root = asRecord(data, "model import");
   const rows = (value: unknown, source: string): ModelImportResult["created"] => {
     if (!Array.isArray(value)) return [];
     return value.map((item, index) => {
       const row = asRecord(item, `${source}[${index}]`);
-      return {
-        name: asString(row.name),
-        action: asString(row.action),
-        reason: asString(row.reason) || undefined,
-        affected_keys: asStringArray(row.affected_keys),
-        duplicate: row.duplicate === true,
-        missing_price: row.missing_price === true,
-        price_conflict: row.price_conflict === true,
-      };
+      return { name: asString(row.name), reason: asString(row.reason) || undefined };
     });
   };
-  return {
-    created: rows(root.created, "created"),
-    updated: rows(root.updated, "updated"),
-    skipped: rows(root.skipped, "skipped"),
-    conflicts: rows(root.conflicts, "conflicts"),
-    missing_price: rows(root.missing_price, "missing_price"),
-    affected_keys: asStringArray(root.affected_keys),
-  };
+  return { created: rows(root.created, "created"), skipped: rows(root.skipped, "skipped") };
 }

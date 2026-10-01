@@ -46,30 +46,14 @@ func TestManagementMutationsProduceAuditEvents(t *testing.T) {
 	if err := store.UpsertModel(model); err != nil {
 		t.Fatal(err)
 	}
-	model.Dispatch = "priority"
+	model.BillingMultiplier = 1.5
 	if err := store.UpsertModel(model); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.DeleteModel(model.Name); err != nil {
 		t.Fatal(err)
 	}
-	rule := ClassifyRule{Name: "audit-rule", Field: "provider", Pattern: "codex", Group: "paid", Enabled: true}
-	if err := store.UpsertClassifyRule(rule); err != nil {
-		t.Fatal(err)
-	}
-	rule.Pattern = "openai|codex"
-	if err := store.UpsertClassifyRule(rule); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.ReorderClassifyRules([]string{rule.Name}); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.DeleteClassifyRule(rule.Name); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := store.ImportModels([]ModelImportItem{{
-		Name: "imported", Targets: []ModelTarget{{Provider: "codex", TargetModel: "m"}}, Input: 1, Output: 2,
-	}}, false); err != nil {
+	if _, err := store.ImportModels([]ModelImportItem{{Provider: "codex", TargetModel: "imported"}}); err != nil {
 		t.Fatal(err)
 	}
 	events, err := store.AuditEvents("", 100)
@@ -87,13 +71,21 @@ func TestManagementMutationsProduceAuditEvents(t *testing.T) {
 			t.Fatalf("audit leaked plaintext key: %s", encoded)
 		}
 	}
-	for _, action := range []string{"create_key", "update_key", "rotate_key", "reset_usage", "delete_key", "create_model", "update_model", "delete_model", "create_classify_rule", "update_classify_rule", "reorder_classify_rules", "delete_classify_rule", "import_create_model"} {
+	for _, action := range []string{"create_key", "update_key", "rotate_key", "reset_usage", "delete_key", "create_model", "update_model", "delete_model", "import_create_model"} {
 		if actions[action] == 0 {
 			t.Errorf("missing audit action %q: %+v", action, actions)
 		}
 	}
 	if actions["update_key"] != 1 || actions["rotate_key"] != 1 {
 		t.Fatalf("key update and rotation must each emit exactly one semantic event: %+v", actions)
+	}
+	for _, event := range events {
+		if event.Action != "update_model" {
+			continue
+		}
+		if len(event.Changes) != 2 || event.Changes["billing_multiplier"] != (audit.Change{From: float64(1), To: 1.5}) {
+			t.Fatalf("model update must record only what changed: %+v", event.Changes)
+		}
 	}
 	keyEvents, err := store.AuditEvents("audit-key", 100)
 	if err != nil {

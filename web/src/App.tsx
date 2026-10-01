@@ -7,11 +7,8 @@ import KeyList from "./pages/KeyList";
 import KeyNew from "./pages/KeyNew";
 import KeyEdit from "./pages/KeyEdit";
 import KeyUsage from "./pages/KeyUsage";
-import ModelPick from "./pages/ModelPick";
 import Models from "./pages/Models";
 import ModelForm from "./pages/ModelForm";
-import CredentialGroups from "./pages/CredentialGroups";
-import CredentialGroupForm from "./pages/CredentialGroupForm";
 import Audit from "./pages/Audit";
 
 function useAuthTick() {
@@ -20,9 +17,18 @@ function useAuthTick() {
   return isAuthed();
 }
 
-// Desktop top horizontal nav. Mirrors the Stitch "Quiet Paper" design: left =
-// app title + base url, right = nav links + logout. Mobile keeps the compact
-// .header (hidden on desktop via CSS) and bottom tab bar instead.
+// Inside the CPA management panel the host already shows the product chrome,
+// the endpoint and its own logout, so the plugin keeps only its section tabs.
+function isEmbedded(): boolean {
+  try {
+    return window.self !== window.top;
+  } catch {
+    return true;
+  }
+}
+
+// Desktop top horizontal nav: app title + base url and logout when opened on
+// its own, section links always. Mobile uses the bottom tab bar instead.
 function TopNav() {
   const t = useT();
   const nav = useNavigate();
@@ -33,27 +39,27 @@ function TopNav() {
   const onKeys = loc.pathname === "/keys" || loc.pathname.startsWith("/keys/");
   const onNew = loc.pathname === "/keys/new" || loc.pathname.startsWith("/keys/new/");
   const onModels = loc.pathname === "/models" || loc.pathname.startsWith("/models/");
-  const onCredentialGroups = loc.pathname === "/credential-groups" || loc.pathname.startsWith("/credential-groups/");
   const onAudit = loc.pathname === "/audit";
+  const embedded = isEmbedded();
   return (
-    <div className="topnav">
+    <div className={"topnav" + (embedded ? " embedded" : "")}>
       <div className="topnav-inner">
-        <div className="topnav-brand">
-          <span className="tn-title">{t("header.title")}</span>
-          <span className="tn-sub">{s.baseUrl}</span>
-        </div>
+        {!embedded && (
+          <div className="topnav-brand">
+            <span className="tn-title">{t("header.title")}</span>
+            <span className="tn-sub">{s.baseUrl}</span>
+          </div>
+        )}
         <div className="topnav-actions">
           <Link to="/keys" className={"tn-link" + (onKeys && !onNew ? " active" : "")}>{t("header.keyList")}</Link>
           <Link to="/keys/new" className={"tn-link" + (onNew ? " active" : "")}>{t("header.newKey")}</Link>
           <Link to="/models" className={"tn-link" + (onModels ? " active" : "")}>{t("header.models")}</Link>
-          <Link to="/credential-groups" className={"tn-link" + (onCredentialGroups ? " active" : "")}>{t("header.credentialGroups")}</Link>
           <Link to="/audit" className={"tn-link" + (onAudit ? " active" : "")}>{t("header.audit")}</Link>
-          <button
-            className="btn sm"
-            onClick={() => { clearSession(); nav("/login"); }}
-          >
-            {t("header.logout")}
-          </button>
+          {!embedded && (
+            <button className="btn sm" onClick={() => { clearSession(); nav("/login"); }}>
+              {t("header.logout")}
+            </button>
+          )}
         </div>
       </div>
     </div>
@@ -101,11 +107,7 @@ function Shell() {
         <Route path="/keys/:id/usage" element={<KeyUsage />} />
         <Route path="/models" element={<Models />} />
         <Route path="/models/new" element={<ModelForm />} />
-        <Route path="/models/pick-target" element={<ModelPick />} />
         <Route path="/models/:name/edit" element={<ModelForm />} />
-        <Route path="/credential-groups" element={<CredentialGroups />} />
-        <Route path="/credential-groups/new" element={<CredentialGroupForm />} />
-        <Route path="/credential-groups/:name/edit" element={<CredentialGroupForm />} />
         <Route path="/audit" element={<Audit />} />
         <Route path="*" element={<Navigate to="/keys" replace />} />
       </Routes>

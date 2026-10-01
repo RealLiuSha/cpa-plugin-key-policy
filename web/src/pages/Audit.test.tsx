@@ -8,7 +8,7 @@ vi.mock("../api/audit", () => ({ fetchAuditEvents: vi.fn() }));
 vi.mock("../i18n", () => ({ useT: () => (key: string) => key }));
 
 import { fetchAuditEvents } from "../api/audit";
-import Audit from "./Audit";
+import Audit, { auditChanges, auditSubject } from "./Audit";
 
 const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
 
@@ -48,5 +48,22 @@ describe("Audit page", () => {
       await tick();
     });
     expect(fetchAuditEvents).toHaveBeenLastCalledWith("k1", 100);
+  });
+});
+
+describe("audit change formatting", () => {
+  const t = (key: string) => key;
+  it("names the model, drops unchanged fields and shows only new values on creation", () => {
+    const update = {
+      ts: "2026-10-01T00:00:00Z", actor: "management-api", action: "update_model",
+      changes: { model: { from: "fast", to: "fast" }, billing_multiplier: { from: 1, to: 1.2 }, upstream: { from: "xai/a", to: "xai/a" } },
+    };
+    expect(auditSubject(update)).toBe("fast");
+    expect(auditChanges(update, t)).toEqual(["billing_multiplier：1 → 1.2"]);
+    const created = {
+      ts: "2026-10-01T00:00:00Z", actor: "management-api", action: "create_key", key_id: "k1",
+      changes: { model_daily_limits: { from: {}, to: { fast: 0, slow: 5 } } },
+    };
+    expect(auditChanges(created, t)).toEqual(["model_daily_limits：fast keyForm.unlimited, slow $5"]);
   });
 });
