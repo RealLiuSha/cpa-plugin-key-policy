@@ -77,24 +77,24 @@ func TestWeeklyResetsAtItsFixedBoundary(t *testing.T) {
 	}
 }
 
-func TestRetentionEvictsBeyond35Days(t *testing.T) {
+func TestRetentionEvictsExpiredDays(t *testing.T) {
 	loc := mustShanghai(t)
 	now := time.Date(2026, 6, 1, 12, 0, 0, 0, loc)
 	ledger := newUsageLedgerWithLocation(func() time.Time { return now }, loc, "Asia/Shanghai")
-	for day := 0; day < 36; day++ {
+	for day := 0; day <= UsageRetentionDays; day++ {
 		now = time.Date(2026, 6, 1, 12, 0, 0, 0, loc).AddDate(0, 0, day)
 		ledger.RecordCost("retained", "fast", 1, 0, 0, 0, 0, 0, 0, 1)
 	}
 
 	state := ledger.snapshot()["retained"]
-	if len(state.Days) != usageRetentionDays {
-		t.Fatalf("retained buckets = %d, want %d", len(state.Days), usageRetentionDays)
+	if len(state.Days) != UsageRetentionDays {
+		t.Fatalf("retained buckets = %d, want %d", len(state.Days), UsageRetentionDays)
 	}
 	if _, ok := state.Days["2026-06-01"]; ok {
-		t.Fatal("36-day-old bucket was not evicted")
+		t.Fatal("bucket older than the retention window was not evicted")
 	}
-	if got := len(state.ByModel["fast"]); got != usageRetentionDays {
-		t.Fatalf("retained model buckets = %d, want %d", got, usageRetentionDays)
+	if got := len(state.ByModel["fast"]); got != UsageRetentionDays {
+		t.Fatalf("retained model buckets = %d, want %d", got, UsageRetentionDays)
 	}
 }
 
