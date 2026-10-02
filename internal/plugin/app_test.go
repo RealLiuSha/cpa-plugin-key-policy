@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"cpa-key-policy/internal/policy"
 )
@@ -656,6 +657,18 @@ func TestUsageHandleBills(t *testing.T) {
 	}
 	if openAI.ResponseHeaders.Get("Retry-After") == "" || openAI.ResponseHeaders.Get("Content-Type") != "application/json" {
 		t.Fatalf("rejection headers = %v", openAI.ResponseHeaders)
+	}
+	responses := interceptBefore(t, app, hdr, "fast", "openai-response", "/v1/responses")
+	var responsesBody struct {
+		Error struct {
+			Message, Type, Code string
+			ResetsAt            int64 `json:"resets_at"`
+		} `json:"error"`
+	}
+	if !responses.Terminate || responses.StatusCode != http.StatusTooManyRequests || json.Unmarshal(responses.ResponseBody, &responsesBody) != nil ||
+		responsesBody.Error.Type != "usage_limit_reached" || responsesBody.Error.Code != "insufficient_quota" ||
+		responsesBody.Error.ResetsAt <= time.Now().Unix() || !strings.Contains(responsesBody.Error.Message, "Daily quota of $1.00") {
+		t.Fatalf("Responses rejection = %+v body=%s", responses, responses.ResponseBody)
 	}
 	claude := interceptBefore(t, app, hdr, "fast", "claude", "/v1/messages")
 	var claudeBody struct {

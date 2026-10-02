@@ -67,7 +67,7 @@ Token 计费模型支持 `billing_multiplier`，默认 `1`，必须为不小于 
 | 未知 Key、停用 Key | 鉴权 | 401（CPA 通用答复） |
 | Key 未授权请求的模型 | 鉴权 | 401 |
 | RPM 超限 | 请求拦截器 | 429 `rate_limit_exceeded`，`Retry-After` 为当前一分钟窗口的剩余秒数 |
-| 日、7 天、30 天或单模型日额度用尽 | 请求拦截器 | 429 `insufficient_quota`，`Retry-After` 为所有已用尽周期中最晚的重置时间 |
+| 日、7 天、30 天或单模型日额度用尽 | 请求拦截器 | 429 `insufficient_quota`，`Retry-After` 为所有已用尽周期中最晚的重置时间；Responses API 的 `type` 为 `usage_limit_reached` 并带 `resets_at`（Unix 秒），Codex 据此显示重置时间，`code` 仍是 `insufficient_quota` |
 
 CPA 会把鉴权阶段的任何拒绝都变成 401，而请求拦截器可以在访问上游之前以任意状态码终止请求（CPA v7.2.103 起）。当 Key 放在请求头里、且路由是 CPA 会拦截并给出 HTTP 答复的接口时，额度和 RPM 交给拦截器判定，这些接口包括 chat/completions、completions、responses、messages、count_tokens、images、videos（生成与结果查询）、`/v1beta/models/*`、interactions 和 codex responses。其余请求仍在鉴权阶段判定，保持原来的 401：Key 放在 query 参数里的请求，realtime、live、alpha/search 路由，以及 `/v1/responses` 的 WebSocket 握手（WebSocket 上被拒的一轮只会断开连接，所以握手时检查额度，RPM 按每一轮计数）。
 

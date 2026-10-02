@@ -41,11 +41,20 @@ func rejectionBody(sourceFormat string, denial *policy.Denial, message string) [
 	case strings.HasPrefix(format, "gemini"):
 		payload = map[string]any{"error": map[string]any{"code": http.StatusTooManyRequests, "message": message, "status": "RESOURCE_EXHAUSTED"}}
 	default:
-		errorType, code := "insufficient_quota", "insufficient_quota"
-		if denial.Reason == "rpm_exceeded" {
-			errorType, code = "rate_limit_error", "rate_limit_exceeded"
+		errorBody := map[string]any{"message": message, "type": "insufficient_quota", "code": "insufficient_quota"}
+		switch {
+		case denial.Reason == "rpm_exceeded":
+			errorBody["type"], errorBody["code"] = "rate_limit_error", "rate_limit_exceeded"
+		case format == "openai-response":
+			// Codex shows fixed text for insufficient_quota but names the reset
+			// time for usage_limit_reached with resets_at (Unix seconds). code
+			// stays insufficient_quota for SDKs that branch on it.
+			errorBody["type"] = "usage_limit_reached"
+			if !denial.RetryAt.IsZero() {
+				errorBody["resets_at"] = denial.RetryAt.Unix()
+			}
 		}
-		payload = map[string]any{"error": map[string]any{"message": message, "type": errorType, "code": code}}
+		payload = map[string]any{"error": errorBody}
 	}
 	body, _ := json.Marshal(payload)
 	return body

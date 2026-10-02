@@ -63,7 +63,7 @@ Per-call models used on image and video generation endpoints are charged when th
 | Unknown or disabled key | Authentication | 401 (CPA's generic answer) |
 | Key does not reference the requested model | Authentication | 401 |
 | RPM limit reached | Request interceptor | 429 `rate_limit_exceeded`, `Retry-After` = seconds left in the one-minute window |
-| Daily, 7-day, 30-day or per-model daily quota used up | Request interceptor | 429 `insufficient_quota`, `Retry-After` = seconds until the latest exhausted cycle resets |
+| Daily, 7-day, 30-day or per-model daily quota used up | Request interceptor | 429 `insufficient_quota`, `Retry-After` = seconds until the latest exhausted cycle resets; on the Responses API `type` is `usage_limit_reached` with `resets_at` (Unix seconds) so Codex shows the reset time, and `code` stays `insufficient_quota` |
 
 CPA turns any frontend-auth rejection into 401, while its request interceptor can terminate a request with any status before contacting upstream (CPA v7.2.103 and later). Requests are admitted in the interceptor when the key is sent in a header and the route is one CPA intercepts with an HTTP answer: chat/completions, completions, responses, messages, count_tokens, images, videos (generation and retrieval), `/v1beta/models/*`, interactions and the codex responses routes. Everything else is admitted during authentication with the previous 401 behavior: keys passed in the query string, realtime, live and alpha/search routes, and WebSocket handshakes on `/v1/responses` (a rejected WebSocket turn only closes the socket, so the handshake checks quota and RPM is counted per turn).
 
