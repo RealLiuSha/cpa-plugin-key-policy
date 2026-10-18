@@ -96,8 +96,33 @@ describe("Stats page", () => {
   const button = (text: string) => [...container.querySelectorAll<HTMLButtonElement>("button")].find((item) => item.textContent === text)!;
   const section = (id: string) => container.querySelector(`[data-testid="${id}"]`)!;
 
-  it("renders KPIs, the daily trend and the model and key tables of the default 30 days", async () => {
+  it("opens on today without a one-bar trend and widens to a daily trend on a longer range", async () => {
+    vi.mocked(fetchStats).mockImplementation(async (days) => report(days, days === 1 ? { from: "2026-10-17", to: "2026-10-17" } : {}));
     await renderPage();
+    expect(fetchStats).toHaveBeenCalledWith(1);
+    expect(button("stats.rangeToday").getAttribute("aria-pressed")).toBe("true");
+    expect(section("stats-kpis")).not.toBeNull();
+    expect(section("stats-models")).not.toBeNull();
+    expect(section("stats-trend")).toBeNull();
+    expect(container.querySelector(".usage-chart")).toBeNull();
+    expect(section("stats-period").textContent).toBe("stats.periodDay 2026-10-17 Asia/Shanghai");
+
+    const link = section("stats-keys").querySelector("a")!;
+    await act(async () => { link.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, button: 0 })); });
+    expect(section("usage-page").getAttribute("data-return-to")).toBe("/stats?days=1");
+    act(() => root.unmount());
+    container.replaceChildren();
+
+    await renderPage("/stats?days=7");
+    expect(section("stats-period")).toBeNull();
+    expect(container.querySelectorAll(".usage-chart-bar")).toHaveLength(7);
+    await act(async () => { button("stats.rangeToday").click(); await tick(); });
+    expect(fetchStats).toHaveBeenLastCalledWith(1);
+    expect(section("stats-trend")).toBeNull();
+  });
+
+  it("renders KPIs, the daily trend and the model and key tables of a 30-day range", async () => {
+    await renderPage("/stats?days=30");
     expect(fetchStats).toHaveBeenCalledWith(30);
     expect(button("usage.rangeDays 30").getAttribute("aria-pressed")).toBe("true");
     const kpis = section("stats-kpis").textContent;
@@ -112,6 +137,8 @@ describe("Stats page", () => {
     const models = [...section("stats-models").querySelectorAll("tbody tr")];
     expect(models[0].textContent).toContain("gpt-6-sol");
     expect(models[0].querySelector(".badge.warn")).toBeNull();
+    // The badge reports the calls billed $0, not the model's price today.
+    expect(models[1].querySelector(".badge.warn")?.textContent).toBe("usage.unpricedBadge 12");
     expect(models[1].querySelector(".badge.warn")?.getAttribute("title")).toBe("usage.unpricedCalls 12");
 
     const notice = section("stats-unpriced");

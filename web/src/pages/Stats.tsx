@@ -10,7 +10,12 @@ import { formatCount, formatHitRate, formatUSD } from "../format";
 import { useT } from "../i18n";
 import { useSearchDraft, type SearchDraft } from "../search";
 import type { LedgerHealth, StatsKey, StatsModel, StatsReport, StatsTotals } from "../types";
-import { DEFAULT_HISTORY_RANGE, HISTORY_RANGES, type HistoryRange } from "./KeyUsage";
+
+// One day is "today": the report ends on the current natural day, so a range of
+// 1 covers only that day. The page opens on it.
+const STATS_RANGES = [1, 7, 30, 90] as const;
+type StatsRange = (typeof STATS_RANGES)[number];
+const DEFAULT_STATS_RANGE: StatsRange = 1;
 
 const HEALTH_COUNTERS = [
   "flush_failures", "skipped_failed", "ignored_unknown_key", "ignored_no_model", "ignored_empty_usage",
@@ -168,16 +173,21 @@ function StatsBody({ report, returnTo, query, search, onClearSearch }: {
         <div className="empty-state" data-testid="stats-empty">{t("stats.empty")}</div>
       ) : (
         <>
-          <section className="card stats-trend" data-testid="stats-trend">
-            <div className="stats-trend-title">
-              <strong>{t("stats.trendTitle", { days: report.days.length })}</strong>
-              <span className="muted">{t("stats.period", { from: report.from, to: report.to, timezone: report.timezone })}</span>
-            </div>
-            <UsageChart
-              points={report.days.map((day) => ({ date: day.date, usd: day.charged_usd, calls: day.calls }))}
-              label={t("stats.trendTitle", { days: report.days.length })}
-            />
-          </section>
+          {report.days.length > 1 ? (
+            <section className="card stats-trend" data-testid="stats-trend">
+              <div className="stats-trend-title">
+                <strong>{t("stats.trendTitle", { days: report.days.length })}</strong>
+                <span className="muted">{t("stats.period", { from: report.from, to: report.to, timezone: report.timezone })}</span>
+              </div>
+              <UsageChart
+                points={report.days.map((day) => ({ date: day.date, usd: day.charged_usd, calls: day.calls }))}
+                label={t("stats.trendTitle", { days: report.days.length })}
+              />
+            </section>
+          ) : (
+            // A one-day trend is a single bar: only the date is worth showing.
+            <p className="muted" data-testid="stats-period">{t("stats.periodDay", { date: report.to, timezone: report.timezone })}</p>
+          )}
           <UsageTable
             title={t("stats.modelsTitle")}
             nameLabel={t("stats.colModel")}
@@ -271,8 +281,8 @@ function HealthPanel() {
 }
 
 // The range lives in the URL so a key's usage page can return to it.
-function rangeFrom(value: string | null): HistoryRange {
-  return HISTORY_RANGES.find((option) => String(option) === value) ?? DEFAULT_HISTORY_RANGE;
+function rangeFrom(value: string | null): StatsRange {
+  return STATS_RANGES.find((option) => String(option) === value) ?? DEFAULT_STATS_RANGE;
 }
 
 export default function Stats() {
@@ -281,7 +291,7 @@ export default function Stats() {
   const range = rangeFrom(params.get("days"));
   const query = params.get("q") ?? "";
   const search = useSearchDraft(query, setParams);
-  const [loaded, setLoaded] = useState<{ range: HistoryRange; report: StatsReport } | null>(null);
+  const [loaded, setLoaded] = useState<{ range: StatsRange; report: StatsReport } | null>(null);
   const [error, setError] = useState("");
   const [attempt, setAttempt] = useState(0);
   const [exporting, setExporting] = useState(false);
@@ -298,7 +308,7 @@ export default function Stats() {
 
   const report = loaded?.report;
   const current = !error && loaded?.range === range ? report : undefined;
-  const selectRange = (option: HistoryRange) => {
+  const selectRange = (option: StatsRange) => {
     setParams((current) => {
       const next = new URLSearchParams(current);
       next.set("days", String(option));
@@ -337,9 +347,9 @@ export default function Stats() {
         <div><h1>{t("stats.title")}</h1><p className="muted">{t("stats.description")}</p></div>
         <div className="page-head-actions">
           <div className="seg stats-range" role="group" aria-label={t("stats.rangeLabel")}>
-            {HISTORY_RANGES.map((option) => (
+            {STATS_RANGES.map((option) => (
               <button key={option} type="button" className={"seg-btn" + (range === option ? " active" : "")} aria-pressed={range === option} onClick={() => selectRange(option)}>
-                {t("usage.rangeDays", { days: option })}
+                {option === 1 ? t("stats.rangeToday") : t("usage.rangeDays", { days: option })}
               </button>
             ))}
           </div>
