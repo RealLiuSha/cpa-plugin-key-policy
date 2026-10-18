@@ -14,6 +14,8 @@ export function MobileFormHeader({ title, backTo }: { title: string; backTo: str
   );
 }
 
+type MobileTab = "keys" | "usage" | "stats" | "new";
+
 /**
  * Mobile bottom tab bar. Active tab gets a 2px primary underline. The "usage"
  * tab is optional — only shown once a specific key's usage page is open.
@@ -23,13 +25,13 @@ export function MobileTabBar({
   showUsage = false,
   usagePath = "/keys",
 }: {
-  active: "keys" | "usage" | "new";
+  active: MobileTab;
   showUsage?: boolean;
   usagePath?: string;
 }) {
   const t = useT();
   const nav = useNavigate();
-  const tab = (id: "keys" | "usage" | "new", label: string, icon: string, target: string) => (
+  const tab = (id: MobileTab, label: string, icon: string, target: string) => (
     <button
       className={"tab" + (active === id ? " active" : "")}
       onClick={() => nav(target)}
@@ -42,6 +44,7 @@ export function MobileTabBar({
     <nav className={"tabbar" + (showUsage ? "" : " tabbar--no-usage")}>
       {tab("keys", t("keys.mobile.tabKeys"), "#", "/keys")}
       {showUsage && tab("usage", t("keys.mobile.tabUsage"), "#", usagePath)}
+      {tab("stats", t("keys.mobile.tabStats"), "$", "/stats")}
       {tab("new", t("keys.mobile.tabNew"), "+", "/keys/new")}
     </nav>
   );

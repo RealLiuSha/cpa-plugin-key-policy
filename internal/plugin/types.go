@@ -24,21 +24,16 @@ const (
 	MethodFrontendAuthIdentifier   = "frontend_auth.identifier"
 	MethodFrontendAuthAuthenticate = "frontend_auth.authenticate"
 
-	MethodModelRoute = "model.route"
-
 	// Request interceptors run before CPA contacts upstream. intercept_before
 	// fires once per model execution and may terminate it with any HTTP status;
-	// intercept_after fires again for every credential attempt.
+	// intercept_after fires again for every credential attempt and is answered
+	// with an empty response because the capability registers both.
 	MethodRequestInterceptBefore = "request.intercept_before"
 	MethodRequestInterceptAfter  = "request.intercept_after"
 
-	MethodResponseInterceptAfter = "response.intercept_after"
-
-	// MethodUsageHandle is the host->plugin call that delivers a finalized
-	// usage record (tokens already parsed by CPA) after a request completes.
-	// This is the billing entry point that ALSO fires for streaming responses
-	// (unlike response.intercept_after, which the host never invokes on the
-	// streaming path — it only invokes response.intercept_stream_chunk).
+	// MethodUsageHandle delivers a finalized usage record (tokens already parsed
+	// by CPA) after a request completes, for streaming and non-streaming
+	// responses alike. It is the only billing entry point.
 	MethodUsageHandle = "usage.handle"
 
 	MethodManagementRegister = "management.register"
@@ -48,7 +43,7 @@ const (
 const (
 	PluginID   = "cpa-key-policy"
 	PluginName = "cpa-key-policy"
-	Version    = "0.9.0"
+	Version    = "0.15.0"
 )
 
 type Envelope struct {
@@ -91,12 +86,13 @@ type ConfigField struct {
 	Description string   `json:"Description"`
 }
 
+// Capabilities lists what this plugin registers. Routing and response
+// rewriting are not among them: CPA routes by its own registry and the
+// response model is whatever upstream reports.
 type Capabilities struct {
 	FrontendAuthProvider          bool `json:"frontend_auth_provider"`
 	FrontendAuthProviderExclusive bool `json:"frontend_auth_provider_exclusive,omitempty"`
-	ModelRouter                   bool `json:"model_router"`
 	RequestInterceptor            bool `json:"request_interceptor"`
-	ResponseInterceptor           bool `json:"response_interceptor"`
 	UsagePlugin                   bool `json:"usage_plugin"`
 	ManagementAPI                 bool `json:"management_api"`
 }
@@ -105,12 +101,14 @@ type IdentifierResponse struct {
 	Identifier string `json:"identifier"`
 }
 
+// FrontendAuthRequest is the part of CPA's pluginapi.FrontendAuthRequest this
+// plugin reads. The host also sends the request body; nothing here depends on
+// it, so it is not decoded.
 type FrontendAuthRequest struct {
 	Method  string      `json:"Method"`
 	Path    string      `json:"Path"`
 	Headers http.Header `json:"Headers"`
 	Query   url.Values  `json:"Query"`
-	Body    []byte      `json:"Body"`
 }
 
 type FrontendAuthResponse struct {
@@ -119,35 +117,16 @@ type FrontendAuthResponse struct {
 	Metadata      map[string]string `json:"Metadata,omitempty"`
 }
 
-// ModelRouteRequest mirrors CPA's pluginapi.ModelRouteRequest without the
-// request body the host also sends: routing never reads it, and leaving it out
-// spares decoding a copy of every request.
-type ModelRouteRequest struct {
-	SourceFormat       string         `json:"SourceFormat"`
-	RequestedModel     string         `json:"RequestedModel"`
-	Stream             bool           `json:"Stream"`
-	Headers            http.Header    `json:"Headers"`
-	Query              url.Values     `json:"Query"`
-	Metadata           map[string]any `json:"Metadata"`
-	AvailableProviders []string       `json:"AvailableProviders"`
-}
-
-type ModelRouteResponse struct {
-	Handled     bool   `json:"Handled"`
-	TargetKind  string `json:"TargetKind,omitempty"`
-	Target      string `json:"Target,omitempty"`
-	TargetModel string `json:"TargetModel,omitempty"`
-	Reason      string `json:"Reason,omitempty"`
-}
-
 // RequestInterceptRequest is the part of CPA's pluginapi.RequestInterceptRequest
-// this plugin reads. Headers are a clone of the inbound request headers; there
-// is no query string. Metadata carries request_path, the matched CPA route.
+// this plugin reads. TraceID is the inbound HTTP request id, which links a
+// media generation to its usage record. Headers are a clone of the inbound
+// request headers; there is no query string. Metadata carries request_path,
+// the matched CPA route.
 type RequestInterceptRequest struct {
-	SourceFormat   string         `json:"SourceFormat"`
-	RequestedModel string         `json:"RequestedModel"`
-	Headers        http.Header    `json:"Headers"`
-	Metadata       map[string]any `json:"Metadata"`
+	TraceID      string         `json:"TraceID"`
+	SourceFormat string         `json:"SourceFormat"`
+	Headers      http.Header    `json:"Headers"`
+	Metadata     map[string]any `json:"Metadata"`
 }
 
 // RequestInterceptResponse mirrors pluginapi.RequestInterceptResponse. An empty
@@ -160,42 +139,27 @@ type RequestInterceptResponse struct {
 	ResponseBody    []byte      `json:"ResponseBody,omitempty"`
 }
 
-// ResponseInterceptRequest mirrors CPA's pluginapi.ResponseInterceptRequest
-// without the original and translated request bodies the host repeats: the
-// model rewrite only reads the response body, and leaving them out spares
-// decoding both on every non-streaming response.
-type ResponseInterceptRequest struct {
-	SourceFormat    string         `json:"SourceFormat"`
-	Model           string         `json:"Model"`
-	RequestedModel  string         `json:"RequestedModel"`
-	Stream          bool           `json:"Stream"`
-	RequestHeaders  http.Header    `json:"RequestHeaders"`
-	ResponseHeaders http.Header    `json:"ResponseHeaders"`
-	Body            []byte         `json:"Body"`
-	StatusCode      int            `json:"StatusCode"`
-	Metadata        map[string]any `json:"Metadata"`
-}
-
-// UsageHandleRequest is the payload of the host->plugin usage.handle call.
-// CPA parses the token counts itself (from the upstream response, including
-// the final usage frame of a stream) and delivers them here after a request
-// completes — both streaming and non-streaming. This is the reliable billing
-// entry point: the host never invokes response.intercept_after on streaming
-// responses, so the plugin cannot rely on that alone to bill streams.
+// UsageHandleRequest is the part of CPA's pluginapi.UsageRecord this plugin
+// bills on. The host's Generate flag is deliberately not read: a client that
+// sends generate=false still has its input processed upstream. Latency and
+// TTFT arrive as int64 nanoseconds and are not needed.
 type UsageHandleRequest struct {
-	// Model is the resolved upstream model id.
+	// TraceID identifies the inbound HTTP request (8-character hex).
+	TraceID      string `json:"TraceID"`
+	Provider     string `json:"Provider"`
+	ExecutorType string `json:"ExecutorType"`
+	// Model is the upstream model id the request ran on.
 	Model string `json:"Model"`
-	// This host field carries the requested public model. Its name is fixed by
-	// the current CPA transport and is not exposed to the policy domain.
+	// This host field carries the model name the client requested. Its name is
+	// fixed by the CPA transport and is not exposed to the policy domain.
 	Alias string `json:"Alias"`
-	// APIKey is the client's downstream key (the cpa_... value), when available.
-	// We hash it to find the owning key config — same lookup path as auth.
+	// APIKey is the auth principal (the key id) or the plaintext key.
 	APIKey string      `json:"APIKey"`
 	Failed bool        `json:"Failed"`
 	Detail UsageDetail `json:"Detail"`
 }
 
-// UsageDetail mirrors CPA's usage token breakdown. Only the fields we bill on.
+// UsageDetail mirrors CPA's usage token breakdown.
 type UsageDetail struct {
 	InputTokens         int64 `json:"InputTokens"`
 	OutputTokens        int64 `json:"OutputTokens"`
@@ -208,12 +172,6 @@ type UsageDetail struct {
 
 // UsageHandleResponse is empty: usage.handle is a fire-and-forget notification.
 type UsageHandleResponse struct{}
-
-type ResponseInterceptResponse struct {
-	Headers      http.Header `json:"Headers,omitempty"`
-	Body         []byte      `json:"Body,omitempty"`
-	ClearHeaders []string    `json:"ClearHeaders,omitempty"`
-}
 
 type ManagementRegistrationRequest struct {
 	BasePath         string `json:"BasePath"`

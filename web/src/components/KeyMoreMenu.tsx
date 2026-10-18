@@ -51,6 +51,7 @@ export default function KeyMoreMenu({
   onRotated,
   onDeleted,
   onOpenChange,
+  balanceUSD,
 }: {
   keyId: string;
   keyListReturnTo?: string;
@@ -61,6 +62,8 @@ export default function KeyMoreMenu({
   onRotated?: (plainKey: string) => void;
   onDeleted?: () => void | Promise<void>;
   onOpenChange?: (open: boolean) => void;
+  /** A balance key's balance, shown in the delete confirmation. */
+  balanceUSD?: number;
 }) {
   const t = useT();
   const menuRef = useRef<HTMLDetailsElement>(null);
@@ -235,7 +238,7 @@ export default function KeyMoreMenu({
       </div>
     </details>
     {quotaWindow && <QuotaResetDialog keyId={keyId} initialWindow={quotaWindow} onClose={() => setQuotaWindow(null)} onComplete={async () => { await onResetComplete?.(); }} />}
-    {pending && <KeyActionDialog keyId={keyId} action={pending} onClose={() => setPending(null)} onComplete={(result) => {
+    {pending && <KeyActionDialog keyId={keyId} balanceUSD={balanceUSD} action={pending} onClose={() => setPending(null)} onComplete={(result) => {
       if (result) onRotated?.(result.plain_key);
       void refreshAfterAction(result === null);
     }} />}

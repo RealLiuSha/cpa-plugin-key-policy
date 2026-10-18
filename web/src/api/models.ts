@@ -119,7 +119,7 @@ export function fromAuthFileModels(provider: string, payload: unknown): RawEntry
   return { provider, models };
 }
 
-export function fromModelDefinitions(channel: string, payload: unknown): RawEntry {
+export function fromStaticModels(channel: string, payload: unknown): RawEntry {
   const root = objectValue(payload, "model-definitions response");
   const responseChannel = stringValue(root.channel, "model-definitions.channel").toLowerCase();
   if (responseChannel !== channel.toLowerCase()) {
@@ -143,7 +143,7 @@ function apiKeyProviderIfConfigured(endpoint: string, payload: unknown): string 
 }
 
 // Static channel definitions are shown only for providers the user has a
-// credential for, or that an existing model already uses.
+// credential for, or that an existing price row is qualified with.
 export function filterByConfigured(entries: RawEntry[], configured: Set<string>, inUse: Set<string>): RawEntry[] {
   return entries.filter((entry) => {
     if (!entry.static) return true;
@@ -152,8 +152,8 @@ export function filterByConfigured(entries: RawEntry[], configured: Set<string>,
   });
 }
 
-// inUseProviders keeps static definitions of providers that existing models
-// already route to visible even if their credential was removed.
+// inUseProviders keeps static definitions of providers that existing price
+// rows are qualified with visible even if their credential was removed.
 export async function fetchCatalog(inUseProviders?: Set<string>): Promise<CatalogModel[]> {
   const c = apiClient();
   const entries: RawEntry[] = [];
@@ -186,7 +186,7 @@ export async function fetchCatalog(inUseProviders?: Set<string>): Promise<Catalo
   for (const channel of STATIC_CHANNELS) {
     try {
       const response = await c.get("/v0/management/model-definitions/" + channel);
-      entries.push(fromModelDefinitions(channel, response.data));
+      entries.push(fromStaticModels(channel, response.data));
     } catch (error) {
       if (
         axios.isAxiosError(error) &&

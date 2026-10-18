@@ -35,6 +35,11 @@ while IFS=: read -r file line content; do
     internal/plugin/app_test.go)
       [[ "${content}" == *"${host_field_title}:"* ]] || unexpected+="${relative}:${line}:${content}"$'\n'
       ;;
+    internal/plugin/testdata/*.json)
+      # Captured CPA wire payloads (pluginapi.UsageRecord as the host sends it)
+      # necessarily carry the host's own field name as a JSON key.
+      [[ "${content}" == *"\"${host_field_title}\":"* ]] || unexpected+="${relative}:${line}:${content}"$'\n'
+      ;;
     *)
       unexpected+="${relative}:${line}:${content}"$'\n'
       ;;

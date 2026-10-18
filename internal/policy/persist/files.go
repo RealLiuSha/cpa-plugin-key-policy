@@ -24,9 +24,15 @@ func ResolvePath(path, defaultPath string) (string, error) {
 	return filepath.Abs(path)
 }
 
-// UsagePath derives the independent usage-ledger path from the state path.
+// UsagePath derives the live ledger path (current quota cycles and the days
+// not yet closed into history) from the state path.
 func UsagePath(statePath string) string {
 	return filepath.Join(filepath.Dir(statePath), "cpa-key-policy-usage.json")
+}
+
+// HistoryPath derives the closed-days ledger path from the state path.
+func HistoryPath(statePath string) string {
+	return filepath.Join(filepath.Dir(statePath), "cpa-key-policy-history.json")
 }
 
 // AuditPath derives the append-only audit path from the state path.

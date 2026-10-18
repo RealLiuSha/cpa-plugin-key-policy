@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"cpa-key-policy/internal/policy/audit"
-	policyPersist "cpa-key-policy/internal/policy/persist"
+	"cpa-key-policy/internal/policy/persist"
 )
 
 type Store struct {
@@ -20,62 +20,70 @@ type Store struct {
 	lifecycleMu sync.RWMutex
 	mu          sync.RWMutex
 	updateMu    sync.Mutex
+	// persistMu serializes every ledger write. Lock order is persistMu →
+	// ledger.mu → store.mu, never the reverse.
 	persistMu   sync.Mutex
 	enabled     bool
 	statePath   string
 	datasetID   string
 	keys        map[string]*KeyConfig
 	keysByHash  map[string]*KeyConfig
-	models      map[string]*ModelDefinition
+	prices      *priceTable
 	limiter     *RateLimiter
 	usage       *usageLedger
 	auditLog    *audit.Log
 	flusher     *usageFlusher
-	precharges  map[string][]time.Time
+	mediaTraces *mediaTraceSet
+	health      *Health
 }
 
-var ErrInvalidUsageResetWindow = errors.New("invalid usage reset window")
-var ErrUsageResetChanged = errors.New("quota period or reset date changed")
-var ErrInvalidUsageResetExpectation = errors.New("expected quota period and reset date are required")
-
-type AuthDecision struct {
-	Known     bool
-	Allowed   bool
-	KeyID     string
-	Principal string
-	Requested string
-	// Model is the resolved public model; its Name is empty when the request
-	// names no model.
-	Model     ModelDefinition
-	Reason    string
-	ModelList bool
-	// Denial explains an RPM or quota rejection made during authentication.
-	Denial *Denial
-	// Deferred means RPM and quota are left to the request interceptor, which
-	// can answer with 429 instead of the host's generic 401.
-	Deferred bool
-}
+var (
+	ErrUnknownKey                   = errors.New("unknown key")
+	ErrInvalidUsageResetWindow      = errors.New("invalid usage reset window")
+	ErrUsageResetChanged            = errors.New("quota period or reset date changed")
+	ErrInvalidUsageResetExpectation = errors.New("expected quota period and reset date are required")
+	// ErrStatePersist wraps every failure to write the state file from a
+	// management write, so callers can tell it from a rejected input.
+	ErrStatePersist = errors.New("persist state")
+)
 
 func NewStore() *Store {
+	location, err := time.LoadLocation(DefaultConfig().UsageTimezone)
+	if err != nil {
+		location = time.UTC
+	}
 	return &Store{
-		enabled:    DefaultConfig().Enabled,
-		keys:       make(map[string]*KeyConfig),
-		keysByHash: make(map[string]*KeyConfig),
-		models:     make(map[string]*ModelDefinition),
-		limiter:    NewRateLimiter(),
-		usage:      newUsageLedger(time.Now),
-		precharges: make(map[string][]time.Time),
+		enabled:     DefaultConfig().Enabled,
+		keys:        make(map[string]*KeyConfig),
+		keysByHash:  make(map[string]*KeyConfig),
+		prices:      &priceTable{index: make(map[string]int)},
+		limiter:     NewRateLimiter(),
+		usage:       newUsageLedger(time.Now, location, location.String()),
+		mediaTraces: newMediaTraceSet(time.Now),
+		health:      &Health{},
 	}
 }
 
+// SetClock replaces the time source of every time-dependent component.
 func (s *Store) SetClock(now func() time.Time) {
 	if now == nil {
 		return
 	}
-	s.mu.Lock()
-	s.limiter = NewRateLimiterWithClock(now)
-	s.usage = newUsageLedger(now)
-	s.mu.Unlock()
+	s.mu.RLock()
+	limiter, ledger, traces := s.limiter, s.usage, s.mediaTraces
+	s.mu.RUnlock()
+	limiter.setClock(now)
+	ledger.setClock(now)
+	traces.setClock(now)
+}
+
+func (s *Store) clock() func() time.Time {
+	s.mu.RLock()
+	ledger := s.usage
+	s.mu.RUnlock()
+	ledger.mu.Lock()
+	defer ledger.mu.Unlock()
+	return ledger.now
 }
 
 func (s *Store) Configure(cfg Config) (err error) {
@@ -95,122 +103,105 @@ func (s *Store) Configure(cfg Config) (err error) {
 	if err != nil {
 		return err
 	}
-
 	if err := s.stopUsageFlusher(); err != nil {
 		return fmt.Errorf("flush usage before reconfigure: %w", err)
 	}
-	s.mu.RLock()
-	clockNow := time.Now
-	if s.usage != nil {
-		clockNow = s.usage.now
-	}
-	s.mu.RUnlock()
-	usagePath := policyPersist.UsagePath(statePath)
-	if err := policyPersist.CleanupStaleTemps(statePath, clockNow()); err != nil {
-		return fmt.Errorf("cleanup state temp files: %w", err)
-	}
-	if err := policyPersist.CleanupStaleTemps(usagePath, clockNow()); err != nil {
-		return fmt.Errorf("cleanup usage temp files: %w", err)
+	clockNow := s.clock()
+	livePath, historyPath := persist.UsagePath(statePath), persist.HistoryPath(statePath)
+	// Temp files carry wall-clock modification times, so their age is not
+	// measured with the ledger clock.
+	for _, path := range []string{statePath, livePath, historyPath} {
+		if err := persist.CleanupStaleTemps(path, time.Now()); err != nil {
+			return fmt.Errorf("cleanup temp files: %w", err)
+		}
 	}
 
-	keys := cfg.Keys
-	models := cfg.Models
-	var removedSettings []string
-	usage := make(map[string]*UsageState)
+	effective := Config{Enabled: cfg.Enabled, StateFile: cfg.StateFile, UsageTimezone: cfg.UsageTimezone, Keys: append([]KeyConfig{}, cfg.Keys...), Models: append([]ModelPrice{}, cfg.Models...)}
+	seedErr := normalizeConfig(&effective)
+	zone, location := effective.UsageTimezone, effective.usageLocation
+	now := clockNow()
+
+	var keys []KeyConfig
+	var models []ModelPrice
 	datasetID := ""
 	firstBoot := false
-	stateVersion, usageVersion := currentStateFileVersion, currentUsageFileVersion
-	state, stateErr := LoadState(statePath)
+	dataset := &UsageDataset{Keys: make(map[string]*KeyUsage)}
+	_, stateErr := os.Stat(statePath)
 	switch {
 	case stateErr == nil:
-		usageFile, usageErr := LoadUsage(usagePath)
-		if usageErr != nil {
-			return fmt.Errorf("load usage paired with state: %w", usageErr)
-		}
-		if state.DatasetID != usageFile.DatasetID {
-			return fmt.Errorf("state/usage dataset_id mismatch: state=%q usage=%q", state.DatasetID, usageFile.DatasetID)
-		}
-		stateVersion, usageVersion = state.Version, usageFile.Version
-		keys = state.Keys
-		models = state.Models
-		removedSettings = state.RemovedSettings
-		usage = usageFile.Usage
-		datasetID = state.DatasetID
-	case errors.Is(stateErr, os.ErrNotExist):
-		if _, usageErr := os.Stat(usagePath); usageErr == nil {
-			return errors.New("usage file exists without its paired state file")
-		} else if !errors.Is(usageErr, os.ErrNotExist) {
-			return fmt.Errorf("inspect usage file: %w", usageErr)
-		}
-		datasetID, err = NewDatasetID()
+		state, err := LoadState(statePath)
 		if err != nil {
+			return fmt.Errorf("load state: %w", err)
+		}
+		if dataset, err = LoadUsage(statePath); err != nil {
+			return fmt.Errorf("load usage paired with state: %w", err)
+		}
+		if state.DatasetID != dataset.DatasetID {
+			return fmt.Errorf("state/usage dataset_id mismatch: state=%q usage=%q", state.DatasetID, dataset.DatasetID)
+		}
+		if dataset.Timezone != zone {
+			return fmt.Errorf("usage ledger uses quota timezone %q; keep usage_timezone consistent", dataset.Timezone)
+		}
+		// A watermark ahead of the clock would close every day as it arrives;
+		// one on today is a restart after a clock rollback and is served from
+		// the first open day (usageLedger.reportEndLocked).
+		if today := now.In(location).Format(dateLayout); dataset.Through > today {
+			return fmt.Errorf("usage history through %s is after today (%s); restore the files or fix the clock", dataset.Through, today)
+		}
+		keys, models, datasetID = state.Keys, state.Models, state.DatasetID
+	case errors.Is(stateErr, os.ErrNotExist):
+		for _, path := range []string{livePath, historyPath} {
+			if _, err := os.Stat(path); err == nil {
+				return fmt.Errorf("%s exists without its paired state file", path)
+			} else if !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("inspect usage file: %w", err)
+			}
+		}
+		if seedErr != nil {
+			return fmt.Errorf("validate initial configuration: %w", seedErr)
+		}
+		if datasetID, err = NewDatasetID(); err != nil {
 			return err
 		}
-		firstBoot = true
+		keys, models, firstBoot = effective.Keys, effective.Models, true
 	default:
 		return fmt.Errorf("load state: %w", stateErr)
 	}
 
-	effective := Config{
-		Enabled: cfg.Enabled, StateFile: cfg.StateFile, UsageTimezone: cfg.UsageTimezone,
-		Keys: keys, Models: models,
-	}
-	if err := normalizeConfig(&effective); err != nil {
-		if firstBoot {
-			return fmt.Errorf("validate initial configuration: %w", err)
-		}
-		return fmt.Errorf("validate state: %w", err)
-	}
-	cfg = effective
-	keys, models = cfg.Keys, cfg.Models
-
-	now := clockNow().UTC()
 	nextKeys := make(map[string]*KeyConfig, len(keys))
 	for i := range keys {
 		item := keys[i]
 		if item.CreatedAt.IsZero() {
-			item.CreatedAt = now
+			item.CreatedAt = now.UTC()
 		}
 		if item.UpdatedAt.IsZero() {
 			item.UpdatedAt = item.CreatedAt
 		}
-		if item.LimitsChangedAt.IsZero() && (item.DailyLimitUSD > 0 || item.WeeklyLimitUSD > 0 || item.MonthlyLimitUSD > 0 || hasModelLimit(item.Models)) {
-			item.LimitsChangedAt = item.CreatedAt
-		}
 		keys[i] = item
 		copy := item
-		copy.Models = append([]KeyModelRef(nil), item.Models...)
 		nextKeys[item.ID] = &copy
 	}
-	nextModels := make(map[string]*ModelDefinition, len(models))
-	for i := range models {
-		copy := cloneModel(models[i])
-		nextModels[strings.ToLower(copy.Name)] = &copy
+	prices, err := normalizeModelPrices(models)
+	if err != nil {
+		return fmt.Errorf("validate state: %w", err)
 	}
-
-	nextUsage := newUsageLedgerWithLocation(clockNow, cfg.usageLocation, cfg.UsageTimezone)
-	for id, entry := range usage {
-		if entry.Cycles != nil && entry.Cycles.Timezone != cfg.UsageTimezone {
-			return fmt.Errorf("key %q uses quota timezone %q; keep usage_timezone consistent", id, entry.Cycles.Timezone)
-		}
-	}
-	nextUsage.loadFromState(usage)
-	nextUsage.initializeCycles(keys, usageVersion < 5)
-	usage = nextUsage.snapshot()
-	cfg.Keys = keys
-	if !firstBoot {
-		if err := migrateStorage(statePath, datasetID, stateVersion, usageVersion, cfg, usage); err != nil {
-			return err
-		}
-	}
+	nextUsage := newUsageLedger(clockNow, location, zone)
+	nextUsage.load(dataset.Keys, dataset.Through)
+	nextUsage.syncCycles(keys)
 	if firstBoot {
-		if err := SaveUsage(usagePath, datasetID, usage); err != nil {
+		nextUsage.mu.Lock()
+		live := nextUsage.liveSnapshotLocked("")
+		nextUsage.mu.Unlock()
+		if err := writeLive(livePath, datasetID, zone, "", live, now); err != nil {
 			return fmt.Errorf("seed usage: %w", err)
 		}
 		if err := SaveState(statePath, datasetID, keys, models); err != nil {
-			_ = os.Remove(usagePath)
+			_ = os.Remove(livePath)
 			return fmt.Errorf("seed state: %w", err)
 		}
+		nextUsage.mu.Lock()
+		nextUsage.dirty = false
+		nextUsage.mu.Unlock()
 	}
 
 	s.mu.Lock()
@@ -222,34 +213,14 @@ func (s *Store) Configure(cfg Config) (err error) {
 	s.statePath = statePath
 	s.datasetID = datasetID
 	s.keys = nextKeys
-	s.models = nextModels
-	s.auditLog = audit.New(policyPersist.AuditPath(statePath), audit.DefaultMaxBytes, audit.DefaultBackups)
+	s.prices = prices
+	s.auditLog = audit.New(persist.AuditPath(statePath), audit.DefaultMaxBytes, audit.DefaultBackups)
 	s.rebuildKeysByHashLocked()
-	s.precharges = make(map[string][]time.Time)
-	if s.limiter == nil {
-		s.limiter = NewRateLimiter()
-	}
 	s.usage = nextUsage
+	// mediaTraces outlives reconfiguration: a media generation admitted before
+	// a reload still has to be billed when its usage record arrives.
 	s.mu.Unlock()
-	if stateVersion < currentStateFileVersion {
-		s.reportRemovedSettings(stateVersion, removedSettings)
-	}
 	return nil
-}
-
-// reportRemovedSettings leaves a trace of what converting an older state file
-// dropped, so operators can review it after the upgrade.
-func (s *Store) reportRemovedSettings(fromVersion int, removed []string) {
-	for _, note := range removed {
-		log.Printf("cpa-key-policy: state version %d converted: %s", fromVersion, note)
-	}
-	if len(removed) == 0 {
-		return
-	}
-	s.recordAudit(audit.Event{Action: "migrate_state", Changes: map[string]audit.Change{
-		"version": {From: fromVersion, To: currentStateFileVersion},
-		"removed": {From: removed, To: nil},
-	}})
 }
 
 func (s *Store) Enabled() bool {
@@ -258,16 +229,16 @@ func (s *Store) Enabled() bool {
 	return s.enabled
 }
 
-func (s *Store) runtimeComponents() (*RateLimiter, *usageLedger) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.limiter, s.usage
-}
-
 func (s *Store) StatePath() string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.statePath
+}
+
+func (s *Store) runtimeComponents() (*RateLimiter, *usageLedger) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.limiter, s.usage
 }
 
 func (s *Store) recordAudit(event audit.Event) {
@@ -282,14 +253,14 @@ func (s *Store) recordAudit(event audit.Event) {
 	}
 }
 
-func (s *Store) AuditEvents(keyID string, limit int) ([]audit.Event, error) {
+func (s *Store) AuditEvents(keyID, action string, limit int) ([]audit.Event, error) {
 	s.mu.RLock()
 	logWriter := s.auditLog
 	s.mu.RUnlock()
 	if logWriter == nil {
 		return []audit.Event{}, nil
 	}
-	return logWriter.Query(strings.TrimSpace(keyID), limit)
+	return logWriter.Query(strings.TrimSpace(keyID), strings.TrimSpace(action), limit)
 }
 
 func (s *Store) FindByAPIKey(raw string) *KeyConfig {
@@ -307,16 +278,13 @@ func (s *Store) findBySecret(raw string) *KeyConfig {
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return cloneKeyConfig(s.keysByHash[strings.ToLower(strings.TrimSpace(hash))])
+	return cloneKeyConfig(s.keysByHash[strings.ToLower(hash)])
 }
 
 func (s *Store) findBySecretWhenEnabled(raw string) (*KeyConfig, bool) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
-		s.mu.RLock()
-		enabled := s.enabled
-		s.mu.RUnlock()
-		return nil, enabled
+		return nil, s.Enabled()
 	}
 	hash, err := HashKey(raw)
 	if err != nil {
@@ -327,9 +295,11 @@ func (s *Store) findBySecretWhenEnabled(raw string) (*KeyConfig, bool) {
 	if !s.enabled {
 		return nil, false
 	}
-	return cloneKeyConfig(s.keysByHash[strings.ToLower(strings.TrimSpace(hash))]), true
+	return cloneKeyConfig(s.keysByHash[strings.ToLower(hash)]), true
 }
 
+// findByID matches the id exactly: ids are unique by exact string, so a
+// case-insensitive match could name another key.
 func (s *Store) findByID(id string) *KeyConfig {
 	id = strings.TrimSpace(id)
 	if id == "" {
@@ -337,16 +307,7 @@ func (s *Store) findByID(id string) *KeyConfig {
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	key := s.keys[id]
-	if key == nil {
-		for candidateID, candidate := range s.keys {
-			if strings.EqualFold(candidateID, id) {
-				key = candidate
-				break
-			}
-		}
-	}
-	return cloneKeyConfig(key)
+	return cloneKeyConfig(s.keys[id])
 }
 
 func cloneKeyConfig(key *KeyConfig) *KeyConfig {
@@ -354,7 +315,6 @@ func cloneKeyConfig(key *KeyConfig) *KeyConfig {
 		return nil
 	}
 	copy := *key
-	copy.Models = append([]KeyModelRef(nil), key.Models...)
 	return &copy
 }
 
@@ -367,11 +327,7 @@ func (s *Store) rebuildKeysByHashLocked() {
 	byHash := make(map[string]*KeyConfig, len(ids))
 	for _, id := range ids {
 		key := s.keys[id]
-		if key == nil {
-			continue
-		}
-		hash := strings.ToLower(strings.TrimSpace(key.KeyHash))
-		if hash != "" {
+		if hash := strings.ToLower(key.KeyHash); hash != "" {
 			if _, exists := byHash[hash]; !exists {
 				byHash[hash] = key
 			}
@@ -380,65 +336,74 @@ func (s *Store) rebuildKeysByHashLocked() {
 	s.keysByHash = byHash
 }
 
-func (s *Store) modelForKey(key *KeyConfig, requested string) (ModelDefinition, bool) {
-	requested = strings.TrimSpace(requested)
-	if key == nil || requested == "" {
-		return ModelDefinition{}, false
-	}
-	allowed := false
-	for _, ref := range key.Models {
-		if strings.EqualFold(ref.Name, requested) {
-			allowed = true
-			break
-		}
-	}
-	if !allowed {
-		return ModelDefinition{}, false
-	}
+func (s *Store) Keys() []KeyConfig {
 	s.mu.RLock()
-	model := s.models[strings.ToLower(requested)]
-	if model == nil {
-		s.mu.RUnlock()
-		return ModelDefinition{}, false
-	}
-	copy := cloneModel(*model)
-	s.mu.RUnlock()
-	return copy, true
+	defer s.mu.RUnlock()
+	return s.keysSnapshotLocked()
 }
 
-func (s *Store) usageSnapshotLocked() map[string]*UsageState {
-	if s.usage == nil {
-		return nil
+func (s *Store) keysSnapshotLocked() []KeyConfig {
+	keys := make([]KeyConfig, 0, len(s.keys))
+	for _, key := range s.keys {
+		keys = append(keys, *key)
 	}
-	return s.usage.snapshot()
+	sort.Slice(keys, func(i, j int) bool { return keys[i].ID < keys[j].ID })
+	return keys
 }
 
+// FlushUsage writes one accounting cut: the history file first when a day
+// has closed since the last history write, then the live file. A failed
+// history write leaves the closed days in the live file and is retried on
+// the next flush; every failure is logged, counted and reported by Status.
 func (s *Store) FlushUsage() error {
 	s.persistMu.Lock()
 	defer s.persistMu.Unlock()
 	s.mu.RLock()
-	ledger := s.usage
-	path := s.statePath
-	datasetID := s.datasetID
+	ledger, path, datasetID, health := s.usage, s.statePath, s.datasetID, s.health
 	s.mu.RUnlock()
-	if path == "" || datasetID == "" || ledger == nil {
+	if path == "" || datasetID == "" {
 		return nil
 	}
-	usage, revision, dirty := ledger.snapshotForFlush()
-	if !dirty {
+	plan, ok := ledger.planFlush()
+	if !ok {
 		return nil
 	}
-	if err := SaveUsage(policyPersist.UsagePath(path), datasetID, usage); err != nil {
+	through, historyWritten := plan.through, false
+	var historyErr error
+	if plan.history != nil {
+		if err := writeHistory(persist.HistoryPath(path), datasetID, plan.historyThrough, plan.history, time.Now()); err != nil {
+			historyErr = fmt.Errorf("write usage history: %w", err)
+		} else {
+			through, historyWritten = plan.historyThrough, true
+		}
+	}
+	liveErr := writeLive(persist.UsagePath(path), datasetID, ledger.timezone, through, plan.live, time.Now())
+	ledger.markFlushed(plan, historyWritten, liveErr == nil)
+	if liveErr != nil {
+		err := fmt.Errorf("write live usage: %w", liveErr)
+		if historyErr != nil {
+			err = fmt.Errorf("%w; %v", historyErr, err)
+		}
+		health.flushFailed(err)
 		return err
 	}
-	ledger.markFlushed(revision)
+	if historyErr != nil {
+		health.flushFailed(historyErr)
+		return historyErr
+	}
+	health.flushSucceeded(time.Now())
 	return nil
 }
 
-func (s *Store) saveState(path, datasetID string, keys []KeyConfig, models []ModelDefinition) error {
+// saveState writes the state file for a management write. Callers validate
+// the rows first, so a failure here is a persistence failure.
+func (s *Store) saveState(path, datasetID string, keys []KeyConfig, models []ModelPrice) error {
 	s.persistMu.Lock()
 	defer s.persistMu.Unlock()
-	return SaveState(path, datasetID, keys, models)
+	if err := SaveState(path, datasetID, keys, models); err != nil {
+		return fmt.Errorf("%w: %w", ErrStatePersist, err)
+	}
+	return nil
 }
 
 func (s *Store) StartUsageFlusher() func() {
@@ -459,10 +424,10 @@ func (s *Store) StartUsageFlusher() func() {
 	return stop
 }
 
-func (s *Store) StopUsageFlusher() {
-	if err := s.stopUsageFlusher(); err != nil {
-		log.Printf("cpa-key-policy: flush usage on stop: %v", err)
-	}
+// Shutdown stops the periodic flusher and writes the final accounting cut,
+// history first when days have closed, so nothing stays only in memory.
+func (s *Store) Shutdown() error {
+	return s.stopUsageFlusher()
 }
 
 func (s *Store) stopUsageFlusher() error {
@@ -493,7 +458,9 @@ func (f *usageFlusher) loop() {
 		case <-f.stopCh:
 			return
 		case <-ticker.C:
-			_ = f.store.FlushUsage()
+			if err := f.store.FlushUsage(); err != nil {
+				log.Printf("cpa-key-policy: usage flush failed, retrying next interval: %v", err)
+			}
 		}
 	}
 }

@@ -1,44 +1,20 @@
-import { useMemo, useState } from "react";
-import { useLocation, useNavigate } from "react-router-dom";
-import { createKey } from "../api/keys";
-import KeyForm, { keyWriteRequestFromForm, type KeyFormValues } from "../components/KeyForm";
+import { useState } from "react";
+import { useNavigate } from "react-router-dom";
+import { adjustBalance, createKey } from "../api/keys";
+import KeyForm, { keyWriteRequestFromForm } from "../components/KeyForm";
 import PlainKeyModal from "../components/PlainKeyModal";
+import { newRequestId } from "../components/BalanceDialog";
 import { MobileFormHeader, MobileTabBar } from "../components/MobileChrome";
 import { useT } from "../i18n";
-import type { KeyPublic } from "../types";
 
-interface ReturnedModelState {
-  createdModel?: string;
-  draftKey?: KeyFormValues;
+export interface KeyUsageNotice {
+  notice: string;
 }
 
 export default function KeyNew() {
   const navigate = useNavigate();
-  const location = useLocation();
   const t = useT();
-  const [plain, setPlain] = useState<string | null>(null);
-
-  const returned = location.state as ReturnedModelState | null;
-  const initial = useMemo<KeyPublic | undefined>(() => {
-    if (!returned?.draftKey) return undefined;
-    const models = [...returned.draftKey.models];
-    if (returned.createdModel && !models.some((model) => model.name.toLowerCase() === returned.createdModel?.toLowerCase())) {
-      models.push({ name: returned.createdModel, daily_limit_usd: 0 });
-    }
-    return {
-      ...returned.draftKey,
-      models,
-      key_preview: "",
-      usage: {
-        daily_usd: 0,
-        weekly_usd: 0,
-        monthly_usd: 0,
-        daily_limit_usd: returned.draftKey.daily_limit_usd,
-        weekly_limit_usd: returned.draftKey.weekly_limit_usd,
-        monthly_limit_usd: returned.draftKey.monthly_limit_usd,
-      },
-    };
-  }, [returned]);
+  const [created, setCreated] = useState<{ id: string; plain: string; balanceFailed: boolean } | null>(null);
 
   const title = t("new.title");
   return (
@@ -46,22 +22,34 @@ export default function KeyNew() {
       <div className="fp-head mobile-hidden"><h1>{title}</h1></div>
       <MobileFormHeader title={title} backTo="/keys" />
       <KeyForm
-        initial={initial}
-        returnPath="/keys/new"
         submitLabel={t("new.create")}
         onCancel={() => navigate("/keys")}
         onSubmit={async (values) => {
           const response = await createKey(keyWriteRequestFromForm(values));
-          setPlain(response.plain_key);
+          // The key exists from here on: a failed initial balance must not hide
+          // the one-time plaintext key, so it is reported after the modal.
+          let balanceFailed = false;
+          if (values.quota_mode === "balance" && values.initial_balance_usd > 0) {
+            try {
+              await adjustBalance(response.key.id, values.initial_balance_usd, t("balance.initialNote"), newRequestId());
+            } catch {
+              balanceFailed = true;
+            }
+          }
+          setCreated({ id: response.key.id, plain: response.plain_key, balanceFailed });
         }}
       />
-      {plain && (
+      {created && (
         <PlainKeyModal
-          plainKey={plain}
+          plainKey={created.plain}
           title={t("plainModal.created")}
           onClose={() => {
-            setPlain(null);
-            navigate("/keys");
+            const { id, balanceFailed } = created;
+            setCreated(null);
+            if (balanceFailed) {
+              const state: KeyUsageNotice = { notice: t("balance.initialFailed") };
+              navigate(`/keys/${encodeURIComponent(id)}/usage`, { state });
+            } else navigate("/keys");
           }}
         />
       )}

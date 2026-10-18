@@ -23,12 +23,10 @@ func NewRateLimiter() *RateLimiter {
 	}
 }
 
-func NewRateLimiterWithClock(now func() time.Time) *RateLimiter {
-	limiter := NewRateLimiter()
-	if now != nil {
-		limiter.now = now
-	}
-	return limiter
+func (l *RateLimiter) setClock(now func() time.Time) {
+	l.mu.Lock()
+	l.now = now
+	l.mu.Unlock()
 }
 
 // Allow counts one request in the key's one-minute window, which starts at the
@@ -38,9 +36,9 @@ func (l *RateLimiter) Allow(id string, rpm int) (bool, time.Time) {
 	if rpm <= 0 {
 		return true, time.Time{}
 	}
-	now := l.now().UTC()
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	now := l.now().UTC()
 	bucket := l.buckets[id]
 	if bucket.windowStart.IsZero() || now.Sub(bucket.windowStart) >= time.Minute || now.Before(bucket.windowStart) {
 		bucket = rateBucket{windowStart: now, count: 0}
@@ -60,11 +58,16 @@ func (l *RateLimiter) Reset(id string) {
 	delete(l.buckets, id)
 }
 
+// Snapshot reports the request count of every window still open now.
 func (l *RateLimiter) Snapshot() map[string]int {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	now := l.now().UTC()
 	out := make(map[string]int, len(l.buckets))
 	for key, bucket := range l.buckets {
+		if now.Sub(bucket.windowStart) >= time.Minute || now.Before(bucket.windowStart) {
+			continue
+		}
 		out[key] = bucket.count
 	}
 	return out

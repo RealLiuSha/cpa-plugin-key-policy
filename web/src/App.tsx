@@ -10,6 +10,7 @@ import KeyUsage from "./pages/KeyUsage";
 import Models from "./pages/Models";
 import ModelForm from "./pages/ModelForm";
 import Audit from "./pages/Audit";
+import Stats from "./pages/Stats";
 
 function useAuthTick() {
   const [, setTick] = useState(0);
@@ -38,6 +39,7 @@ function TopNav() {
   // Active state: highlight the nav item matching the current path prefix.
   const onKeys = loc.pathname === "/keys" || loc.pathname.startsWith("/keys/");
   const onNew = loc.pathname === "/keys/new" || loc.pathname.startsWith("/keys/new/");
+  const onStats = loc.pathname === "/stats";
   const onModels = loc.pathname === "/models" || loc.pathname.startsWith("/models/");
   const onAudit = loc.pathname === "/audit";
   const embedded = isEmbedded();
@@ -53,6 +55,7 @@ function TopNav() {
         <div className="topnav-actions">
           <Link to="/keys" className={"tn-link" + (onKeys && !onNew ? " active" : "")}>{t("header.keyList")}</Link>
           <Link to="/keys/new" className={"tn-link" + (onNew ? " active" : "")}>{t("header.newKey")}</Link>
+          <Link to="/stats" className={"tn-link" + (onStats ? " active" : "")}>{t("header.stats")}</Link>
           <Link to="/models" className={"tn-link" + (onModels ? " active" : "")}>{t("header.models")}</Link>
           <Link to="/audit" className={"tn-link" + (onAudit ? " active" : "")}>{t("header.audit")}</Link>
           {!embedded && (
@@ -106,8 +109,9 @@ function Shell() {
         <Route path="/keys/:id/edit" element={<KeyEdit />} />
         <Route path="/keys/:id/usage" element={<KeyUsage />} />
         <Route path="/models" element={<Models />} />
-        <Route path="/models/new" element={<ModelForm />} />
-        <Route path="/models/:name/edit" element={<ModelForm />} />
+        <Route path="/models/new" element={<ModelForm key="new" mode="new" />} />
+        <Route path="/models/edit" element={<ModelForm key="edit" mode="edit" />} />
+        <Route path="/stats" element={<Stats />} />
         <Route path="/audit" element={<Audit />} />
         <Route path="*" element={<Navigate to="/keys" replace />} />
       </Routes>

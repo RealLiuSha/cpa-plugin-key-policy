@@ -1,4 +1,4 @@
-# Example CLIProxyAPI snippet for cpa-key-policy 1.0.
+# Example CLIProxyAPI snippet for cpa-key-policy (data format 7).
 # Replace placeholders. Never commit real keys or production paths.
 
 plugins:
@@ -8,17 +8,19 @@ plugins:
     cpa-key-policy:
       enabled: true
       priority: 10
-      # State and usage are a paired dataset. The lists below seed first boot;
-      # after state exists, keys and models come only from state.
+      # State, usage and history are one dataset. The lists below seed the
+      # first boot; after state exists, keys and prices come only from state.
       state_file: "cpa-key-policy-state.json"
       usage_timezone: "Asia/Shanghai"
 
-      # A public model routes to one CPA capability. Prices are USD; omitted
-      # prices are $0. billing_multiplier scales token charges (default 1).
+      # A price row prices one upstream model id (the Model CPA reports in
+      # usage records). provider is an optional qualifier; an empty provider
+      # matches any provider. Prices are USD per million tokens; omitted
+      # prices are $0 and the row is reported as unpriced until set.
+      # billing_multiplier scales token charges (1..50, default 1).
       models:
-        - name: "fast"
+        - name: "gpt-5.6"
           provider: "codex"
-          target_model: "gpt-5.6"
           billing_mode: "tokens"
           billing_multiplier: 1.2
           input_price_per_million: 1
@@ -26,14 +28,19 @@ plugins:
           cache_read_price_per_million: 0.1
           cache_write_price_per_million: 0.3
 
+        # Per-call rows bill once per admitted POST on an image or video
+        # generation endpoint. Result polling and the image record a Codex
+        # image_generation tool call on /v1/responses adds are not billed
+        # per call (unmetered_per_call); price models that report tokens,
+        # such as Codex's gpt-image-*, by token instead.
         - name: "grok-imagine-image"
           provider: "xai"
-          target_model: "grok-imagine-image"
           billing_mode: "per_call"
           per_call_usd: 0.07
 
       # Seed keys are used only when state_file does not exist. Afterwards,
-      # create and edit keys through the Web UI or management API.
+      # create and edit keys through the Web UI or management API. Every
+      # enabled key may use every model; limits of 0 mean unlimited.
       keys:
         - id: "team-a"
           name: "Team A"
@@ -44,7 +51,3 @@ plugins:
           daily_limit_usd: 10
           weekly_limit_usd: 50
           monthly_limit_usd: 150
-          models:
-            - name: "fast"
-              daily_limit_usd: 5
-            - name: "grok-imagine-image"

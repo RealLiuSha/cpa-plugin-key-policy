@@ -3,13 +3,16 @@ import { deleteKey, rotateKey } from "../api/keys";
 import { extractApiError } from "../api/error";
 import type { RotateKeyResponse } from "../types";
 import { useT } from "../i18n";
+import { formatUSD } from "../format";
 import Modal from "./Modal";
 
 export type KeyAction = "rotate" | "delete";
 
-export default function KeyActionDialog({ keyId, action, onClose, onComplete }: {
+export default function KeyActionDialog({ keyId, action, balanceUSD, onClose, onComplete }: {
   keyId: string;
   action: KeyAction;
+  // A balance key's balance, named before deletion since it goes with the key.
+  balanceUSD?: number;
   onClose: () => void;
   onComplete: (result: RotateKeyResponse | null) => void;
 }) {
@@ -38,6 +41,7 @@ export default function KeyActionDialog({ keyId, action, onClose, onComplete }: 
   return (
     <Modal title={title} closeLabel={t("keyForm.cancel")} onClose={onClose} dismissible={!busy}>
       <p>{t(action === "rotate" ? "keys.rotateConfirm" : "keys.deleteConfirm", { id: keyId })}</p>
+      {action === "delete" && balanceUSD !== undefined && balanceUSD !== 0 && <p className="balance-warning" role="alert">{t("balance.deleteDropsBalance", { amount: formatUSD(balanceUSD) })}</p>}
       {error && <div className="error" role="alert">{error}</div>}
       <div className="form-actions modal-actions">
         <button type="button" className="btn" disabled={busy} onClick={onClose}>{t("keyForm.cancel")}</button>

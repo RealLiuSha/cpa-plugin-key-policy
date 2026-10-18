@@ -113,7 +113,9 @@ func (l *Log) rotateLocked() error {
 	return nil
 }
 
-func (l *Log) Query(keyID string, limit int) ([]Event, error) {
+// Query returns the newest events, at most limit, of one key and one action
+// when they are set.
+func (l *Log) Query(keyID, action string, limit int) ([]Event, error) {
 	if l == nil {
 		return []Event{}, nil
 	}
@@ -146,7 +148,7 @@ func (l *Log) Query(keyID string, limit int) ([]Event, error) {
 				_ = file.Close()
 				return nil, fmt.Errorf("decode audit event in %s: %w", path, err)
 			}
-			if keyID == "" || event.KeyID == keyID {
+			if (keyID == "" || event.KeyID == keyID) && (action == "" || event.Action == action) {
 				events = append(events, event)
 			}
 		}

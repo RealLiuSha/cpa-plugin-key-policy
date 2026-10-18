@@ -1,4 +1,8 @@
 import { afterEach, describe, expect, it } from "vitest";
+import en from "./locales/en.json";
+import ru from "./locales/ru.json";
+import zhCN from "./locales/zh-CN.json";
+import zhTW from "./locales/zh-TW.json";
 import {
   getLocale,
   setLocale,
@@ -46,16 +50,14 @@ describe("translate", () => {
   it("provides more-menu and table labels in all four locales", () => {
     _resetLocale("zh-CN");
     expect(translate("keys.more")).toBe("更多");
-    expect(translate("keys.reset")).toBe("重置");
     expect(translate("keys.resetRpm")).toBe("重置 RPM");
     expect(translate("keys.resetKey")).toBe("更换 Key");
-    expect(translate("keys.colAvailableModels")).toBe("可用模型");
+    expect(translate("header.models")).toBe("模型价格");
     _resetLocale("en");
     expect(translate("keys.more")).toBe("More");
-    expect(translate("keys.reset")).toBe("Reset");
     expect(translate("keys.resetRpm")).toBe("Reset RPM");
     expect(translate("keys.resetKey")).toBe("Replace Key");
-    expect(translate("keys.colAvailableModels")).toBe("Available models");
+    expect(translate("header.models")).toBe("Model prices");
     _resetLocale("zh-TW");
     expect(translate("keys.more")).toBe("更多");
     expect(translate("keys.resetKey")).toBe("更換 Key");
@@ -68,33 +70,52 @@ describe("translate", () => {
     for (const locale of ["zh-CN", "zh-TW", "en", "ru"] as const) {
       _resetLocale(locale);
       for (const key of [
-        "usage.last7Days",
-        "usage.boundaryDaily",
-        "usage.boundaryWeekly",
-        "usage.boundaryMonthly",
-        "usage.boundaryUnlimited",
-        "usage.windowHelp",
+        "usage.unpriced",
+        "usage.unpricedCalls",
         "keyForm.monthlyLimitLabel",
-        "keyForm.limitBelowUsageConfirm",
-        "keyForm.modelDailyLimit",
-        "keys.resetMonthlyConfirm",
+        "keyForm.limitInvalid",
         "keyUsage.tabMonthly",
         "keyUsage.historyTitle",
+        "usage.rangeDays",
+        "keyUsage.rangeModelsTitle",
         "keyUsage.colModel",
         "models.title",
         "models.priceHint",
         "models.priceTokenSummary",
         "models.importFromCpa",
         "models.cacheWritePrice",
+        "models.providerQualifier",
+        "models.unpricedNotice",
         "keyUsage.colCacheWrite",
-        "models.unpriced",
         "models.importCount",
         "models.syncHint",
         "audit.title",
         "audit.action.migrate_state",
         "audit.field.billing_multiplier",
+        "audit.field.provider",
+        "header.stats",
+        "keys.mobile.tabStats",
+        "stats.title",
+        "stats.exportTooLarge",
+        "stats.keysTruncated",
+        "stats.health.title",
       ]) {
         expect(translate(key)).not.toBe(key);
+      }
+    }
+  });
+
+  it("keeps the same non-empty keys and placeholders in every locale", () => {
+    const entries = (node: unknown, prefix = ""): [string, string][] => Object.entries(node as Record<string, unknown>).flatMap(([key, value]) =>
+      typeof value === "string" ? [[prefix + key, value] as [string, string]] : entries(value, `${prefix}${key}.`));
+    const placeholders = (text: string) => [...text.matchAll(/\{\{(\w+)\}\}/g)].map((match) => match[1]).sort().join(",");
+    const base = new Map(entries(zhCN));
+    for (const [locale, messages] of Object.entries({ en, ru, "zh-TW": zhTW })) {
+      const current = new Map(entries(messages));
+      expect([...current.keys()].sort(), locale).toEqual([...base.keys()].sort());
+      for (const [key, text] of current) {
+        expect(text.trim(), `${locale} ${key}`).not.toBe("");
+        expect(placeholders(text), `${locale} ${key}`).toBe(placeholders(base.get(key)!));
       }
     }
   });

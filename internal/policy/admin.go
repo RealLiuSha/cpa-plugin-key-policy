@@ -1,173 +1,116 @@
 package policy
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"strings"
 
 	"cpa-key-policy/internal/policy/audit"
-	policyPersist "cpa-key-policy/internal/policy/persist"
+	"cpa-key-policy/internal/policy/persist"
 )
 
-func (s *Store) UpsertKey(input KeyConfig, persist bool) error {
-	previous, stored, err := s.applyKeyMutation(input, persist)
+// UpsertKey creates or updates a key, persisting before publishing. A
+// secret another key already uses is rejected with ErrDuplicateKeyHash.
+func (s *Store) UpsertKey(input KeyConfig) error {
+	previous, stored, err := s.applyKeyMutation(input)
 	if err != nil {
 		return err
 	}
-	if persist {
-		action := "create_key"
-		if previous != nil {
-			action = "update_key"
-		}
-		s.recordAudit(audit.Event{Action: action, KeyID: stored.ID, Changes: keyLimitChanges(previous, stored)})
+	action := "create_key"
+	if previous != nil {
+		action = "update_key"
 	}
+	s.recordAudit(audit.Event{Action: action, KeyID: stored.ID, Changes: keyChanges(previous, stored)})
 	return nil
 }
 
-// applyKeyMutation owns the normalized, persist-before-publish key update.
-// Callers add the audit event that describes their management operation.
-func (s *Store) applyKeyMutation(input KeyConfig, persist bool) (*KeyConfig, KeyConfig, error) {
+func (s *Store) applyKeyMutation(input KeyConfig) (*KeyConfig, KeyConfig, error) {
 	s.updateMu.Lock()
 	defer s.updateMu.Unlock()
 	s.mu.RLock()
 	keys := s.keysSnapshotLocked()
-	models := s.modelsSnapshotLocked()
+	models := s.prices.snapshot()
 	path, datasetID := s.statePath, s.datasetID
 	s.mu.RUnlock()
 
-	now := s.billingNow().UTC()
+	now := s.clock()().UTC()
+	input.ID = strings.TrimSpace(input.ID)
 	var previous *KeyConfig
-	found := false
+	index := -1
 	for i := range keys {
-		if keys[i].ID != input.ID {
-			continue
+		if keys[i].ID == input.ID {
+			copy := keys[i]
+			previous = &copy
+			index = i
+			break
 		}
-		copy := keys[i]
-		previous = &copy
-		if !keys[i].CreatedAt.IsZero() {
-			input.CreatedAt = keys[i].CreatedAt
-		}
-		keys[i] = input
-		found = true
-		break
 	}
-	if !found {
-		keys = append(keys, input)
+	if previous != nil && !previous.CreatedAt.IsZero() {
+		input.CreatedAt = previous.CreatedAt
 	}
 	if input.CreatedAt.IsZero() {
 		input.CreatedAt = now
 	}
-	if previous == nil {
-		if input.DailyLimitUSD > 0 || input.WeeklyLimitUSD > 0 || input.MonthlyLimitUSD > 0 || hasModelLimit(input.Models) {
-			input.LimitsChangedAt = now
-		}
-	} else if !limitsEqual(*previous, input) {
-		input.LimitsChangedAt = now
-	} else {
-		input.LimitsChangedAt = previous.LimitsChangedAt
-	}
 	input.UpdatedAt = now
-	if found {
-		for i := range keys {
-			if keys[i].ID == input.ID {
-				keys[i] = input
-				break
-			}
-		}
+	if index >= 0 {
+		keys[index] = input
 	} else {
-		keys[len(keys)-1] = input
+		keys = append(keys, input)
+		index = len(keys) - 1
 	}
-	cfg := Config{Enabled: true, Keys: keys, Models: models}
-	if err := normalizeConfig(&cfg); err != nil {
+	if err := normalizeKeys(keys); err != nil {
 		return nil, KeyConfig{}, err
 	}
-	for i := range cfg.Keys {
-		if cfg.Keys[i].ID == input.ID {
-			input = cfg.Keys[i]
-			break
-		}
+	if err := secretUnique(keys, keys[index]); err != nil {
+		return nil, KeyConfig{}, err
 	}
-	if persist {
-		if err := s.saveState(path, datasetID, cfg.Keys, cfg.Models); err != nil {
-			return nil, KeyConfig{}, err
-		}
+	input = keys[index]
+	if err := s.saveState(path, datasetID, keys, models); err != nil {
+		return nil, KeyConfig{}, err
 	}
+	// Periods exist before the key is published, so a usage record that
+	// arrives right after publication is counted against its quota.
+	s.mu.RLock()
+	ledger := s.usage
+	s.mu.RUnlock()
+	ledger.openCycles(input)
 	s.mu.Lock()
 	copy := input
-	copy.Models = append([]KeyModelRef(nil), input.Models...)
 	s.keys[input.ID] = &copy
 	s.rebuildKeysByHashLocked()
-	s.clearPrechargesForKeyLocked(input.ID)
 	s.mu.Unlock()
-	_, ledger := s.runtimeComponents()
-	if ledger != nil {
-		ledger.initializeCycles([]KeyConfig{input}, false)
-	}
 	return previous, input, nil
 }
 
-func keyLimitChanges(previous *KeyConfig, current KeyConfig) map[string]audit.Change {
-	changes := make(map[string]audit.Change)
+// keyChanges lists the managed fields an upsert changed. Secrets, hashes
+// and previews are never recorded.
+func keyChanges(previous *KeyConfig, current KeyConfig) map[string]audit.Change {
 	before := KeyConfig{}
 	if previous != nil {
 		before = *previous
 	}
-	for field, values := range map[string][2]float64{
-		"daily_limit_usd": {before.DailyLimitUSD, current.DailyLimitUSD}, "weekly_limit_usd": {before.WeeklyLimitUSD, current.WeeklyLimitUSD},
-		"monthly_limit_usd": {before.MonthlyLimitUSD, current.MonthlyLimitUSD},
-	} {
-		if values[0] != values[1] {
-			changes[field] = audit.Change{From: values[0], To: values[1]}
+	changes := make(map[string]audit.Change)
+	record := func(field string, from, to any) {
+		if from != to {
+			changes[field] = audit.Change{From: from, To: to}
 		}
 	}
-	beforeModels := make(map[string]float64, len(before.Models))
-	for _, ref := range before.Models {
-		beforeModels[strings.ToLower(ref.Name)] = ref.DailyLimitUSD
-	}
-	afterModels := make(map[string]float64, len(current.Models))
-	for _, ref := range current.Models {
-		afterModels[strings.ToLower(ref.Name)] = ref.DailyLimitUSD
-	}
-	beforeRaw, _ := json.Marshal(beforeModels)
-	afterRaw, _ := json.Marshal(afterModels)
-	if string(beforeRaw) != string(afterRaw) {
-		changes["model_daily_limits"] = audit.Change{From: beforeModels, To: afterModels}
-	}
+	record("name", before.Name, current.Name)
+	record("enabled", before.Enabled, current.Enabled)
+	record("rpm", before.RPM, current.RPM)
+	record("daily_limit_usd", before.DailyLimitUSD, current.DailyLimitUSD)
+	record("weekly_limit_usd", before.WeeklyLimitUSD, current.WeeklyLimitUSD)
+	record("monthly_limit_usd", before.MonthlyLimitUSD, current.MonthlyLimitUSD)
+	record("quota_mode", before.Mode(), current.Mode())
 	if len(changes) == 0 {
 		return nil
 	}
 	return changes
 }
 
-func hasModelLimit(refs []KeyModelRef) bool {
-	for _, ref := range refs {
-		if ref.DailyLimitUSD > 0 {
-			return true
-		}
-	}
-	return false
-}
-
-func limitsEqual(left, right KeyConfig) bool {
-	if left.DailyLimitUSD != right.DailyLimitUSD || left.WeeklyLimitUSD != right.WeeklyLimitUSD || left.MonthlyLimitUSD != right.MonthlyLimitUSD {
-		return false
-	}
-	limits := make(map[string]float64, len(left.Models))
-	for _, ref := range left.Models {
-		limits[strings.ToLower(ref.Name)] = ref.DailyLimitUSD
-	}
-	if len(limits) != len(right.Models) {
-		return false
-	}
-	for _, ref := range right.Models {
-		if value, exists := limits[strings.ToLower(ref.Name)]; !exists || value != ref.DailyLimitUSD {
-			return false
-		}
-	}
-	return true
-}
-
+// DeleteKey removes the key, its quota periods, balance and RPM window. Its
+// daily history stays until retention drops it and is reported as deleted.
 func (s *Store) DeleteKey(id string) error {
 	s.updateMu.Lock()
 	defer s.updateMu.Unlock()
@@ -177,10 +120,10 @@ func (s *Store) DeleteKey(id string) error {
 	}
 	s.mu.RLock()
 	keys := s.keysSnapshotLocked()
-	models := s.modelsSnapshotLocked()
+	models := s.prices.snapshot()
 	path, datasetID := s.statePath, s.datasetID
 	_, exists := s.keys[id]
-	limiter, usageLedger := s.limiter, s.usage
+	limiter, ledger := s.limiter, s.usage
 	s.mu.RUnlock()
 	if !exists {
 		return ErrUnknownKey
@@ -197,15 +140,27 @@ func (s *Store) DeleteKey(id string) error {
 	s.mu.Lock()
 	delete(s.keys, id)
 	s.rebuildKeysByHashLocked()
-	s.clearPrechargesForKeyLocked(id)
 	s.mu.Unlock()
-	if limiter != nil {
-		limiter.Reset(id)
+	limiter.Reset(id)
+	daily, weekly, monthly, balance := ledger.forgetKey(id)
+	changes := map[string]audit.Change{
+		"daily_usd":   {From: daily.USD(), To: nil},
+		"weekly_usd":  {From: weekly.USD(), To: nil},
+		"monthly_usd": {From: monthly.USD(), To: nil},
 	}
-	if usageLedger != nil {
-		usageLedger.removeKeyUsage(id)
+	if balance != 0 {
+		changes["balance_usd"] = audit.Change{From: balance.USD(), To: nil}
 	}
-	s.recordAudit(audit.Event{Action: "delete_key", KeyID: id})
+	s.recordAudit(audit.Event{Action: "delete_key", KeyID: id, Changes: changes})
+	// The live file follows now rather than at the next tick: a key recreated
+	// under this id before then, followed by a crash, would find the cleared
+	// periods on restart and inherit them. TRADEOFF: the state write is not
+	// rolled back when this fails and the delete still reports success; the
+	// key is gone either way, the failure is logged, counted in health and
+	// retried by the flusher.
+	if err := s.FlushUsage(); err != nil {
+		log.Printf("cpa-key-policy: usage flush after deleting key %q failed, retrying next interval: %v", id, err)
+	}
 	return nil
 }
 
@@ -228,7 +183,7 @@ func (s *Store) RotateKey(id string) (string, KeyConfig, error) {
 	}
 	key.KeyHash = hash
 	key.KeyPreview = PreviewKey(plain)
-	_, stored, err := s.applyKeyMutation(*key, true)
+	_, stored, err := s.applyKeyMutation(*key)
 	if err != nil {
 		return "", KeyConfig{}, err
 	}
@@ -241,12 +196,13 @@ func (s *Store) ResetRPM(id string) error {
 		return errors.New("id is required")
 	}
 	limiter, _ := s.runtimeComponents()
-	if limiter != nil {
-		limiter.Reset(id)
-	}
+	limiter.Reset(id)
 	return nil
 }
 
+// ResetUsageWindow starts a new quota period now. With expected set, the
+// reset only happens when the period and proposed deadline still match
+// what the caller displayed (ErrUsageResetChanged otherwise).
 func (s *Store) ResetUsageWindow(id string, window UsageResetWindow, expected *UsageResetExpectation) (UsageResetResult, error) {
 	s.updateMu.Lock()
 	defer s.updateMu.Unlock()
@@ -254,7 +210,7 @@ func (s *Store) ResetUsageWindow(id string, window UsageResetWindow, expected *U
 	if id == "" {
 		return UsageResetResult{}, errors.New("id is required")
 	}
-	if window != UsageResetDaily && window != UsageResetWeekly && window != UsageResetMonthly {
+	if !window.valid() {
 		return UsageResetResult{}, fmt.Errorf("%w: %q", ErrInvalidUsageResetWindow, window)
 	}
 	if expected != nil && (expected.StartedAt.IsZero() || expected.ResetAfterManualAt.IsZero()) {
@@ -262,20 +218,22 @@ func (s *Store) ResetUsageWindow(id string, window UsageResetWindow, expected *U
 	}
 	s.mu.RLock()
 	_, exists := s.keys[id]
-	usage, path, datasetID := s.usage, s.statePath, s.datasetID
+	ledger, path, datasetID := s.usage, s.statePath, s.datasetID
 	s.mu.RUnlock()
 	if !exists {
 		return UsageResetResult{}, ErrUnknownKey
 	}
-	if usage == nil {
-		return UsageResetResult{KeyID: id, Window: window}, nil
-	}
+	// The callback runs under the ledger lock, so the clock is read here.
+	writtenAt := s.clock()()
 	s.persistMu.Lock()
-	result, err := usage.resetWindowAndPersist(id, window, expected, func(snapshot map[string]*UsageState) error {
-		return SaveUsage(policyPersist.UsagePath(path), datasetID, snapshot)
+	result, err := ledger.resetWindowAndPersist(id, window, expected, func(through string, keys map[string]liveKey) error {
+		return writeLive(persist.UsagePath(path), datasetID, ledger.timezone, through, keys, writtenAt)
 	})
 	s.persistMu.Unlock()
 	if err != nil {
+		if errors.Is(err, ErrUsageResetChanged) {
+			return UsageResetResult{}, err
+		}
 		return UsageResetResult{}, fmt.Errorf("persist usage reset: %w", err)
 	}
 	s.recordAudit(audit.Event{Action: "reset_usage", KeyID: id, Changes: map[string]audit.Change{

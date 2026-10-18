@@ -1,11 +1,13 @@
 import KeyActionDialog, { type KeyAction } from "../components/KeyActionDialog";
 import QuotaResetDialog from "../components/QuotaResetDialog";
+import BalanceDialog from "../components/BalanceDialog";
+import { balanceOf, isBalanceKey } from "../components/BalanceUsage";
 import { extractApiError } from "../api/error";
 import { keyListReturnPath } from "../navigation";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import { useLocation, useNavigate, useParams } from "react-router-dom";
 import { listKeys, patchKey } from "../api/keys";
-import KeyForm, { keyWriteRequestFromForm, type KeyFormValues } from "../components/KeyForm";
+import KeyForm, { keyWriteRequestFromForm } from "../components/KeyForm";
 import KeyMoreMenu, { type KeyMoreMenuItem } from "../components/KeyMoreMenu";
 import { MobileFormHeader, MobileTabBar } from "../components/MobileChrome";
 import PlainKeyModal from "../components/PlainKeyModal";
@@ -13,11 +15,6 @@ import { useT } from "../i18n";
 import type { KeyPublic } from "../types";
 
 const EDIT_RESET_ITEMS: KeyMoreMenuItem[] = ["rpm"];
-
-interface ReturnedModelState {
-  createdModel?: string;
-  draftKey?: KeyFormValues;
-}
 
 export default function KeyEdit() {
   const { id } = useParams<{ id: string }>();
@@ -32,6 +29,7 @@ export default function KeyEdit() {
   const [plainTitle, setPlainTitle] = useState("");
   const [pendingAction, setPendingAction] = useState<KeyAction | null>(null);
   const [showReset, setShowReset] = useState(false);
+  const [showBalance, setShowBalance] = useState(false);
 
   useEffect(() => {
     let alive = true;
@@ -52,19 +50,8 @@ export default function KeyEdit() {
     return () => { alive = false; };
   }, [id, t]);
 
-  const returned = location.state as ReturnedModelState | null;
-  const initial = useMemo<KeyPublic | null>(() => {
-    if (!key) return null;
-    if (!returned?.draftKey) return key;
-    const models = [...returned.draftKey.models];
-    if (returned.createdModel && !models.some((model) => model.name.toLowerCase() === returned.createdModel?.toLowerCase())) {
-      models.push({ name: returned.createdModel, daily_limit_usd: 0 });
-    }
-    return { ...key, ...returned.draftKey, id: key.id, models };
-  }, [key, returned]);
-
   if (loading) return <div className="muted">{t("keys.loading")}</div>;
-  if (error || !key || !initial) return <div className="error">{error || t("edit.notFound")}</div>;
+  if (error || !key) return <div className="error">{error || t("edit.notFound")}</div>;
 
   const refreshUsage = async () => {
     const refreshed = (await listKeys()).find((candidate) => candidate.id === key.id);
@@ -83,16 +70,16 @@ export default function KeyEdit() {
       <div className="fp-idline mobile-hidden">{key.id}<span className="fp-name">{key.name}</span></div>
       <MobileFormHeader title={title} backTo={backTo} />
       <div className="key-edit-operations">
-        <button className="btn sm" onClick={() => setShowReset(true)}>{t("quota.resetTitle")}</button>
+        {isBalanceKey(key)
+          ? <button className="btn sm" onClick={() => setShowBalance(true)}>{t("balance.adjust")}</button>
+          : <button className="btn sm" onClick={() => setShowReset(true)}>{t("quota.resetTitle")}</button>}
         <button className="btn sm" onClick={() => setPendingAction("rotate")}>{t("keys.resetKey")}</button>
         <KeyMoreMenu keyId={key.id} items={EDIT_RESET_ITEMS} onResetComplete={refreshUsage} />
       </div>
       <KeyForm
-        initial={initial}
+        initial={key}
         idReadOnly
         showCurrentUsage
-        returnPath={`/keys/${encodeURIComponent(key.id)}/edit`}
-        keyListReturnTo={backTo}
         submitLabel={t("edit.save")}
         onCancel={() => navigate(backTo)}
         dangerLabel={t("keys.delete")}
@@ -103,7 +90,8 @@ export default function KeyEdit() {
         }}
       />
       {showReset && <QuotaResetDialog keyId={key.id} onClose={() => setShowReset(false)} onComplete={refreshUsage} />}
-      {pendingAction && <KeyActionDialog keyId={key.id} action={pendingAction} onClose={() => setPendingAction(null)} onComplete={(result) => {
+      {showBalance && <BalanceDialog keyId={key.id} onClose={() => setShowBalance(false)} onComplete={refreshUsage} />}
+      {pendingAction && <KeyActionDialog keyId={key.id} balanceUSD={key.usage.balance_usd === undefined ? undefined : balanceOf(key.usage).balance} action={pendingAction} onClose={() => setPendingAction(null)} onComplete={(result) => {
         if (result) {
           setKey(result.key);
           setPlain(result.plain_key);

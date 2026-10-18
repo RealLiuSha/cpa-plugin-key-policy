@@ -1,10 +1,16 @@
 import { keyListReturnPath } from "../navigation";
 import QuotaUsage from "../components/QuotaUsage";
+import BalanceUsage from "../components/BalanceUsage";
+import BalanceDialog from "../components/BalanceDialog";
+import BalanceHistory from "../components/BalanceHistory";
+import UnpricedBadge from "../components/UnpricedBadge";
+import UsageChart from "../components/UsageChart";
 import { useEffect, useState } from "react";
 import { Link, useLocation, useParams } from "react-router-dom";
 import { fetchKeyHistory, fetchKeyUsage } from "../api/keys";
 import { extractApiError } from "../api/error";
-import type { KeyHistoryResponse, KeyUsageResponse, ModelUsageEntry, UsageWindow } from "../types";
+import { formatCount, formatHitRate, formatUSD } from "../format";
+import type { KeyHistoryResponse, KeyUsageResponse, ModelUsageEntry, UsageBucket, UsageHistoryDay, UsageWindow } from "../types";
 import { useT } from "../i18n";
 import { MobileTabBar } from "../components/MobileChrome";
 
@@ -12,24 +18,33 @@ import { MobileTabBar } from "../components/MobileChrome";
 // daily, 7-day and 30-day quota periods; the selected period applies to all rows.
 type Window = "daily" | "weekly" | "monthly";
 
-function fmtUsd(n: number): string {
-  return "$" + (Number.isFinite(n) ? n.toFixed(2) : "0.00");
+export const HISTORY_RANGES = [7, 30, 90] as const;
+export type HistoryRange = (typeof HISTORY_RANGES)[number];
+export const DEFAULT_HISTORY_RANGE: HistoryRange = 30;
+
+const BUCKET_FIELDS = [
+  "total_usd", "call_count", "unpriced_calls", "input_tokens", "output_tokens",
+  "cache_read_tokens", "cache_cost_usd", "cache_write_tokens", "cache_write_usd",
+] as const satisfies readonly (keyof UsageBucket)[];
+
+export interface ModelRangeTotal {
+  name: string;
+  usage: Required<UsageBucket>;
 }
 
-// Compact integer formatting with thousands separators. 0 shows as "0".
-function fmtInt(n: number): string {
-  if (!n || n <= 0) return "0";
-  return Math.round(n).toLocaleString("en-US");
-}
-
-// Hit-rate = cacheRead / (cacheRead + input), expressed as a percentage.
-// Returns "—" when there's no input activity for the window (avoid 0/0).
-function hitRate(w: UsageWindow): string {
-  const cr = w.cache_read_tokens ?? 0;
-  const inp = w.input_tokens ?? 0;
-  const denom = cr + inp;
-  if (denom <= 0) return "—";
-  return Math.round((cr / denom) * 100) + "%";
+// The range's per-model totals, summed from each day's by_model buckets;
+// the most expensive model first.
+export function sumHistoryByModel(days: UsageHistoryDay[]): ModelRangeTotal[] {
+  const totals = new Map<string, Required<UsageBucket>>();
+  for (const day of days) {
+    for (const [name, bucket] of Object.entries(day.by_model ?? {})) {
+      const sum = totals.get(name) ?? Object.fromEntries(BUCKET_FIELDS.map((field) => [field, 0])) as Required<UsageBucket>;
+      for (const field of BUCKET_FIELDS) sum[field] += bucket[field] ?? 0;
+      totals.set(name, sum);
+    }
+  }
+  return [...totals].map(([name, usage]) => ({ name, usage }))
+    .sort((a, b) => b.usage.total_usd - a.usage.total_usd || a.name.localeCompare(b.name));
 }
 
 // Billing-mode tag, reusing the existing .tag styling. Per-call rows use a
@@ -44,88 +59,148 @@ function BillingTag({ mode }: { mode?: string }) {
   );
 }
 
-// The chart's own axes: the dollar scale on the left (top = the larger of the
-// daily limit and the busiest day) and every fifth date along the bottom.
-export function UsageHistoryChart({ history, dailyLimit }: { history: KeyHistoryResponse | null; dailyLimit: number }) {
+function ModelRangeTable({ models, days }: { models: ModelRangeTotal[]; days: number }) {
   const t = useT();
-  const days = history?.days ?? [];
-  const width = 640;
-  const height = 196;
-  const left = 52;
-  const plotTop = 12;
-  const plotBottom = 160;
-  const plotHeight = plotBottom - plotTop;
-  const plotWidth = width - left;
-  const maxValue = Math.max(dailyLimit, ...days.map((day) => day.total_usd ?? 0)) || 1;
-  const slot = days.length > 0 ? plotWidth / days.length : plotWidth;
-  const limitY = plotBottom - (dailyLimit / maxValue) * plotHeight;
+  const maxUsd = Math.max(1, ...models.map((model) => model.usage.total_usd));
+  return (
+    <section className="usage-range-models" data-testid="usage-range-models">
+      <h2 className="usage-section-title">{t("keyUsage.rangeModelsTitle", { days })}</h2>
+      <div className="card table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>{t("keyUsage.colModel")}</th>
+              <th className="num">{t("keyUsage.colUsd")}</th>
+              <th className="num">{t("keyUsage.colCalls")}</th>
+              <th className="num">{t("keyUsage.colInput")}</th>
+              <th className="num">{t("keyUsage.colOutput")}</th>
+              <th className="num">{t("keyUsage.colCacheRead")}</th>
+              <th className="num">{t("keyUsage.colCacheWrite")}</th>
+              <th className="num">{t("keyUsage.colHitRate")}</th>
+            </tr>
+          </thead>
+          <tbody>
+            {models.length === 0 ? (
+              <tr><td colSpan={8} className="muted keyusage-no-model">{t("keyUsage.rangeEmpty")}</td></tr>
+            ) : models.map(({ name, usage }) => (
+              <tr key={name}>
+                <td>
+                  <div className="mono">{name}</div>
+                  {usage.unpriced_calls > 0 && <UnpricedBadge calls={usage.unpriced_calls} />}
+                </td>
+                <td className="num strong">{formatUSD(usage.total_usd)}</td>
+                <td className="num mono">{formatCount(usage.call_count)}</td>
+                <td className="num mono">{formatCount(usage.input_tokens)}</td>
+                <td className="num mono">{formatCount(usage.output_tokens)}</td>
+                <td className="num mono">{formatCount(usage.cache_read_tokens)} / {formatUSD(usage.cache_cost_usd)}</td>
+                <td className="num mono">{formatCount(usage.cache_write_tokens)} / {formatUSD(usage.cache_write_usd)}</td>
+                <td className="num mono">{formatHitRate(usage.cache_read_tokens, usage.input_tokens)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <div className="mobile-only">
+        <div className="bar-rank">
+          {models.length === 0 ? <div className="muted">{t("keyUsage.rangeEmpty")}</div> : models.map(({ name, usage }) => (
+            <div key={name} className="br-row">
+              <div className="br-top">
+                <span className="br-name">{name}</span>
+                <span className="br-usd">{formatUSD(usage.total_usd)}</span>
+              </div>
+              <div className="br-bar"><span style={{ width: Math.max(2, (usage.total_usd / maxUsd) * 100) + "%" }} /></div>
+              <div className="br-cap">
+                {t("keys.mobile.callCount", { n: formatCount(usage.call_count) })} · {t("keyUsage.mobile.inputTok")} {formatCount(usage.input_tokens)} · {t("keyUsage.mobile.outputTok")} {formatCount(usage.output_tokens)}
+                {usage.unpriced_calls > 0 && <> <UnpricedBadge calls={usage.unpriced_calls} /></>}
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    </section>
+  );
+}
+
+// The 7/30/90-day history card and the range's per-model totals. Switching the
+// range reloads only the history; a failure stays inside this section.
+function UsageHistorySection({ keyId, dailyLimit }: { keyId: string; dailyLimit: number }) {
+  const t = useT();
+  const [range, setRange] = useState<HistoryRange>(DEFAULT_HISTORY_RANGE);
+  const [loaded, setLoaded] = useState<{ range: HistoryRange; history: KeyHistoryResponse } | null>(null);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    let alive = true;
+    setError("");
+    fetchKeyHistory(keyId, range)
+      .then((history) => { if (alive) setLoaded({ range, history }); })
+      .catch((reason) => { if (alive) setError(extractApiError(reason, t("keyUsage.historyLoadFailed"))); });
+    return () => { alive = false; };
+  }, [keyId, range, t]);
+
+  const days = loaded?.history.days ?? [];
+  const shownRange = loaded?.range ?? range;
   const total = days.reduce((sum, day) => sum + (day.total_usd ?? 0), 0);
   return (
-    <div className="card usage-history-card" data-testid="usage-history-chart">
-      <div className="usage-history-title">
-        <strong>{t("keyUsage.historyTitle")}</strong>
-        <span className="muted">{t("keyUsage.historyTotal", { amount: fmtUsd(total) })} · {history?.timezone ?? "Asia/Shanghai"}</span>
-      </div>
-      <svg viewBox={`0 0 ${width} ${height}`} role="img" aria-label={t("keyUsage.historyTitle")}>
-        <text x={left - 6} y={plotTop + 4} textAnchor="end" className="usage-chart-label">{fmtUsd(maxValue)}</text>
-        <text x={left - 6} y={plotBottom} textAnchor="end" className="usage-chart-label">$0</text>
-        <line x1={left} x2={width} y1={plotBottom} y2={plotBottom} className="usage-chart-axis" />
-        {dailyLimit > 0 && (
-          <line x1={left} x2={width} y1={limitY} y2={limitY} className="usage-chart-limit" data-testid="usage-history-limit-line">
-            <title>{t("keyUsage.dailyLimitLine", { amount: fmtUsd(dailyLimit) })}</title>
-          </line>
+    <>
+      <section className="card usage-history-card" data-testid="usage-history-chart">
+        <div className="usage-history-title">
+          <div>
+            <strong>{t("keyUsage.historyTitle", { days: shownRange })}</strong>
+            <span className="muted"> · {t("keyUsage.historyTotal", { amount: formatUSD(total) })} · {loaded?.history.timezone ?? "Asia/Shanghai"}</span>
+          </div>
+          <div className="seg usage-range-switch" role="group" aria-label={t("keyUsage.rangeLabel")}>
+            {HISTORY_RANGES.map((option) => (
+              <button key={option} type="button" className={"seg-btn" + (range === option ? " active" : "")} aria-pressed={range === option} onClick={() => setRange(option)}>
+                {t("usage.rangeDays", { days: option })}
+              </button>
+            ))}
+          </div>
+        </div>
+        {error ? <div className="error" role="alert">{error}</div> : loaded === null ? <div className="muted" role="status">{t("keyUsage.loading")}</div> : (
+          <UsageChart
+            points={days.map((day) => ({ date: day.date, usd: day.total_usd ?? 0, calls: day.call_count ?? 0 }))}
+            label={t("keyUsage.historyTitle", { days: days.length })}
+            limit={{ usd: dailyLimit, label: t("keyUsage.dailyLimitLine", { amount: formatUSD(dailyLimit) }) }}
+          />
         )}
-        {days.map((day, index) => {
-          const value = day.total_usd ?? 0;
-          const barHeight = (value / maxValue) * plotHeight;
-          const x = left + index * slot;
-          return (
-            <g key={day.date}>
-              <rect x={x + slot * 0.16} y={plotBottom - barHeight} width={Math.max(1, slot * 0.68)} height={barHeight} className="usage-chart-bar">
-                <title>{day.date}: {fmtUsd(value)} · {t("keys.mobile.callCount", { n: fmtInt(day.call_count ?? 0) })}</title>
-              </rect>
-              {(index % 5 === 0 || index === days.length - 1) && (
-                <text x={index === days.length - 1 ? width : x + slot / 2} y={height - 18} textAnchor={index === days.length - 1 ? "end" : "middle"} className="usage-chart-label">{day.date.slice(5)}</text>
-              )}
-            </g>
-          );
-        })}
-      </svg>
-    </div>
+        {loaded !== null && loaded.range !== range && !error && <div className="muted" role="status">{t("keyUsage.loading")}</div>}
+      </section>
+      {loaded !== null && <ModelRangeTable models={sumHistoryByModel(days)} days={shownRange} />}
+    </>
   );
 }
 
 export default function KeyUsage() {
   const { id } = useParams<{ id: string }>();
-  const backTo = keyListReturnPath(useLocation().state);
+  const location = useLocation();
+  const backTo = keyListReturnPath(location.state);
+  // Set when a new balance key was created but its initial balance failed.
+  const notice = (location.state as { notice?: unknown } | null)?.notice;
   const t = useT();
   const [data, setData] = useState<KeyUsageResponse | null>(null);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
   const [win, setWin] = useState<Window>("daily");
-  const [history, setHistory] = useState<KeyHistoryResponse | null>(null);
+  const [showBalance, setShowBalance] = useState(false);
+  const [version, setVersion] = useState(0);
+  const keyId = decodeURIComponent(id ?? "");
 
   useEffect(() => {
     let alive = true;
     (async () => {
-      setLoading(true);
+      // A reload after a balance adjustment keeps the page on screen.
+      if (version === 0) setLoading(true);
       setError("");
       try {
-        const keyId = decodeURIComponent(id ?? "");
         if (!keyId) {
           setError(t("keyUsage.notFound"));
           return;
         }
-        const [usage, usageHistory] = await Promise.all([
-          fetchKeyUsage(keyId),
-          fetchKeyHistory(keyId, 30),
-        ]);
-        if (alive) {
-          setData(usage);
-          setHistory(usageHistory);
-        }
+        const usage = await fetchKeyUsage(keyId);
+        if (alive) setData(usage);
       } catch (e) {
-        setError(extractApiError(e, t("keyUsage.loadFailed")));
+        if (alive) setError(extractApiError(e, t("keyUsage.loadFailed")));
       } finally {
         if (alive) setLoading(false);
       }
@@ -134,33 +209,25 @@ export default function KeyUsage() {
       alive = false;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [id]);
+  }, [keyId, version]);
 
   if (loading) return <div className="muted">{t("keyUsage.loading")}</div>;
   if (error || !data) return <div className="error">{error || t("keyUsage.notFound")}</div>;
 
   const models = data.models ?? [];
-  const hasUsage = models.some((model) =>
-    (model.daily.call_count ?? 0) > 0
-    || (model.weekly.call_count ?? 0) > 0
-    || (model.monthly?.call_count ?? 0) > 0
-    || (model.daily.total_usd ?? 0) > 0
-    || (model.weekly.total_usd ?? 0) > 0
-    || (model.monthly?.total_usd ?? 0) > 0,
-  );
-
+  const prepaid = data.usage.quota_mode === "balance";
   const windowOf = (model: ModelUsageEntry): UsageWindow => (
-    win === "daily" ? model.daily : win === "weekly" ? model.weekly : (model.monthly ?? { total_usd: 0 })
+    win === "daily" ? model.daily : win === "weekly" ? model.weekly : model.monthly
   );
 
-  // Mobile hero totals: sum across public models for the active window.
+  // Mobile hero totals: sum across models for the active window.
   const heroUsd = models.reduce((sum, model) => sum + (windowOf(model).total_usd ?? 0), 0);
   const heroCalls = models.reduce((sum, model) => sum + (windowOf(model).call_count ?? 0), 0);
   const heroInput = models.reduce((sum, model) => sum + (windowOf(model).input_tokens ?? 0), 0);
   const heroOutput = models.reduce((sum, model) => sum + (windowOf(model).output_tokens ?? 0), 0);
   const heroLimit = win === "daily"
     ? data.daily_limit_usd
-    : win === "weekly" ? data.weekly_limit_usd : (data.monthly_limit_usd ?? 0);
+    : win === "weekly" ? data.weekly_limit_usd : data.monthly_limit_usd;
   const heroPct = heroLimit > 0 ? Math.min(100, (heroUsd / heroLimit) * 100) : 0;
   const maxModelUsd = Math.max(1, ...models.map((model) => windowOf(model).total_usd ?? 0));
 
@@ -196,7 +263,7 @@ export default function KeyUsage() {
             className={"seg-btn " + (win === "weekly" ? "active" : "")}
             onClick={() => setWin("weekly")}
           >
-            {t("keyUsage.tabWeekly")}
+            {t(prepaid ? "balance.tabWeekly" : "keyUsage.tabWeekly")}
           </button>
           <button
             role="tab"
@@ -204,16 +271,24 @@ export default function KeyUsage() {
             className={"seg-btn " + (win === "monthly" ? "active" : "")}
             onClick={() => setWin("monthly")}
           >
-            {t("keyUsage.tabMonthly")}
+            {t(prepaid ? "balance.tabMonthly" : "keyUsage.tabMonthly")}
           </button>
         </div>
       </div>
 
-      {data.usage && <section className="card quota-detail"><h2>{t("quota.currentPeriods")}</h2><QuotaUsage usage={data.usage} all /></section>}
-      <UsageHistoryChart history={history} dailyLimit={data.daily_limit_usd} />
+      {typeof notice === "string" && notice && <div className="notice warn" role="alert">{notice}</div>}
+      {prepaid ? (
+        <section className="card quota-detail balance-detail">
+          <div className="balance-detail-head"><h2>{t("balance.current")}</h2><button type="button" className="btn sm primary" onClick={() => setShowBalance(true)}>{t("balance.adjust")}</button></div>
+          <BalanceUsage usage={data.usage} />
+          <BalanceHistory keyId={data.key_id} version={version} />
+        </section>
+      ) : <section className="card quota-detail"><h2>{t("quota.currentPeriods")}</h2><QuotaUsage usage={data.usage} all /></section>}
+      {showBalance && <BalanceDialog keyId={data.key_id} onClose={() => setShowBalance(false)} onComplete={() => setVersion((value) => value + 1)} />}
+      <UsageHistorySection keyId={data.key_id} dailyLimit={data.daily_limit_usd} />
 
+      <h2 className="usage-section-title mobile-hidden">{t(prepaid ? "balance.periodModelsTitle" : "keyUsage.periodModelsTitle")}</h2>
       <div className="card table-wrap">
-        {!hasUsage && <div className="muted keyusage-empty">{t("keyUsage.empty")}</div>}
         <table>
           <thead>
             <tr>
@@ -239,21 +314,21 @@ export default function KeyUsage() {
               models.map((model) => {
                 const w = windowOf(model);
                 return (
-                  <tr key={model.name} className={model.in_config ? "" : "keyusage-residual"}>
+                  <tr key={model.name}>
                     <td>
                       <div className="mono">{model.name}</div>
-                      {!model.in_config && <span className="keyusage-badge">{t("keyUsage.notInConfig")}</span>}
+                      {!model.priced && <UnpricedBadge />}
                     </td>
                     <td>
                       <BillingTag mode={model.billing_mode} />
                     </td>
-                    <td className="num strong">{fmtUsd(w.total_usd ?? 0)}</td>
-                    <td className="num mono">{fmtInt(w.call_count ?? 0)}</td>
-                    <td className="num mono">{fmtInt(w.input_tokens ?? 0)}</td>
-                    <td className="num mono">{fmtInt(w.output_tokens ?? 0)}</td>
-                    <td className="num mono">{fmtInt(w.cache_read_tokens ?? 0)} / {fmtUsd(w.cache_cost_usd ?? 0)}</td>
-                    <td className="num mono">{fmtInt(w.cache_write_tokens ?? 0)} / {fmtUsd(w.cache_write_usd ?? 0)}</td>
-                    <td className="num mono">{hitRate(w)}</td>
+                    <td className="num strong">{formatUSD(w.total_usd ?? 0)}</td>
+                    <td className="num mono">{formatCount(w.call_count ?? 0)}</td>
+                    <td className="num mono">{formatCount(w.input_tokens ?? 0)}</td>
+                    <td className="num mono">{formatCount(w.output_tokens ?? 0)}</td>
+                    <td className="num mono">{formatCount(w.cache_read_tokens ?? 0)} / {formatUSD(w.cache_cost_usd ?? 0)}</td>
+                    <td className="num mono">{formatCount(w.cache_write_tokens ?? 0)} / {formatUSD(w.cache_write_usd ?? 0)}</td>
+                    <td className="num mono">{formatHitRate(w.cache_read_tokens ?? 0, w.input_tokens ?? 0)}</td>
                   </tr>
                 );
               })
@@ -264,10 +339,10 @@ export default function KeyUsage() {
               <tr className="keyusage-total">
                 <td>{t("keyUsage.total")}</td>
                 <td />
-                <td className="num strong">{fmtUsd(heroUsd)}</td>
-                <td className="num mono">{fmtInt(heroCalls)}</td>
-                <td className="num mono">{fmtInt(heroInput)}</td>
-                <td className="num mono">{fmtInt(heroOutput)}</td>
+                <td className="num strong">{formatUSD(heroUsd)}</td>
+                <td className="num mono">{formatCount(heroCalls)}</td>
+                <td className="num mono">{formatCount(heroInput)}</td>
+                <td className="num mono">{formatCount(heroOutput)}</td>
                 <td colSpan={3} />
               </tr>
             </tfoot>
@@ -281,7 +356,7 @@ export default function KeyUsage() {
           <div className="uh-label">
             {win === "daily" ? t("keyUsage.mobile.today") : win === "weekly" ? t("keyUsage.mobile.last7Days") : t("keyUsage.mobile.last30Days")}
           </div>
-          <div className="uh-amount">{fmtUsd(heroUsd)}<span className="uh-unit">USD</span></div>
+          <div className="uh-amount">{formatUSD(heroUsd)}<span className="uh-unit">USD</span></div>
           <div className="uh-row">
             <div className="uh-ring">
               <svg width="64" height="64" viewBox="0 0 64 64">
@@ -293,18 +368,18 @@ export default function KeyUsage() {
               <span className="uh-pct">{Math.round(heroPct)}%</span>
             </div>
             <div className="uh-limits">
-              <div><span className="uh-lk">{t("keyUsage.mobile.limit")}</span> <span className="uh-lv">{heroLimit > 0 ? fmtUsd(heroLimit) : t("keyUsage.mobile.noLimit")}</span></div>
-              <div><span className="uh-lk">{t("keyUsage.mobile.remaining")}</span> <span className="uh-lv">{heroLimit > 0 ? fmtUsd(Math.max(0, heroLimit - heroUsd)) : "—"}</span></div>
+              <div><span className="uh-lk">{t("keyUsage.mobile.limit")}</span> <span className="uh-lv">{heroLimit > 0 ? formatUSD(heroLimit) : t("keyUsage.mobile.noLimit")}</span></div>
+              <div><span className="uh-lk">{t("keyUsage.mobile.remaining")}</span> <span className="uh-lv">{heroLimit > 0 ? formatUSD(Math.max(0, heroLimit - heroUsd)) : "—"}</span></div>
             </div>
           </div>
           <div className="uh-stats">
-            <span>{t("keyUsage.mobile.calls")} {fmtInt(heroCalls)}</span>
-            <span>{t("keyUsage.mobile.inputTok")} {fmtInt(heroInput)}</span>
-            <span>{t("keyUsage.mobile.outputTok")} {fmtInt(heroOutput)}</span>
+            <span>{t("keyUsage.mobile.calls")} {formatCount(heroCalls)}</span>
+            <span>{t("keyUsage.mobile.inputTok")} {formatCount(heroInput)}</span>
+            <span>{t("keyUsage.mobile.outputTok")} {formatCount(heroOutput)}</span>
           </div>
         </div>
 
-        <div className="section-label">{t("keyUsage.mobile.byModel")}</div>
+        <div className="section-label">{t("keyUsage.periodModelsTitle")}</div>
         <div className="bar-rank">
           {models.length === 0 ? (
             <div className="muted">{t("keyUsage.noModel")}</div>
@@ -314,14 +389,15 @@ export default function KeyUsage() {
             const w2 = Math.max(2, (usd / maxModelUsd) * 100);
             const perCall = model.billing_mode === "per_call";
             return (
-              <div key={model.name} className={"br-row" + (model.in_config ? "" : " br-residual")}>
+              <div key={model.name} className="br-row">
                 <div className="br-top">
-                  <span className="br-name">{model.name}{!model.in_config && <span className="br-badge">!</span>}</span>
-                  <span className="br-usd">{fmtUsd(usd)}</span>
+                  <span className="br-name">{model.name}</span>
+                  <span className="br-usd">{formatUSD(usd)}</span>
                 </div>
                 <div className="br-bar"><span style={{ width: w2 + "%" }} /></div>
                 <div className="br-cap">
-                  {perCall ? t("keyUsage.billingPerCall") : t("keyUsage.billingTokens")} · {t("keys.mobile.callCount", { n: fmtInt(w.call_count ?? 0) })}
+                  {perCall ? t("keyUsage.billingPerCall") : t("keyUsage.billingTokens")} · {t("keys.mobile.callCount", { n: formatCount(w.call_count ?? 0) })}
+                  {!model.priced && <> <UnpricedBadge /></>}
                 </div>
               </div>
             );

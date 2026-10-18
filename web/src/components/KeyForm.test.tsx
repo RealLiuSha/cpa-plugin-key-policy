@@ -2,35 +2,14 @@ import { act } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createRoot } from "react-dom/client";
 import { Simulate } from "react-dom/test-utils";
-import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
-import type { KeyPublic, ModelDefinition } from "../types";
+import type { KeyPublic } from "../types";
 
 (globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
-vi.mock("../api/modelDefinitions", () => ({ fetchModelDefinitions: vi.fn() }));
-const { translate } = vi.hoisted(() => ({ translate: (key: string) => key }));
+const { translate } = vi.hoisted(() => ({ translate: (key: string, vars?: Record<string, string | number>) => key + (vars ? ` ${Object.values(vars).join(" ")}` : "") }));
 vi.mock("../i18n", () => ({ useT: () => translate }));
 
-import { fetchModelDefinitions } from "../api/modelDefinitions";
 import KeyForm, { keyWriteRequestFromForm, type KeyFormValues } from "./KeyForm";
-
-const definitions: ModelDefinition[] = [
-  {
-    name: "fast",
-    provider: "codex",
-    target_model: "gpt-5",
-    billing_mode: "tokens",
-    input_price_per_million: 1,
-    output_price_per_million: 2,
-    cache_read_price_per_million: 0.2,
-  },
-  {
-    name: "community",
-    provider: "openai",
-    target_model: "small",
-    billing_mode: "tokens",
-  },
-];
 
 const initial: KeyPublic = {
   id: "team-a",
@@ -38,11 +17,10 @@ const initial: KeyPublic = {
   enabled: true,
   key_preview: "cpa_te...am-a",
   rpm: 60,
-  models: [{ name: "fast", daily_limit_usd: 2 }],
   daily_limit_usd: 10,
-  weekly_limit_usd: 50,
+  weekly_limit_usd: 0,
   monthly_limit_usd: 100,
-  usage: { daily_usd: 1, weekly_usd: 2, daily_limit_usd: 10, weekly_limit_usd: 50 },
+  usage: { daily_usd: 1, weekly_usd: 2.5, monthly_usd: 0.0042, daily_limit_usd: 10, weekly_limit_usd: 0, monthly_limit_usd: 100 },
 };
 
 const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
@@ -53,7 +31,6 @@ beforeEach(() => {
   container = document.createElement("div");
   document.body.appendChild(container);
   root = undefined;
-  vi.mocked(fetchModelDefinitions).mockResolvedValue(definitions);
 });
 
 afterEach(() => {
@@ -95,19 +72,42 @@ function scanColumnRuleConflicts(css: string): { columnRuleCount: number; confli
   return { columnRuleCount: columnRules.length, conflictingSelectors };
 }
 
-describe("KeyForm current model references", () => {
-  it("keeps the shared card layout and field hints wired", async () => {
-    await act(async () => {
-      root = createRoot(container);
-      root.render(<MemoryRouter><KeyForm initial={initial} showCurrentUsage submitLabel="save" onCancel={() => {}} onSubmit={async () => {}} /></MemoryRouter>);
-    });
-    await flush();
+async function renderForm(onSubmit: (values: KeyFormValues) => Promise<void> = async () => {}) {
+  await act(async () => {
+    root = createRoot(container);
+    root.render(<KeyForm initial={initial} showCurrentUsage submitLabel="save" onCancel={() => {}} onSubmit={onSubmit} />);
+  });
+  await flush();
+}
 
+async function submit() {
+  await act(async () => {
+    container.querySelector("form")!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+    await tick();
+  });
+}
+
+describe("KeyForm", () => {
+  it("keeps the shared card layout, field hints and current usage wired", async () => {
+    await renderForm();
     expect(container.querySelector("form.key-form")?.classList.contains("card")).toBe(true);
     expect(container.querySelector<HTMLInputElement>('input[placeholder="keyForm.idPlaceholder"]')).not.toBeNull();
     expect(container.querySelector<HTMLInputElement>('input[placeholder="keyForm.namePlaceholder"]')).not.toBeNull();
     expect(container.textContent).toContain("keyForm.statusLabel");
-    expect(container.textContent).toContain("keyForm.currentUsage");
+    expect(container.textContent).toContain("keyForm.currentUsage $1.00");
+    expect(container.textContent).toContain("keyForm.currentUsage $2.50");
+    expect(container.textContent).toContain("keyForm.currentUsage $0.0042");
+  });
+
+  it("offers no model grants or /v1/models switch and marks a 0 limit as unlimited", async () => {
+    await renderForm();
+    expect(container.querySelectorAll('input[type="checkbox"]')).toHaveLength(1);
+    expect(container.textContent).not.toContain("models");
+    const unlimited = [...container.querySelectorAll(".field-label")].filter((label) => label.querySelector(".badge")?.textContent === "keyForm.unlimited");
+    expect(unlimited.map((label) => label.firstChild?.textContent)).toEqual(["keyForm.weeklyLimitLabel"]);
+    const daily = container.querySelectorAll<HTMLInputElement>('.form-grid input[type="number"]')[1];
+    await act(async () => Simulate.change(daily, { target: { value: "0" } } as never));
+    expect(container.querySelectorAll(".field-label .badge")).toHaveLength(2);
   });
 
   it("keeps checkbox rows outside every column-flow rule, including nested media rules", async () => {
@@ -125,133 +125,102 @@ describe("KeyForm current model references", () => {
     expect(nestedMediaConflict.conflictingSelectors).toContain(".form-grid > label");
   });
 
-  it("builds one complete request without target or price fields", () => {
+  it("builds one complete request from the key fields only", () => {
     const request = keyWriteRequestFromForm({
       id: "team-a",
       name: " ",
       enabled: true,
       rpm: 60,
-      models: [{ name: "fast", daily_limit_usd: 3 }],
       daily_limit_usd: 10,
       weekly_limit_usd: 20,
       monthly_limit_usd: 30,
-      allow_models_endpoint: true,
+      quota_mode: "cycle",
+      initial_balance_usd: 0,
     });
     expect(request).toEqual({
       id: "team-a",
       name: undefined,
       enabled: true,
       rpm: 60,
-      models: [{ name: "fast", daily_limit_usd: 3 }],
+      quota_mode: "cycle",
       daily_limit_usd: 10,
       weekly_limit_usd: 20,
       monthly_limit_usd: 30,
-      allow_models_endpoint: true,
     });
-    expect(JSON.stringify(request)).not.toContain("target_model");
-    expect(JSON.stringify(request)).not.toContain("price_per_million");
   });
 
-  it("shows model prices read-only and submits selected names with per-model daily limits", async () => {
+  it("submits the edited values and generates an ID when none is given", async () => {
     let submitted: KeyFormValues | null = null;
     await act(async () => {
       root = createRoot(container);
-      root.render(<MemoryRouter><KeyForm initial={initial} submitLabel="save" onCancel={() => {}} onSubmit={async (values) => { submitted = values; }} /></MemoryRouter>);
+      root.render(<KeyForm submitLabel="save" onCancel={() => {}} onSubmit={async (values) => { submitted = values; }} />);
     });
-    await flush();
+    const rpm = container.querySelectorAll<HTMLInputElement>('.form-grid input[type="number"]')[0];
+    await act(async () => Simulate.change(rpm, { target: { value: "30" } } as never));
+    await submit();
+    expect(submitted).toMatchObject({ rpm: 30, enabled: true, daily_limit_usd: 0, weekly_limit_usd: 0, monthly_limit_usd: 0 });
+    expect(submitted!.id).toMatch(/^key-[0-9a-f]{8}$/);
+  });
 
-    expect(container.textContent).toContain("models.priceTokenSummary");
-    expect(container.textContent).toContain("models.unpriced");
-    const modelChecks = container.querySelectorAll<HTMLInputElement>(".model-definition-main input");
-    expect(modelChecks).toHaveLength(2);
-    expect(modelChecks[0].checked).toBe(true);
-    expect(modelChecks[1].checked).toBe(false);
+  it("sends a balance key without period limits", () => {
+    const request = keyWriteRequestFromForm({
+      id: "prepaid", name: "Prepaid", enabled: true, rpm: 0, daily_limit_usd: 10, weekly_limit_usd: 20, monthly_limit_usd: 30,
+      quota_mode: "balance", initial_balance_usd: 25,
+    });
+    expect(request).toEqual({ id: "prepaid", name: "Prepaid", enabled: true, rpm: 0, quota_mode: "balance" });
+  });
 
-    const fastLimit = container.querySelector<HTMLInputElement>(".model-limit-field input");
-    expect(fastLimit?.value).toBe("2");
+  it("switches a new key to a prepaid balance with a starting amount instead of period limits", async () => {
+    const onSubmit = vi.fn<(values: KeyFormValues) => Promise<void>>().mockResolvedValue();
     await act(async () => {
-      Simulate.change(fastLimit!, { target: { value: "3.5" } } as never);
-      modelChecks[1].click();
+      root = createRoot(container);
+      root.render(<KeyForm submitLabel="create" onSubmit={onSubmit} onCancel={vi.fn()} />);
     });
+    const modeButton = (mode: string) => [...container.querySelectorAll<HTMLButtonElement>('[role="radio"]')].find((item) => item.textContent === `balance.mode.${mode}`)!;
+    expect(container.textContent).toContain("keyForm.dailyLimitLabel");
+    await act(async () => { modeButton("balance").click(); });
+    expect(modeButton("balance").getAttribute("aria-checked")).toBe("true");
+    expect(container.textContent).not.toContain("keyForm.dailyLimitLabel");
+    expect(container.textContent).toContain("balance.modeHint.balance");
+    const startingBalance = [...container.querySelectorAll<HTMLInputElement>('input[type="number"]')].find((input) => input.closest("label")?.textContent?.includes("balance.initialLabel"))!;
+    await act(async () => Simulate.change(startingBalance, { target: { value: "25" } } as never));
     await act(async () => {
       container.querySelector("form")!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
       await tick();
     });
-
-    expect(submitted).not.toBeNull();
-    expect(submitted!.models).toEqual([
-      { name: "fast", daily_limit_usd: 3.5 },
-      { name: "community", daily_limit_usd: 0 },
-    ]);
-    expect(JSON.stringify(submitted!.models)).not.toContain("provider");
+    expect(onSubmit).toHaveBeenCalledWith(expect.objectContaining({ quota_mode: "balance", initial_balance_usd: 25 }));
   });
 
-  it("applies bulk model selection and clearing only to the visible result", async () => {
-    await act(async () => {
+  it("warns before an edit clears period limits or parks a balance", async () => {
+    const render = async (key: KeyPublic) => {
+      if (root) act(() => root?.unmount());
       root = createRoot(container);
-      root.render(<MemoryRouter><KeyForm initial={initial} submitLabel="save" onCancel={() => {}} onSubmit={async () => {}} /></MemoryRouter>);
-    });
-    await flush();
+      await act(async () => { root!.render(<KeyForm initial={key} idReadOnly submitLabel="save" onSubmit={vi.fn()} onCancel={vi.fn()} />); });
+    };
+    const modeButton = (mode: string) => [...container.querySelectorAll<HTMLButtonElement>('[role="radio"]')].find((item) => item.textContent === `balance.mode.${mode}`)!;
+    await render(initial);
+    expect(container.textContent).not.toContain("balance.switchClearsLimits");
+    await act(async () => { modeButton("balance").click(); });
+    const notice = container.querySelector('[role="alert"]')?.textContent ?? "";
+    expect(notice).toContain("balance.switchClearsLimits");
+    expect(notice).toContain("balance.switchEmptyBalance");
+    expect(container.textContent).not.toContain("balance.currentOnEdit");
 
-    const search = container.querySelector<HTMLInputElement>('input[placeholder="keyForm.searchModelsPlaceholder"]')!;
-    await act(async () => Simulate.change(search, { target: { value: "community" } } as never));
-    expect(container.querySelectorAll(".model-definition-row")).toHaveLength(1);
-    expect(container.textContent).toContain("community");
-
-    const selectAll = [...container.querySelectorAll<HTMLButtonElement>("button")].find((button) => button.textContent === "picker.selectAll")!;
-    await act(async () => selectAll.click());
-    expect(container.querySelector<HTMLInputElement>(".model-definition-main input")?.checked).toBe(true);
-
-    const selectedOnly = [...container.querySelectorAll<HTMLButtonElement>("button")].find((button) => button.textContent === "keyForm.showSelectedOnly")!;
-    await act(async () => selectedOnly.click());
-    expect(selectedOnly.getAttribute("aria-pressed")).toBe("true");
-    expect(selectAll.disabled).toBe(true);
-
-    const clearAll = [...container.querySelectorAll<HTMLButtonElement>("button")].find((button) => button.textContent === "picker.clearAll")!;
-    await act(async () => clearAll.click());
-    expect(container.textContent).toContain("keyForm.noModelMatch");
-    await act(async () => Simulate.change(search, { target: { value: "" } } as never));
-    const remaining = container.querySelectorAll<HTMLInputElement>(".model-definition-main input");
-    expect(remaining).toHaveLength(1);
-    expect(remaining[0].checked).toBe(true);
-    expect(container.textContent).toContain("fast");
+    const prepaid: KeyPublic = { ...initial, daily_limit_usd: 0, monthly_limit_usd: 0, quota_mode: "balance", usage: { ...initial.usage, quota_mode: "balance", balance_usd: 12.5, net_credited_usd: 20 } };
+    await render(prepaid);
+    expect(container.textContent).toContain("balance.currentOnEdit $12.50");
+    await act(async () => { modeButton("cycle").click(); });
+    expect(container.textContent).toContain("balance.switchKeepsBalance $12.50");
+    expect(container.textContent).toContain("keyForm.dailyLimitLabel");
   });
 
-  it("blocks negative total or model limits at the form boundary", async () => {
+  it("blocks a negative RPM or limit at the form boundary", async () => {
     const onSubmit = vi.fn();
-    await act(async () => {
-      root = createRoot(container);
-      root.render(<MemoryRouter><KeyForm initial={initial} submitLabel="save" onCancel={() => {}} onSubmit={onSubmit} /></MemoryRouter>);
-    });
-    await flush();
-    const fastLimit = container.querySelector<HTMLInputElement>(".model-limit-field input");
-    await act(async () => Simulate.change(fastLimit!, { target: { value: "-1" } } as never));
-    await act(async () => container.querySelector("form")!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })));
+    await renderForm(onSubmit);
+    const weekly = container.querySelectorAll<HTMLInputElement>('.form-grid input[type="number"]')[2];
+    await act(async () => Simulate.change(weekly, { target: { value: "-1" } } as never));
+    await submit();
     expect(onSubmit).not.toHaveBeenCalled();
-    expect(container.textContent).toContain("keyForm.modelLimitInvalid");
-  });
-
-  it("opens model creation with a safe return path and the complete key draft", async () => {
-    function Destination() {
-      const location = useLocation();
-      return <pre data-testid="destination">{JSON.stringify(location.state)}</pre>;
-    }
-    await act(async () => {
-      root = createRoot(container);
-      root.render(
-        <MemoryRouter initialEntries={["/keys/team-a/edit"]}>
-          <Routes>
-            <Route path="/keys/team-a/edit" element={<KeyForm initial={initial} returnPath="/keys/team-a/edit" submitLabel="save" onCancel={() => {}} onSubmit={async () => {}} />} />
-            <Route path="/models/new" element={<Destination />} />
-          </Routes>
-        </MemoryRouter>,
-      );
-    });
-    await flush();
-    const create = Array.from(container.querySelectorAll<HTMLButtonElement>("button")).find((button) => button.textContent === "keyForm.newModel");
-    await act(async () => create!.click());
-    const state = JSON.parse(container.querySelector('[data-testid="destination"]')!.textContent ?? "{}") as { returnTo: string; draftKey: KeyFormValues };
-    expect(state.returnTo).toBe("/keys/team-a/edit");
-    expect(state.draftKey).toMatchObject({ id: "team-a", models: [{ name: "fast", daily_limit_usd: 2 }] });
+    expect(container.textContent).toContain("keyForm.limitInvalid");
   });
 });

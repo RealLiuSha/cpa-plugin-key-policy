@@ -26,7 +26,7 @@ func TestAppendRotateAndQueryNewestFirst(t *testing.T) {
 	if _, err := os.Stat(path + ".4"); !os.IsNotExist(err) {
 		t.Fatalf("rotation exceeded configured backup count: %v", err)
 	}
-	events, err := log.Query("a", 4)
+	events, err := log.Query("a", "", 4)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -37,6 +37,33 @@ func TestAppendRotateAndQueryNewestFirst(t *testing.T) {
 		if events[index].TS.After(events[index-1].TS) {
 			t.Fatalf("events not newest first: %+v", events)
 		}
+	}
+}
+
+// The limit counts matching events, so a rare action is found behind a burst
+// of others, across rotated files.
+func TestQueryFiltersByActionBeforeTheLimit(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit.jsonl")
+	log := New(path, 400, 3)
+	base := time.Date(2026, 8, 8, 0, 0, 0, 0, time.UTC)
+	actions := []string{"adjust_balance", "update_key", "update_key", "update_key", "update_key", "update_key", "update_key", "update_key"}
+	for index, action := range actions {
+		if err := log.Append(Event{TS: base.Add(time.Duration(index) * time.Minute), Actor: "management-api", Action: action, KeyID: "a"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := os.Stat(path + ".1"); err != nil {
+		t.Fatalf("rotation backup missing: %v", err)
+	}
+	events, err := log.Query("", "adjust_balance", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 || events[0].Action != "adjust_balance" || !events[0].TS.Equal(base) {
+		t.Fatalf("action filter = %+v, want the one adjust_balance event", events)
+	}
+	if events, _ := log.Query("b", "adjust_balance", 2); len(events) != 0 {
+		t.Fatalf("key and action filters combine: %+v", events)
 	}
 }
 

@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"cpa-key-policy/internal/policy"
 )
@@ -35,186 +36,174 @@ func TestNewAppDoesNotWriteStateBeforeConfigure(t *testing.T) {
 	}
 }
 
-func nearly(a, b float64) bool {
-	if a < 0 {
-		a = -a
+func TestRegistrationDeclaresRequestPathCapabilitiesOnly(t *testing.T) {
+	app := newTestApp(t, appOptions{})
+	var registration struct {
+		SchemaVersion uint32                     `json:"schema_version"`
+		Metadata      Metadata                   `json:"metadata"`
+		Capabilities  map[string]json.RawMessage `json:"capabilities"`
 	}
-	if b < 0 {
-		b = -b
-	}
-	return a < b+1e-9 && b < a+1e-9
-}
-
-func configureTestApp(t *testing.T) (*App, string) {
-	t.Helper()
-	app := NewApp()
-	plain := "cpa_plugin_test"
-	hash := hashForTest(t, plain)
-	yaml := []byte(`
-enabled: true
-state_file: "` + filepath.ToSlash(filepath.Join(t.TempDir(), "state.json")) + `"
-models:
-  - name: fast
-    free: true
-    targets:
-      - provider: codex
-        target_model: gpt-5-codex
-keys:
-  - id: team-a
-    name: Team A
-    enabled: true
-    key_hash: "` + hash + `"
-    key_preview: "cpa_plu..._test"
-    rpm: 60
-    models:
-      - name: fast
-`)
-	req, _ := json.Marshal(LifecycleRequest{ConfigYAML: yaml, SchemaVersion: SchemaVersion})
-	if _, err := app.HandleMethod(MethodPluginReconfigure, req); err != nil {
-		t.Fatalf("configure: %v", err)
-	}
-	return app, plain
-}
-
-func hashForTest(t *testing.T, key string) string {
-	t.Helper()
-	hash, err := policy.HashKey(key)
+	raw, err := json.Marshal(LifecycleRequest{ConfigYAML: []byte("enabled: true\nstate_file: \"" + filepath.ToSlash(app.store.StatePath()) + "\"\n"), SchemaVersion: SchemaVersion})
 	if err != nil {
 		t.Fatal(err)
 	}
-	return hash
-}
-
-func TestAppAuthenticationAndRoute(t *testing.T) {
-	app, plain := configureTestApp(t)
-	authReq, _ := json.Marshal(FrontendAuthRequest{
-		Method:  "POST",
-		Path:    "/v1/chat/completions",
-		Headers: http.Header{"Authorization": {"Bearer " + plain}},
-		Body:    []byte(`{"model":"fast"}`),
-	})
-	raw, err := app.HandleMethod(MethodFrontendAuthAuthenticate, authReq)
-	if err != nil {
-		t.Fatal(err)
+	decode(t, handle(t, app, MethodPluginReconfigure, raw), &registration)
+	if registration.SchemaVersion != 2 || registration.Metadata.Version != Version || registration.Metadata.GitHubRepository != "https://github.com/RealLiuSha/cpa-plugin-key-policy" {
+		t.Fatalf("registration metadata = %+v", registration.Metadata)
 	}
-	var env Envelope
-	if err := json.Unmarshal(raw, &env); err != nil {
-		t.Fatal(err)
+	for _, capability := range []string{"frontend_auth_provider", "request_interceptor", "usage_plugin", "management_api"} {
+		if string(registration.Capabilities[capability]) != "true" {
+			t.Fatalf("capability %s = %s", capability, registration.Capabilities[capability])
+		}
 	}
-	var authResp FrontendAuthResponse
-	if err := json.Unmarshal(env.Result, &authResp); err != nil {
-		t.Fatal(err)
+	for _, removed := range []string{"model_router", "response_interceptor"} {
+		if _, declared := registration.Capabilities[removed]; declared {
+			t.Fatalf("capability %s must no longer be declared: %v", removed, registration.Capabilities)
+		}
 	}
-	if !authResp.Authenticated || authResp.Principal != "team-a" {
-		t.Fatalf("auth response = %+v", authResp)
+	var fields []string
+	for _, field := range registration.Metadata.ConfigFields {
+		fields = append(fields, field.Name)
+		if strings.Contains(field.Description, "target_model") {
+			t.Fatalf("config field %s still describes routing: %q", field.Name, field.Description)
+		}
 	}
-
-	routeReq, _ := json.Marshal(ModelRouteRequest{
-		RequestedModel: "fast",
-		Headers:        http.Header{"Authorization": {"Bearer " + plain}},
-	})
-	raw, err = app.HandleMethod(MethodModelRoute, routeReq)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := json.Unmarshal(raw, &env); err != nil {
-		t.Fatal(err)
-	}
-	var routeResp ModelRouteResponse
-	if err := json.Unmarshal(env.Result, &routeResp); err != nil {
-		t.Fatal(err)
-	}
-	if !routeResp.Handled || routeResp.Target != "codex" || routeResp.TargetModel != "gpt-5-codex" {
-		t.Fatalf("route response = %+v", routeResp)
+	if strings.Join(fields, ",") != "enabled,state_file,usage_timezone,keys,models" {
+		t.Fatalf("config fields = %v", fields)
 	}
 }
 
-func TestAppModelsEndpointDenied(t *testing.T) {
-	app, plain := configureTestApp(t)
-	authReq, _ := json.Marshal(FrontendAuthRequest{
-		Method:  "GET",
-		Path:    "/v1/models",
-		Headers: http.Header{"Authorization": {"Bearer " + plain}},
-	})
-	raw, err := app.HandleMethod(MethodFrontendAuthAuthenticate, authReq)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var env Envelope
-	var authResp FrontendAuthResponse
-	if err := json.Unmarshal(raw, &env); err != nil {
-		t.Fatal(err)
-	}
-	if err := json.Unmarshal(env.Result, &authResp); err != nil {
-		t.Fatal(err)
-	}
-	if authResp.Authenticated {
-		t.Fatalf("auth response = %+v, want denied", authResp)
-	}
-}
-
-func TestAppAuthenticationUnknownKeyIsUnhandled(t *testing.T) {
-	app, _ := configureTestApp(t)
-	authReq, _ := json.Marshal(FrontendAuthRequest{
-		Method:  "POST",
-		Path:    "/v1/chat/completions",
-		Headers: http.Header{"Authorization": {"Bearer unknown"}},
-		Body:    []byte(`{"model":"fast"}`),
-	})
-	raw, err := app.HandleMethod(MethodFrontendAuthAuthenticate, authReq)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var env Envelope
-	if err := json.Unmarshal(raw, &env); err != nil {
-		t.Fatal(err)
-	}
-	var authResp FrontendAuthResponse
-	if err := json.Unmarshal(env.Result, &authResp); err != nil {
-		t.Fatal(err)
-	}
-	if authResp.Authenticated {
-		t.Fatalf("unknown key must remain unhandled: %+v", authResp)
-	}
-}
-
-// interceptBefore sends request.intercept_before in CPA's wire shape (Go field
-// names, base64 body) and decodes the plugin's answer.
-func interceptBefore(t *testing.T, app *App, headers http.Header, model, sourceFormat, requestPath string) RequestInterceptResponse {
-	t.Helper()
-	raw, err := json.Marshal(map[string]any{
-		"RequestID": "req-1", "SourceFormat": sourceFormat, "Model": model, "RequestedModel": model,
-		"Headers": headers, "Body": []byte(`{"model":"` + model + `"}`),
-		"Metadata": map[string]any{"request_path": requestPath, "requested_model": model},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	var env Envelope
-	if err := json.Unmarshal(mustHandle(t, app, MethodRequestInterceptBefore, raw), &env); err != nil || !env.OK {
-		t.Fatalf("intercept_before envelope = %+v, err=%v", env, err)
-	}
-	var response RequestInterceptResponse
-	if err := json.Unmarshal(env.Result, &response); err != nil {
-		t.Fatal(err)
-	}
-	return response
-}
-
-func TestAppRPMExceededTerminatesWith429(t *testing.T) {
-	app, plain := configureTestApp(t)
-	headers := http.Header{"Authorization": {"Bearer " + plain}}
-	authReq, _ := json.Marshal(FrontendAuthRequest{Method: "POST", Path: "/v1/chat/completions", Headers: headers, Body: []byte(`{"model":"fast"}`)})
-	for i := 0; i < 61; i++ {
-		var env Envelope
-		var authResp FrontendAuthResponse
-		if err := json.Unmarshal(mustHandle(t, app, MethodFrontendAuthAuthenticate, authReq), &env); err != nil {
+func TestRemovedHostMethodsAreUnknown(t *testing.T) {
+	app := newTestApp(t, appOptions{})
+	for _, method := range []string{"model.route", "response.intercept_after"} {
+		raw, err := app.HandleMethod(method, []byte(`{}`))
+		if err != nil {
 			t.Fatal(err)
 		}
-		if err := json.Unmarshal(env.Result, &authResp); err != nil || !authResp.Authenticated {
-			t.Fatalf("authentication %d = %+v; RPM belongs to the interceptor", i, authResp)
+		var env Envelope
+		decode(t, raw, &env)
+		if env.OK || env.Error == nil || env.Error.Code != "unknown_method" || env.Error.HTTPStatus != http.StatusNotFound {
+			t.Fatalf("%s envelope = %+v", method, env)
 		}
-		response := interceptBefore(t, app, headers, "fast", "openai", "/v1/chat/completions")
+	}
+	if raw := handle(t, app, MethodRequestInterceptAfter, map[string]any{"Headers": bearer(testKeyPlain)}); string(raw) != "{}" {
+		t.Fatalf("intercept_after must pass requests through unchanged: %s", raw)
+	}
+}
+
+func TestLifecycleAcceptsNewerHostSchema(t *testing.T) {
+	// The host sends the highest lifecycle version it supports and honors
+	// whatever the plugin reports back at plugin.register.
+	for _, hostSchema := range []uint32{MinHostSchemaVersion, SchemaVersion + 1, SchemaVersion + 2} {
+		app := NewApp()
+		statePath := filepath.ToSlash(filepath.Join(t.TempDir(), "state.json"))
+		raw, _ := json.Marshal(LifecycleRequest{ConfigYAML: []byte("enabled: true\nstate_file: \"" + statePath + "\"\n"), SchemaVersion: hostSchema})
+		if _, err := app.HandleMethod(MethodPluginRegister, raw); err != nil {
+			t.Fatalf("host schema_version %d was rejected: %v", hostSchema, err)
+		}
+		app.Shutdown()
+	}
+}
+
+func TestLifecycleRejectsOlderHostSchemaAndUnknownFields(t *testing.T) {
+	app := NewApp()
+	statePath := filepath.ToSlash(filepath.Join(t.TempDir(), "state.json"))
+	older, _ := json.Marshal(map[string]any{"schema_version": MinHostSchemaVersion - 1, "config_yaml": []byte("enabled: true\nstate_file: \"" + statePath + "\"\n")})
+	if _, err := app.HandleMethod(MethodPluginRegister, older); err == nil {
+		t.Fatalf("host schema_version %d was accepted", MinHostSchemaVersion-1)
+	}
+	unknown, _ := json.Marshal(map[string]any{"schema_version": SchemaVersion, "config_yaml": []byte("enabled: true\nstate_file: \"" + statePath + "\"\n"), "unexpected": true})
+	if _, err := app.HandleMethod(MethodPluginRegister, unknown); err == nil {
+		t.Fatal("unknown lifecycle field was accepted")
+	}
+}
+
+// A config.yaml written for earlier releases keeps registering: the removed
+// key and model settings decode and are ignored, and a model seed names its
+// price row by target_model.
+// Settings of earlier releases are not part of the configuration any more:
+// registration refuses them by name, while CPA's own catalog fields pass.
+func TestConfigRejectsRemovedSettingsAndKeepsHostFields(t *testing.T) {
+	cfg, err := ParseConfig([]byte(`
+enabled: true
+state_file: "/data/state.json"
+priority: 10
+store:
+  id: cpa-key-policy
+  version: "0.12.0"
+models:
+  - name: grok-4.7
+    provider: xai
+    input_price_per_million: 2
+`))
+	if err != nil || cfg.StateFile != "/data/state.json" || len(cfg.Models) != 1 || cfg.Models[0].Name != "grok-4.7" {
+		t.Fatalf("current configuration = %+v err=%v", cfg, err)
+	}
+	_, err = ParseConfig([]byte(`
+enabled: true
+classify_rules:
+  - match: foo
+models:
+  - name: fast
+    target_model: gpt-5-codex
+keys:
+  - id: legacy
+    allow_models_endpoint: false
+    models:
+      - name: fast
+`))
+	if err == nil {
+		t.Fatal("removed settings were accepted")
+	}
+	for _, field := range []string{"classify_rules", "target_model", "allow_models_endpoint", "field models"} {
+		if !strings.Contains(err.Error(), field) {
+			t.Errorf("error %q does not name %s", err, field)
+		}
+	}
+}
+
+func TestAuthenticateIdentifiesKeyAndDefersAdmission(t *testing.T) {
+	app := newTestApp(t, appOptions{})
+	response := authenticate(t, app, http.MethodPost, "/v1/chat/completions", bearer(testKeyPlain), nil)
+	if !response.Authenticated || response.Principal != testKeyID {
+		t.Fatalf("auth response = %+v", response)
+	}
+	if len(response.Metadata) != 2 || response.Metadata["provider"] != PluginID || response.Metadata["key_id"] != testKeyID {
+		t.Fatalf("auth metadata = %v, want provider and key_id only", response.Metadata)
+	}
+	if response := authenticate(t, app, http.MethodPost, "/v1/chat/completions", bearer("cpa_unknown"), nil); response.Authenticated {
+		t.Fatalf("unknown key authenticated: %+v", response)
+	}
+	if response := authenticate(t, app, http.MethodGet, "/v1/models", nil, url.Values{"key": {testKeyPlain}}); !response.Authenticated {
+		t.Fatalf("model list with a query key denied: %+v", response)
+	}
+	if raw, err := json.Marshal(FrontendAuthResponse{Authenticated: false}); err != nil || string(raw) != `{"Authenticated":false}` {
+		t.Fatalf("denied response wire shape = %s (%v)", raw, err)
+	}
+}
+
+func TestAuthenticateRejectsQueryOnlyKeyOnMediaGeneration(t *testing.T) {
+	app := newTestApp(t, appOptions{})
+	query := url.Values{"key": {testKeyPlain}}
+	if response := authenticate(t, app, http.MethodPost, "/v1/images/generations", nil, query); response.Authenticated {
+		t.Fatalf("query-only key on a generation route must be refused: %+v", response)
+	}
+	if response := authenticate(t, app, http.MethodPost, "/v1/images/generations", bearer(testKeyPlain), nil); !response.Authenticated {
+		t.Fatalf("header key on a generation route denied: %+v", response)
+	}
+	if response := authenticate(t, app, http.MethodPost, "/v1/embeddings", nil, query); !response.Authenticated {
+		t.Fatalf("query key on a non-media route denied: %+v", response)
+	}
+}
+
+func TestInterceptorEnforcesRPMWith429(t *testing.T) {
+	app := newTestApp(t, appOptions{RPM: 60})
+	headers := bearer(testKeyPlain)
+	for i := 0; i < 61; i++ {
+		if response := authenticate(t, app, http.MethodPost, "/v1/chat/completions", headers, nil); !response.Authenticated {
+			t.Fatalf("authentication %d = %+v; RPM belongs to the interceptor", i, response)
+		}
+		response := interceptBefore(t, app, "trace-"+strconv.Itoa(i), "openai", headers, "/v1/chat/completions")
 		if i < 60 {
 			if response.Terminate {
 				t.Fatalf("request %d within the limit was terminated: %+v", i, response)
@@ -230,919 +219,281 @@ func TestAppRPMExceededTerminatesWith429(t *testing.T) {
 		var body struct {
 			Error struct{ Message, Type, Code string } `json:"error"`
 		}
-		if err := json.Unmarshal(response.ResponseBody, &body); err != nil || body.Error.Code != "rate_limit_exceeded" || !strings.Contains(body.Error.Message, "limit is 60 RPM") {
+		decode(t, response.ResponseBody, &body)
+		if body.Error.Code != "rate_limit_exceeded" || body.Error.Type != "rate_limit_error" || !strings.Contains(body.Error.Message, "limit is 60 RPM") {
 			t.Fatalf("429 body = %s", response.ResponseBody)
 		}
-		if strings.Contains(string(response.ResponseBody), plain) {
+		if strings.Contains(string(response.ResponseBody), testKeyPlain) {
 			t.Fatal("rejection leaked the plaintext key")
 		}
 	}
-	afterRaw, _ := json.Marshal(map[string]any{"Headers": headers, "RequestedModel": "fast"})
-	if raw := mustHandle(t, app, MethodRequestInterceptAfter, afterRaw); !okEnvelope(t, raw) || strings.Contains(string(raw), "Terminate") {
-		t.Fatalf("intercept_after must pass requests through unchanged: %s", raw)
+	managementOK(t, app, http.MethodPost, "/keys/reset-rpm", nil, []byte(`{"id":"priced"}`))
+	if response := interceptBefore(t, app, "trace-after-reset", "openai", headers, "/v1/chat/completions"); response.Terminate {
+		t.Fatalf("request after RPM reset was terminated: %+v", response)
 	}
 }
 
-func TestAppResponseInterceptorRewritesModel(t *testing.T) {
-	app, plain := configureTestApp(t)
-	req, _ := json.Marshal(ResponseInterceptRequest{
-		RequestedModel: "fast",
-		RequestHeaders: http.Header{"Authorization": {"Bearer " + plain}},
-		Body:           []byte(`{"id":"resp","model":"gpt-5-codex"}`),
+// 1M input tokens at $1/M meet the $1 daily limit: authentication still
+// passes and the interceptor answers the next request with 429 in the
+// caller's protocol, while the model list stays readable.
+func TestUsageHandleBillsAndQuotaTerminatesWith429(t *testing.T) {
+	app := newTestApp(t, appOptions{DailyLimitUSD: 1})
+	headers := bearer(testKeyPlain)
+	recordUsage(t, app, UsageHandleRequest{
+		Provider: "codex", ExecutorType: "codexexecutor", Model: "gpt-5-codex", Alias: "fast", APIKey: testKeyID,
+		Detail: UsageDetail{InputTokens: 1_000_000, TotalTokens: 1_000_000},
 	})
-	raw, err := app.HandleMethod(MethodResponseInterceptAfter, req)
-	if err != nil {
-		t.Fatal(err)
+	if response := authenticate(t, app, http.MethodPost, "/v1/chat/completions", headers, nil); !response.Authenticated {
+		t.Fatalf("quota must not turn into an authentication failure: %+v", response)
 	}
-	var env Envelope
-	if err := json.Unmarshal(raw, &env); err != nil {
-		t.Fatal(err)
-	}
-	var resp ResponseInterceptResponse
-	if err := json.Unmarshal(env.Result, &resp); err != nil {
-		t.Fatal(err)
-	}
-	if string(resp.Body) != `{"id":"resp","model":"fast"}` {
-		t.Fatalf("response body = %s", resp.Body)
-	}
-}
-
-func TestAppManagementCreateAndRotate(t *testing.T) {
-	app, _ := configureTestApp(t)
-	createBody := []byte(`{"id":"team-b","models":[{"name":"fast"}]}`)
-	req, _ := json.Marshal(ManagementRequest{
-		Method: http.MethodPost,
-		Path:   "/v0/management/plugins/cpa-key-policy/keys",
-		Body:   createBody,
-	})
-	raw, err := app.HandleMethod(MethodManagementHandle, req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	resp := managementResponseFromEnvelope(t, raw)
-	if resp.StatusCode != http.StatusCreated {
-		t.Fatalf("create status = %d, body = %s", resp.StatusCode, resp.Body)
-	}
-	if !json.Valid(resp.Body) {
-		t.Fatalf("create body is not json: %s", resp.Body)
-	}
-
-	rotateReq, _ := json.Marshal(ManagementRequest{
-		Method: http.MethodPost,
-		Path:   "/v0/management/plugins/cpa-key-policy/keys/rotate",
-		Body:   []byte(`{"id":"team-b"}`),
-	})
-	raw, err = app.HandleMethod(MethodManagementHandle, rotateReq)
-	if err != nil {
-		t.Fatal(err)
-	}
-	resp = managementResponseFromEnvelope(t, raw)
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("rotate status = %d, body = %s", resp.StatusCode, resp.Body)
-	}
-}
-
-func managementResponseFromEnvelope(t *testing.T, raw []byte) ManagementResponse {
-	t.Helper()
-	var env Envelope
-	if err := json.Unmarshal(raw, &env); err != nil {
-		t.Fatal(err)
-	}
-	var resp ManagementResponse
-	if err := json.Unmarshal(env.Result, &resp); err != nil {
-		t.Fatal(err)
-	}
-	return resp
-}
-
-func TestAppResponseInterceptorPreservesUsageWithoutBilling(t *testing.T) {
-	app, plain := configureTestApp(t)
-	// A response body may contain usage, but response.intercept_after only
-	// rewrites the model. Accounting is owned exclusively by usage.handle.
-	req, _ := json.Marshal(ResponseInterceptRequest{
-		RequestedModel: "fast",
-		RequestHeaders: http.Header{"Authorization": {"Bearer " + plain}},
-		Body:           []byte(`{"id":"resp","model":"gpt-5-codex","usage":{"prompt_tokens":100,"completion_tokens":20}}`),
-	})
-	raw, err := app.HandleMethod(MethodResponseInterceptAfter, req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var env Envelope
-	if err := json.Unmarshal(raw, &env); err != nil {
-		t.Fatal(err)
-	}
-	var resp ResponseInterceptResponse
-	if err := json.Unmarshal(env.Result, &resp); err != nil {
-		t.Fatal(err)
-	}
-	// The interceptor rewrites the top-level "model" to the public model and
-	// leaves usage intact. Parse rather than string-compare (Go encodes map keys
-	// in sorted order).
-	var body map[string]any
-	if err := json.Unmarshal(resp.Body, &body); err != nil {
-		t.Fatalf("body not json: %s err=%v", resp.Body, err)
-	}
-	if body["model"] != "fast" {
-		t.Fatalf("model = %v, want fast", body["model"])
-	}
-	usage, ok := body["usage"].(map[string]any)
-	if !ok || usage["prompt_tokens"] != float64(100) || usage["completion_tokens"] != float64(20) {
-		t.Fatalf("usage = %+v, want preserved prompt=100 completion=20", usage)
-	}
-	key := app.store.Keys()[0]
-	if summary := app.store.UsageSummaryFor(key); summary.DailyUSD != 0 || summary.DailyCallCount != 0 {
-		t.Fatalf("response interceptor billed usage: %+v", summary)
-	}
-}
-
-func TestAppKeysListExposesUsageAndLimits(t *testing.T) {
-	app, _ := configureTestApp(t)
-	req, _ := json.Marshal(ManagementRequest{
-		Method: http.MethodGet,
-		Path:   "/v0/management/plugins/cpa-key-policy/keys",
-	})
-	raw, err := app.HandleMethod(MethodManagementHandle, req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	resp := managementResponseFromEnvelope(t, raw)
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d", resp.StatusCode)
-	}
-	var payload struct {
-		Keys []struct {
-			ID             string  `json:"id"`
-			DailyLimitUSD  float64 `json:"daily_limit_usd"`
-			WeeklyLimitUSD float64 `json:"weekly_limit_usd"`
-			Usage          struct {
-				DailyUSD      float64 `json:"daily_usd"`
-				WeeklyUSD     float64 `json:"weekly_usd"`
-				DailyLimitUSD float64 `json:"daily_limit_usd"`
-			} `json:"usage"`
-		} `json:"keys"`
-	}
-	if err := json.Unmarshal(resp.Body, &payload); err != nil {
-		t.Fatalf("unmarshal: %v body=%s", err, resp.Body)
-	}
-	if len(payload.Keys) == 0 {
-		t.Fatal("no keys returned")
-	}
-	k := payload.Keys[0]
-	if k.ID != "team-a" {
-		t.Fatalf("id = %s", k.ID)
-	}
-	if k.Usage.DailyLimitUSD != 0 {
-		t.Fatalf("test config has no daily limit, got %v", k.Usage.DailyLimitUSD)
-	}
-	// Usage object must always be present (even when empty).
-	if k.Usage.DailyUSD != 0 {
-		t.Fatalf("expected 0 daily usage, got %v", k.Usage.DailyUSD)
-	}
-}
-
-func TestAppPatchKeySetsLimits(t *testing.T) {
-	app, _ := configureTestApp(t)
-	f := 1.5
-	patchBody, _ := json.Marshal(map[string]any{
-		"id": "team-a", "daily_limit_usd": f, "weekly_limit_usd": 10.0, "monthly_limit_usd": 30.0,
-		"models": []map[string]any{{"name": "fast", "daily_limit_usd": 2.0}},
-	})
-	req, _ := json.Marshal(ManagementRequest{
-		Method: http.MethodPatch,
-		Path:   "/v0/management/plugins/cpa-key-policy/keys",
-		Body:   patchBody,
-	})
-	raw, err := app.HandleMethod(MethodManagementHandle, req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	resp := managementResponseFromEnvelope(t, raw)
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d body = %s", resp.StatusCode, resp.Body)
-	}
-	var payload struct {
-		Key struct {
-			DailyLimitUSD   float64              `json:"daily_limit_usd"`
-			WeeklyLimitUSD  float64              `json:"weekly_limit_usd"`
-			MonthlyLimitUSD float64              `json:"monthly_limit_usd"`
-			Models          []policy.KeyModelRef `json:"models"`
-			Usage           policy.UsageSummary  `json:"usage"`
-		} `json:"key"`
-	}
-	if err := json.Unmarshal(resp.Body, &payload); err != nil {
-		t.Fatal(err)
-	}
-	if payload.Key.DailyLimitUSD != 1.5 || payload.Key.WeeklyLimitUSD != 10.0 || payload.Key.MonthlyLimitUSD != 30.0 {
-		t.Fatalf("limits = %+v", payload.Key)
-	}
-	if len(payload.Key.Models) != 1 || payload.Key.Models[0].Name != "fast" || payload.Key.Models[0].DailyLimitUSD != 2 {
-		t.Fatalf("model limits = %+v", payload.Key.Models)
-	}
-	if payload.Key.Usage.MonthlyLimitUSD != 30 || payload.Key.Usage.Timezone != "Asia/Shanghai" || payload.Key.Usage.LimitsChangedAt.IsZero() {
-		t.Fatalf("public usage fields = %+v", payload.Key.Usage)
-	}
-}
-
-func TestKeyHistoryAndAuditRoutes(t *testing.T) {
-	app, _ := configurePricedApp(t)
-	usageReq, _ := json.Marshal(UsageHandleRequest{
-		APIKey: "priced", Alias: "fast", Model: "gpt-5-codex",
-		Detail: UsageDetail{InputTokens: 200_000, OutputTokens: 100_000},
-	})
-	if _, err := app.HandleMethod(MethodUsageHandle, usageReq); err != nil {
-		t.Fatal(err)
-	}
-	historyReq, _ := json.Marshal(ManagementRequest{
-		Method: http.MethodGet,
-		Path:   "/v0/management/plugins/cpa-key-policy/keys/history",
-		Query:  url.Values{"id": {"priced"}, "days": {"30"}},
-	})
-	historyResp := managementResponseFromEnvelope(t, mustHandle(t, app, MethodManagementHandle, historyReq))
-	if historyResp.StatusCode != http.StatusOK {
-		t.Fatalf("history status=%d body=%s", historyResp.StatusCode, historyResp.Body)
-	}
-	var history struct {
-		KeyID    string                   `json:"key_id"`
-		Timezone string                   `json:"timezone"`
-		Days     []policy.UsageHistoryDay `json:"days"`
-	}
-	if err := json.Unmarshal(historyResp.Body, &history); err != nil {
-		t.Fatal(err)
-	}
-	if history.KeyID != "priced" || history.Timezone != "Asia/Shanghai" || len(history.Days) != 30 {
-		t.Fatalf("history response = %+v", history)
-	}
-	last := history.Days[len(history.Days)-1]
-	if !nearly(last.TotalUSD, 0.30) || !nearly(last.ByModel["fast"].TotalUSD, 0.30) {
-		t.Fatalf("history last day = %+v", last)
-	}
-
-	patchBody, _ := json.Marshal(map[string]any{"id": "priced", "monthly_limit_usd": 20.0})
-	patchReq, _ := json.Marshal(ManagementRequest{Method: http.MethodPatch, Path: "/v0/management/plugins/cpa-key-policy/keys", Body: patchBody})
-	patchResp := managementResponseFromEnvelope(t, mustHandle(t, app, MethodManagementHandle, patchReq))
-	if patchResp.StatusCode != http.StatusOK {
-		t.Fatalf("patch status=%d body=%s", patchResp.StatusCode, patchResp.Body)
-	}
-	auditReq, _ := json.Marshal(ManagementRequest{
-		Method: http.MethodGet,
-		Path:   "/v0/management/plugins/cpa-key-policy/audit",
-		Query:  url.Values{"key_id": {"priced"}, "limit": {"10"}},
-	})
-	auditResp := managementResponseFromEnvelope(t, mustHandle(t, app, MethodManagementHandle, auditReq))
-	if auditResp.StatusCode != http.StatusOK {
-		t.Fatalf("audit status=%d body=%s", auditResp.StatusCode, auditResp.Body)
-	}
-	var auditBody struct {
-		Events []struct {
-			Action  string                     `json:"action"`
-			Changes map[string]json.RawMessage `json:"changes"`
-		} `json:"events"`
-	}
-	if err := json.Unmarshal(auditResp.Body, &auditBody); err != nil {
-		t.Fatal(err)
-	}
-	if len(auditBody.Events) == 0 || auditBody.Events[0].Action != "update_key" || auditBody.Events[0].Changes["monthly_limit_usd"] == nil {
-		t.Fatalf("audit response = %+v", auditBody)
-	}
-}
-
-func TestManagementRegistrationDeclaresResource(t *testing.T) {
-	app := NewApp()
-	resp := app.managementRegistration()
-	if len(resp.Resources) == 0 {
-		t.Fatal("no resources declared")
-	}
-	found := false
-	for _, r := range resp.Resources {
-		if r.Path == "/index.html" {
-			found = true
-			if r.Menu != "密钥策略" {
-				t.Fatalf("Menu = %q, want 密钥策略", r.Menu)
-			}
-		}
-	}
-	if !found {
-		t.Fatalf("resources do not include /index.html: %+v", resp.Resources)
-	}
-}
-
-func TestHandleManagementServesResourceUI(t *testing.T) {
-	app := NewApp()
-	req, _ := json.Marshal(ManagementRequest{
-		Method: http.MethodGet,
-		Path:   "/v0/resource/plugins/cpa-key-policy/index.html",
-	})
-	raw, err := app.HandleMethod(MethodManagementHandle, req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	resp := managementResponseFromEnvelope(t, raw)
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d, want 200", resp.StatusCode)
-	}
-	if ct := resp.Headers.Get("Content-Type"); ct != "text/html; charset=utf-8" {
-		t.Fatalf("content-type = %q, want text/html", ct)
-	}
-	if len(resp.Body) == 0 {
-		t.Fatal("resource body empty")
-	}
-}
-
-func TestHandleManagementResourceUnknownPath404(t *testing.T) {
-	app := NewApp()
-	req, _ := json.Marshal(ManagementRequest{
-		Method: http.MethodGet,
-		Path:   "/v0/resource/plugins/cpa-key-policy/assets/app.js",
-	})
-	raw, err := app.HandleMethod(MethodManagementHandle, req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	resp := managementResponseFromEnvelope(t, raw)
-	if resp.StatusCode != http.StatusNotFound {
-		t.Fatalf("status = %d, want 404", resp.StatusCode)
-	}
-}
-
-// configurePricedApp builds an app with one priced key ($1/M input, $1/M
-// output) under a $1 daily limit, so usage.handle billing can be observed.
-func configurePricedApp(t *testing.T) (*App, string) {
-	t.Helper()
-	app := NewApp()
-	plain := "cpa_priced"
-	hash := hashForTest(t, plain)
-	yaml := []byte(`
-enabled: true
-state_file: "` + filepath.ToSlash(filepath.Join(t.TempDir(), "state.json")) + `"
-models:
-  - name: fast
-    targets:
-      - provider: codex
-        target_model: gpt-5-codex
-    billing_mode: tokens
-    input_price_per_million: 1
-    output_price_per_million: 1
-keys:
-  - id: priced
-    enabled: true
-    key_hash: "` + hash + `"
-    key_preview: "cpa_pr...ced"
-    rpm: 0
-    daily_limit_usd: 1.00
-    models:
-      - name: fast
-`)
-	req, _ := json.Marshal(LifecycleRequest{ConfigYAML: yaml, SchemaVersion: SchemaVersion})
-	if _, err := app.HandleMethod(MethodPluginReconfigure, req); err != nil {
-		t.Fatalf("configure: %v", err)
-	}
-	return app, plain
-}
-
-// TestUsageHandleBills is the regression test for streaming billing. The host
-// delivers a finalized usage record via usage.handle for EVERY completed
-// request (streaming and non-streaming). 1M input tokens × $1/M = $1.00, which
-// equals the $1 daily limit, so the NEXT auth check is rejected on the daily
-// window. This is the path that covers streaming (response.intercept_after is
-// never invoked on streams, so usage.handle is the only billing entry point).
-func TestUsageHandleBills(t *testing.T) {
-	app, plain := configurePricedApp(t)
-	hdr := http.Header{"Authorization": {"Bearer " + plain}}
-
-	// The host's usage.handle APIKey field carries our auth Principal, which
-	// THIS plugin sets to key.ID ("priced") — NOT the plaintext secret. This is
-	// the regression for the real wire value: matching must be ID-based.
-	req, _ := json.Marshal(UsageHandleRequest{
-		APIKey: "priced", // key.ID, what CPA actually forwards
-		Alias:  "fast",
-		Model:  "gpt-5-codex",
-		Detail: UsageDetail{InputTokens: 1_000_000, OutputTokens: 0, TotalTokens: 1_000_000},
-	})
-	raw, err := app.HandleMethod(MethodUsageHandle, req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !okEnvelope(t, raw) {
-		t.Fatalf("usage.handle should always return ok, got %s", raw)
-	}
-
-	// $1.00 spent == $1.00 daily limit: authentication still passes and the
-	// request interceptor answers the next request with 429.
-	authReq, _ := json.Marshal(FrontendAuthRequest{
-		Method: "POST", Path: "/v1/chat/completions", Headers: hdr, Body: []byte(`{"model":"fast"}`),
-	})
-	raw, err = app.HandleMethod(MethodFrontendAuthAuthenticate, authReq)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var env Envelope
-	if err := json.Unmarshal(raw, &env); err != nil {
-		t.Fatal(err)
-	}
-	var authResp FrontendAuthResponse
-	if err := json.Unmarshal(env.Result, &authResp); err != nil {
-		t.Fatal(err)
-	}
-	if !authResp.Authenticated {
-		t.Fatalf("quota must not turn into an authentication failure: %+v", authResp)
-	}
-	openAI := interceptBefore(t, app, hdr, "fast", "openai", "/v1/chat/completions")
+	openAI := interceptBefore(t, app, "trace-openai", "openai", headers, "/v1/chat/completions")
 	var openAIBody struct {
 		Error struct{ Message, Type, Code string } `json:"error"`
 	}
-	if !openAI.Terminate || openAI.StatusCode != http.StatusTooManyRequests || json.Unmarshal(openAI.ResponseBody, &openAIBody) != nil || openAIBody.Error.Type != "insufficient_quota" || !strings.Contains(openAIBody.Error.Message, "Daily quota of $1.00") {
+	decode(t, openAI.ResponseBody, &openAIBody)
+	if !openAI.Terminate || openAI.StatusCode != http.StatusTooManyRequests || openAIBody.Error.Type != "insufficient_quota" || openAIBody.Error.Code != "insufficient_quota" || !strings.Contains(openAIBody.Error.Message, "Daily quota of $1.00") {
 		t.Fatalf("OpenAI rejection = %+v body=%s", openAI, openAI.ResponseBody)
 	}
 	if openAI.ResponseHeaders.Get("Retry-After") == "" || openAI.ResponseHeaders.Get("Content-Type") != "application/json" {
 		t.Fatalf("rejection headers = %v", openAI.ResponseHeaders)
 	}
-	claude := interceptBefore(t, app, hdr, "fast", "claude", "/v1/messages")
+	responses := interceptBefore(t, app, "trace-responses", "openai-response", headers, "/v1/responses")
+	var responsesBody struct {
+		Error struct {
+			Message, Type, Code string
+			ResetsAt            int64 `json:"resets_at"`
+		} `json:"error"`
+	}
+	decode(t, responses.ResponseBody, &responsesBody)
+	if !responses.Terminate || responses.StatusCode != http.StatusTooManyRequests || responsesBody.Error.Type != "usage_limit_reached" || responsesBody.Error.Code != "insufficient_quota" ||
+		responsesBody.Error.ResetsAt <= time.Now().Unix() || !strings.Contains(responsesBody.Error.Message, "Daily quota of $1.00") {
+		t.Fatalf("Responses rejection = %+v body=%s", responses, responses.ResponseBody)
+	}
+	claude := interceptBefore(t, app, "trace-claude", "claude", headers, "/v1/messages")
 	var claudeBody struct {
 		Type  string                         `json:"type"`
 		Error struct{ Type, Message string } `json:"error"`
 	}
-	if !claude.Terminate || json.Unmarshal(claude.ResponseBody, &claudeBody) != nil || claudeBody.Type != "error" || claudeBody.Error.Type != "rate_limit_error" {
+	decode(t, claude.ResponseBody, &claudeBody)
+	if !claude.Terminate || claudeBody.Type != "error" || claudeBody.Error.Type != "rate_limit_error" || !strings.Contains(claudeBody.Error.Message, "resets at") {
 		t.Fatalf("Claude rejection body = %s", claude.ResponseBody)
 	}
-}
-
-// TestUsageHandleRequestedModelFallsBackToResolvedModel verifies that when the host omits its
-// fixed requested-model transport field, the resolved upstream Model is used.
-func TestUsageHandleRequestedModelFallsBackToResolvedModel(t *testing.T) {
-	app, plain := configurePricedApp(t)
-	hdr := http.Header{"Authorization": {"Bearer " + plain}}
-
-	// Only the resolved Model is present. 2M input tokens × $1/M = $2.00.
-	// APIKey is key.ID ("priced"), matching the real host wire value.
-	req, _ := json.Marshal(UsageHandleRequest{
-		APIKey: "priced",
-		Model:  "fast",
-		Detail: UsageDetail{InputTokens: 2_000_000, OutputTokens: 0, TotalTokens: 2_000_000},
-	})
-	if _, err := app.HandleMethod(MethodUsageHandle, req); err != nil {
-		t.Fatal(err)
+	gemini := interceptBefore(t, app, "trace-gemini", "gemini", headers, "/v1beta/models/gemini-pro:generateContent")
+	var geminiBody struct {
+		Error struct {
+			Code   int    `json:"code"`
+			Status string `json:"status"`
+		} `json:"error"`
 	}
-	if denial := app.Store().AdmitIntercepted(hdr, "fast", "/v1/chat/completions"); denial == nil {
-		t.Fatal("resolved-model fallback billing should block")
+	decode(t, gemini.ResponseBody, &geminiBody)
+	if !gemini.Terminate || geminiBody.Error.Code != http.StatusTooManyRequests || geminiBody.Error.Status != "RESOURCE_EXHAUSTED" {
+		t.Fatalf("Gemini rejection body = %s", gemini.ResponseBody)
 	}
-}
-
-// TestUsageHandleUnknownKeyNotBilled: a usage record for a key we don't manage
-// bills nothing and never blocks. (The host fires usage.handle for all keys,
-// including plain CPA keys not routed through this plugin.)
-func TestUsageHandleUnknownKeyNotBilled(t *testing.T) {
-	app, plain := configurePricedApp(t)
-	hdr := http.Header{"Authorization": {"Bearer " + plain}}
-
-	req, _ := json.Marshal(UsageHandleRequest{
-		APIKey: "cpa_some_other_key_we_dont_know",
-		Alias:  "fast",
-		Detail: UsageDetail{InputTokens: 100_000_000, OutputTokens: 100_000_000},
-	})
-	if _, err := app.HandleMethod(MethodUsageHandle, req); err != nil {
-		t.Fatal(err)
+	if response := authenticate(t, app, http.MethodGet, "/v1/models", headers, nil); !response.Authenticated {
+		t.Fatalf("model list must stay readable when the quota is used up: %+v", response)
 	}
-	d := app.Store().Authenticate("POST", "/v1/chat/completions", hdr, nil, []byte(`{"model":"fast"}`))
-	if !d.Allowed {
-		t.Fatalf("unknown-key usage must not affect our key: %+v", d)
+	var keys struct {
+		Keys []struct {
+			Usage policy.UsageSummary `json:"usage"`
+		} `json:"keys"`
+	}
+	decode(t, managementOK(t, app, http.MethodGet, "/keys", nil, nil), &keys)
+	if len(keys.Keys) != 1 || keys.Keys[0].Usage.Status != "limited" || keys.Keys[0].Usage.BlockedReason != "daily_exceeded" || !nearly(keys.Keys[0].Usage.DailyUSD, 1) {
+		t.Fatalf("key usage = %+v", keys.Keys)
 	}
 }
 
-func okEnvelope(t *testing.T, raw []byte) bool {
-	t.Helper()
-	var env Envelope
-	if err := json.Unmarshal(raw, &env); err != nil {
-		t.Fatal(err)
+// The host's second model field names what the client asked for; it is the
+// billed model only when the upstream model id is missing.
+func TestUsageHandleFallsBackToRequestedModelName(t *testing.T) {
+	app := newTestApp(t, appOptions{})
+	recordUsage(t, app, UsageHandleRequest{Provider: "codex", Alias: "gpt-5-codex", APIKey: testKeyID, Detail: UsageDetail{InputTokens: 300_000}})
+	recordUsage(t, app, UsageHandleRequest{Provider: "codex", Model: "gpt-5-codex", Alias: "fast", APIKey: testKeyID, Detail: UsageDetail{InputTokens: 200_000}})
+	var usage struct {
+		Models []policy.ModelUsageEntry `json:"models"`
 	}
-	return env.OK
-}
-
-// TestUsageHandleBillsCacheReadClaude verifies cache-aware billing end to end
-// via usage.handle for an additive provider (Claude). 1M input @ $1/M +
-// 500K cache-read @ $0.10/M = 1.0 + 0.05 = $1.05 > $1 daily limit → next auth
-// blocked. Without cache pricing the cache-read tokens would be unbilled and
-// the daily total would be $1.00 (exactly the limit, still blocked, but the
-// cost returned would be 1.0, not 1.05) — the test pins the cache-aware total.
-func TestUsageHandleBillsCacheReadClaude(t *testing.T) {
-	app := NewApp()
-	hash := hashForTest(t, "cpa_cache")
-	yaml := []byte(`
-enabled: true
-state_file: "` + filepath.ToSlash(filepath.Join(t.TempDir(), "state.json")) + `"
-models:
-  - name: sonnet
-    targets:
-      - provider: claude
-        target_model: claude-sonnet-4
-    billing_mode: tokens
-    input_price_per_million: 1
-    output_price_per_million: 1
-    cache_read_price_per_million: 0.10
-keys:
-  - id: cached
-    enabled: true
-    key_hash: "` + hash + `"
-    daily_limit_usd: 1.00
-    models:
-      - name: sonnet
-`)
-	req, _ := json.Marshal(LifecycleRequest{ConfigYAML: yaml, SchemaVersion: SchemaVersion})
-	if _, err := app.HandleMethod(MethodPluginReconfigure, req); err != nil {
-		t.Fatalf("configure: %v", err)
-	}
-
-	// Host wire: APIKey = key.ID ("cached"). 1M input (excl cache) + 500K cache-read.
-	usageReq, _ := json.Marshal(UsageHandleRequest{
-		APIKey: "cached",
-		Alias:  "sonnet",
-		Model:  "claude-sonnet-4",
-		Detail: UsageDetail{InputTokens: 1_000_000, CacheReadTokens: 500_000, TotalTokens: 1_500_000},
-	})
-	raw, err := app.HandleMethod(MethodUsageHandle, usageReq)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !okEnvelope(t, raw) {
-		t.Fatalf("usage.handle ok envelope: %s", raw)
-	}
-
-	// $1.05 spent > $1.00 daily limit → next request rejected.
-	hdr := http.Header{"Authorization": {"Bearer cpa_cache"}}
-	if denial := app.Store().AdmitIntercepted(hdr, "sonnet", "/v1/chat/completions"); denial == nil || denial.Reason != "daily_exceeded" {
-		t.Fatalf("cache-billed usage should block at $1.05 > $1.00: %+v", denial)
+	decode(t, managementOK(t, app, http.MethodGet, "/keys/usage", url.Values{"id": {testKeyID}}, nil), &usage)
+	if len(usage.Models) != 1 || usage.Models[0].Name != "gpt-5-codex" || usage.Models[0].Daily.CallCount != 2 || !nearly(usage.Models[0].Daily.TotalUSD, 0.5) {
+		t.Fatalf("usage models = %+v", usage.Models)
 	}
 }
 
-// TestUsageHandlePerCallBills verifies the full usage.handle path for a
-// per-call-billed public model: each successful record charges the fixed PerCallUSD
-// (ignoring token counts), and a Failed record charges nothing.
-func TestUsageHandlePerCallBills(t *testing.T) {
-	app := NewApp()
-	plain := "cpa_percall_app"
-	hash := hashForTest(t, plain)
-	yaml := []byte(`
-enabled: true
-state_file: "` + filepath.ToSlash(filepath.Join(t.TempDir(), "state.json")) + `"
-models:
-  - name: fast
-    targets:
-      - provider: codex
-        target_model: gpt-5-codex
-    billing_mode: per_call
-    per_call_usd: 0.50
-    input_price_per_million: 999
-    output_price_per_million: 999
-keys:
-  - id: percall
-    enabled: true
-    key_hash: "` + hash + `"
-    key_preview: "cpa_pe...app"
-    daily_limit_usd: 1.00
-    models:
-      - name: fast
-`)
-	req, _ := json.Marshal(LifecycleRequest{ConfigYAML: yaml, SchemaVersion: SchemaVersion})
-	if _, err := app.HandleMethod(MethodPluginReconfigure, req); err != nil {
-		t.Fatalf("configure: %v", err)
+func TestUsageHandleIgnoresFailedUnknownAndMalformedRecords(t *testing.T) {
+	app := newTestApp(t, appOptions{})
+	recordUsage(t, app, UsageHandleRequest{Model: "gpt-5-codex", APIKey: testKeyID, Failed: true, Detail: UsageDetail{InputTokens: 1_000_000}})
+	recordUsage(t, app, UsageHandleRequest{Model: "gpt-5-codex", APIKey: "cpa_some_other_key", Detail: UsageDetail{InputTokens: 1_000_000}})
+	if raw := handle(t, app, MethodUsageHandle, []byte(`{"Model":`)); string(raw) != "{}" {
+		t.Fatalf("malformed usage record answer = %s", raw)
 	}
-	hdr := http.Header{"Authorization": {"Bearer " + plain}}
-
-	// Successful record with huge token counts — must charge $0.50, not token price.
-	successReq, _ := json.Marshal(UsageHandleRequest{
-		APIKey: "percall",
-		Alias:  "fast",
-		Detail: UsageDetail{InputTokens: 10_000_000, OutputTokens: 10_000_000},
-	})
-	if _, err := app.HandleMethod(MethodUsageHandle, successReq); err != nil {
-		t.Fatal(err)
+	var status struct {
+		Health policy.HealthSnapshot `json:"health"`
 	}
-	// Failed record — must charge nothing and not count.
-	failReq, _ := json.Marshal(UsageHandleRequest{
-		APIKey: "percall",
-		Alias:  "fast",
-		Failed: true,
-		Detail: UsageDetail{InputTokens: 10_000_000, OutputTokens: 10_000_000},
-	})
-	if _, err := app.HandleMethod(MethodUsageHandle, failReq); err != nil {
-		t.Fatal(err)
+	decode(t, managementOK(t, app, http.MethodGet, "/status", nil, nil), &status)
+	if status.Health.SkippedFailed != 1 || status.Health.IgnoredUnknownKey != 1 {
+		t.Fatalf("health = %+v", status.Health)
 	}
-	// A second successful record → total $1.00 == limit.
-	if _, err := app.HandleMethod(MethodUsageHandle, successReq); err != nil {
-		t.Fatal(err)
+	var usage struct {
+		Models []policy.ModelUsageEntry `json:"models"`
 	}
-
-	// Next auth rejected on daily limit. CallCount = 2 (failed didn't count).
-	if denial := app.Store().AdmitIntercepted(hdr, "fast", "/v1/chat/completions"); denial == nil || denial.Reason != "daily_exceeded" {
-		t.Fatalf("after two per_call charges, next should be daily_exceeded: %+v", denial)
-	}
-	keys := app.Store().Keys()
-	var key policy.KeyConfig
-	for _, k := range keys {
-		if k.ID == "percall" {
-			key = k
-		}
-	}
-	s := app.Store().UsageSummaryFor(key)
-	if s.DailyCallCount != 2 {
-		t.Fatalf("daily call count = %d, want 2 (failed excluded)", s.DailyCallCount)
-	}
-	if !nearly(s.DailyUSD, 1.00) {
-		t.Fatalf("daily usd = %v, want 1.00", s.DailyUSD)
+	decode(t, managementOK(t, app, http.MethodGet, "/keys/usage", url.Values{"id": {testKeyID}}, nil), &usage)
+	if len(usage.Models) != 0 {
+		t.Fatalf("ignored records were billed: %+v", usage.Models)
 	}
 }
 
-// TestManagementKeyUsageEndpoint: GET /keys/usage?id=... returns the per-model
-// breakdown for a key after usage.handle billing. Verifies the response shape
-// (key_id/key_name/models), per-model daily+weekly figures, output tokens, and
-// the 404 for an unknown key.
-func TestManagementKeyUsageEndpoint(t *testing.T) {
-	app, _ := configurePricedApp(t)
-
-	// Bill 200K input + 100K output @ $1/$1 = $0.20 + $0.10 = $0.30.
-	usageReq, _ := json.Marshal(UsageHandleRequest{
-		APIKey: "priced", Alias: "fast", Model: "gpt-5-codex",
-		Detail: UsageDetail{InputTokens: 200_000, OutputTokens: 100_000, TotalTokens: 300_000},
-	})
-	if _, err := app.HandleMethod(MethodUsageHandle, usageReq); err != nil {
-		t.Fatal(err)
-	}
-
-	req, _ := json.Marshal(ManagementRequest{
-		Method: http.MethodGet,
-		Path:   "/v0/management/plugins/cpa-key-policy/keys/usage",
-		Query:  url.Values{"id": {"priced"}},
-	})
-	raw, err := app.HandleMethod(MethodManagementHandle, req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	resp := managementResponseFromEnvelope(t, raw)
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d, body = %s", resp.StatusCode, resp.Body)
-	}
-	var got struct {
-		KeyID   string                   `json:"key_id"`
-		KeyName string                   `json:"key_name"`
-		Models  []policy.ModelUsageEntry `json:"models"`
-	}
-	if err := json.Unmarshal(resp.Body, &got); err != nil {
-		t.Fatalf("unmarshal: %v, body=%s", err, resp.Body)
-	}
-	if got.KeyID != "priced" || len(got.Models) != 1 {
-		t.Fatalf("usage response = %+v, want key_id=priced 1 model", got)
-	}
-	model := got.Models[0]
-	if model.Name != "fast" || !model.InConfig {
-		t.Fatalf("model row = %+v, want fast/in_config", model)
-	}
-	if !nearly(model.Daily.TotalUSD, 0.30) || !nearly(model.Weekly.TotalUSD, 0.30) {
-		t.Fatalf("model usd = %+v, want 0.30/0.30", model)
-	}
-	if model.Daily.CallCount != 1 || model.Daily.InputTokens != 200_000 || model.Daily.OutputTokens != 100_000 {
-		t.Fatalf("model daily counters = %+v, want 1/200000/100000", model.Daily)
-	}
-
-	// Missing id → 400.
-	badReq, _ := json.Marshal(ManagementRequest{
-		Method: http.MethodGet,
-		Path:   "/v0/management/plugins/cpa-key-policy/keys/usage",
-	})
-	badResp := managementResponseFromEnvelope(t, mustHandle(t, app, MethodManagementHandle, badReq))
-	if badResp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("missing id status = %d, want 400", badResp.StatusCode)
-	}
-
-	// Unknown id → 404.
-	nopeReq, _ := json.Marshal(ManagementRequest{
-		Method: http.MethodGet,
-		Path:   "/v0/management/plugins/cpa-key-policy/keys/usage",
-		Query:  url.Values{"id": {"nope"}},
-	})
-	nopeResp := managementResponseFromEnvelope(t, mustHandle(t, app, MethodManagementHandle, nopeReq))
-	if nopeResp.StatusCode != http.StatusNotFound {
-		t.Fatalf("unknown id status = %d, want 404", nopeResp.StatusCode)
-	}
-}
-
-func TestManagementResetUsageEndpoint(t *testing.T) {
-	app, _ := configurePricedApp(t)
-	usageReq, _ := json.Marshal(UsageHandleRequest{
-		APIKey: "priced", Alias: "fast", Model: "gpt-5-codex",
-		Detail: UsageDetail{InputTokens: 200_000, OutputTokens: 100_000, TotalTokens: 300_000},
-	})
-	if _, err := app.HandleMethod(MethodUsageHandle, usageReq); err != nil {
-		t.Fatal(err)
-	}
-
-	resetBody, _ := json.Marshal(map[string]string{"id": "priced", "window": "daily"})
-	req, _ := json.Marshal(ManagementRequest{
-		Method: http.MethodPost,
-		Path:   "/v0/management/plugins/cpa-key-policy/keys/reset-usage",
-		Body:   resetBody,
-	})
-	resp := managementResponseFromEnvelope(t, mustHandle(t, app, MethodManagementHandle, req))
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("daily reset status = %d, body = %s", resp.StatusCode, resp.Body)
-	}
-	var got policy.UsageResetResult
-	if err := json.Unmarshal(resp.Body, &got); err != nil {
-		t.Fatalf("unmarshal reset response: %v, body=%s", err, resp.Body)
-	}
-	if got.KeyID != "priced" || got.Window != policy.UsageResetDaily || !nearly(got.BeforeDailyUSD, 0.30) {
-		t.Fatalf("daily reset response = %+v", got)
-	}
-
-	keys := app.Store().Keys()
-	summary := app.Store().UsageSummaryFor(keys[0])
-	if !nearly(summary.DailyUSD, 0) || !nearly(summary.WeeklyUSD, 0.30) {
-		t.Fatalf("daily reset summary = %+v, want daily 0 / weekly 0.30", summary)
-	}
-
-	if _, err := app.HandleMethod(MethodUsageHandle, usageReq); err != nil {
-		t.Fatal(err)
-	}
-	monthlyBody, _ := json.Marshal(map[string]string{"id": "priced", "window": "monthly"})
-	monthlyReq, _ := json.Marshal(ManagementRequest{
-		Method: http.MethodPost,
-		Path:   "/v0/management/plugins/cpa-key-policy/keys/reset-usage",
-		Body:   monthlyBody,
-	})
-	monthlyResp := managementResponseFromEnvelope(t, mustHandle(t, app, MethodManagementHandle, monthlyReq))
-	if monthlyResp.StatusCode != http.StatusOK {
-		t.Fatalf("monthly reset status = %d, body = %s", monthlyResp.StatusCode, monthlyResp.Body)
-	}
-	if err := json.Unmarshal(monthlyResp.Body, &got); err != nil {
-		t.Fatalf("unmarshal monthly reset response: %v, body=%s", err, monthlyResp.Body)
-	}
-	if got.Window != policy.UsageResetMonthly || !nearly(got.BeforeMonthlyUSD, 0.60) || !nearly(got.AfterMonthlyUSD, 0) {
-		t.Fatalf("monthly reset response = %+v", got)
-	}
-
-	badBody, _ := json.Marshal(map[string]string{"id": "priced", "window": "year"})
-	badReq, _ := json.Marshal(ManagementRequest{
-		Method: http.MethodPost,
-		Path:   "/v0/management/plugins/cpa-key-policy/keys/reset-usage",
-		Body:   badBody,
-	})
-	badResp := managementResponseFromEnvelope(t, mustHandle(t, app, MethodManagementHandle, badReq))
-	if badResp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("invalid window status = %d, want 400", badResp.StatusCode)
-	}
-
-	for _, tc := range []struct {
-		name       string
-		body       []byte
-		wantStatus int
-	}{
-		{name: "malformed json", body: []byte(`{"id":`), wantStatus: http.StatusBadRequest},
-		{name: "missing id", body: []byte(`{"window":"daily"}`), wantStatus: http.StatusBadRequest},
-		{name: "unknown key", body: []byte(`{"id":"missing","window":"daily"}`), wantStatus: http.StatusNotFound},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			boundaryReq, _ := json.Marshal(ManagementRequest{
-				Method: http.MethodPost,
-				Path:   "/v0/management/plugins/cpa-key-policy/keys/reset-usage",
-				Body:   tc.body,
-			})
-			boundaryResp := managementResponseFromEnvelope(t, mustHandle(t, app, MethodManagementHandle, boundaryReq))
-			if boundaryResp.StatusCode != tc.wantStatus {
-				t.Fatalf("status = %d, want %d; body=%s", boundaryResp.StatusCode, tc.wantStatus, boundaryResp.Body)
-			}
-		})
-	}
-}
-
-func mustHandle(t *testing.T, app *App, method string, req []byte) []byte {
-	t.Helper()
-	raw, err := app.HandleMethod(method, req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return raw
-}
-
-// TestAppMultiTargetModelRoute verifies that a key with a multi-target public
-// model routes correctly via model.route.
-// This reproduces the 502 bug: CPA calls model.route and the plugin must
-// return Handled=true with a valid Target/TargetModel for each round-robin
-// rotation.
-// A config.yaml written for older releases may still seed a model with several
-// targets; it keeps registering and routes every request to the first target.
-func TestAppLegacyMultiTargetSeedRoutesToFirstTarget(t *testing.T) {
-	app := NewApp()
-	plain := "cpa_multi_target_test"
-	hash := hashForTest(t, plain)
-	stateFile := filepath.ToSlash(filepath.Join(t.TempDir(), "state.json"))
-	yaml := []byte(`
-enabled: true
-state_file: "` + stateFile + `"
-models:
-  - name: mymulti
-    free: true
-    targets:
-      - {provider: opencode, target_model: glm-5.2}
-      - {provider: nvidia, target_model: z-ai/glm-5.2}
-    dispatch: round-robin
-    billing_mode: tokens
-keys:
-  - id: mt-key
-    enabled: true
-    key_hash: "` + hash + `"
-    models:
-      - name: mymulti
-`)
-	req, _ := json.Marshal(LifecycleRequest{ConfigYAML: yaml, SchemaVersion: SchemaVersion})
-	if _, err := app.HandleMethod(MethodPluginReconfigure, req); err != nil {
-		t.Fatalf("configure: %v", err)
-	}
-	hdr := http.Header{"Authorization": {"Bearer " + plain}}
-	for i := 0; i < 3; i++ {
-		routeReq, _ := json.Marshal(ModelRouteRequest{RequestedModel: "mymulti", Headers: hdr, AvailableProviders: []string{"openai-compatible-opencode"}})
-		resp := routeResponseFromEnvelope(t, mustHandle(t, app, MethodModelRoute, routeReq))
-		if !resp.Handled || resp.Target != "openai-compatible-opencode" || resp.TargetModel != "glm-5.2" {
-			t.Fatalf("call %d route = %+v", i, resp)
-		}
-	}
-}
-
-func routeResponseFromEnvelope(t *testing.T, raw []byte) ModelRouteResponse {
-	t.Helper()
-	var env Envelope
-	if err := json.Unmarshal(raw, &env); err != nil {
-		t.Fatal(err)
-	}
-	var resp ModelRouteResponse
-	if err := json.Unmarshal(env.Result, &resp); err != nil {
-		t.Fatal(err)
-	}
-	return resp
-}
-
-// TestResolveProviderKey verifies the openai-compatible- prefix mapping so
-// CPA's HasBuiltinProvider check succeeds for OpenAI-compatibility providers.
-// Reproduces the 502 bug: CPA log "model router returned unavailable
-// provider" when the plugin returned the bare provider name "nvidia".
-func TestResolveProviderKey(t *testing.T) {
-	cases := []struct {
-		name     string
-		provider string
-		avail    []string
-		want     string
-	}{
-		{"bare matches built-in", "codex", []string{"codex", "claude"}, "codex"},
-		{"nvidia openai-compat", "nvidia", []string{"openai-compatible-nvidia", "openai-compatible-opencode", "cerebras"}, "openai-compatible-nvidia"},
-		{"opencode openai-compat", "opencode", []string{"openai-compatible-nvidia", "openai-compatible-opencode"}, "openai-compatible-opencode"},
-		{"cerebras openai-compat", "cerebras", []string{"openai-compatible-cerebras"}, "openai-compatible-cerebras"},
-		{"no available → bare fallback", "nvidia", nil, "nvidia"},
-		{"not in available → bare", "custom", []string{"openai-compatible-x"}, "custom"},
-		{"empty", "", []string{"codex"}, ""},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got := resolveProviderKey(tc.provider, tc.avail)
-			if got != tc.want {
-				t.Fatalf("resolveProviderKey(%q, %v) = %q, want %q", tc.provider, tc.avail, got, tc.want)
-			}
-		})
-	}
-}
-
-func TestUsageHandleTransportJSONSnapshot(t *testing.T) {
+func TestUsageHandleTransportFieldNames(t *testing.T) {
 	if ABIVersion != 1 || SchemaVersion != 2 {
 		t.Fatalf("ABI/schema versions changed: %d/%d", ABIVersion, SchemaVersion)
 	}
-	raw, err := json.Marshal(UsageHandleRequest{
-		Model:  "upstream-model",
-		Alias:  "public-model",
-		APIKey: "key-id",
-		Detail: UsageDetail{InputTokens: 1},
-	})
+	raw, err := json.Marshal(UsageHandleRequest{TraceID: "a1b2c3d4", Provider: "codex", ExecutorType: "codexexecutor", Model: "upstream-model", Alias: "public-model", APIKey: "key-id", Detail: UsageDetail{InputTokens: 1}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	var payload map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &payload); err != nil {
-		t.Fatal(err)
-	}
+	decode(t, raw, &payload)
 	requestedModelField := string([]byte{65, 108, 105, 97, 115})
-	for _, field := range []string{"Model", requestedModelField, "APIKey", "Failed", "Detail"} {
+	for _, field := range []string{"TraceID", "Provider", "ExecutorType", "Model", requestedModelField, "APIKey", "Failed", "Detail"} {
 		if _, exists := payload[field]; !exists {
 			t.Fatalf("transport snapshot missing %q: %s", field, raw)
 		}
 	}
-	if len(payload) != 5 || string(payload[requestedModelField]) != `"public-model"` {
+	if len(payload) != 8 || string(payload[requestedModelField]) != `"public-model"` {
 		t.Fatalf("transport snapshot = %s", raw)
 	}
 }
 
-func TestRegistrationReportsCurrentReleaseMetadata(t *testing.T) {
-	registration := NewApp().registration()
-	if registration.SchemaVersion != 2 || registration.Metadata.Version != Version {
-		t.Fatalf("registration version metadata = %+v", registration)
+func TestManagementKeyLifecycle(t *testing.T) {
+	app := newTestApp(t, appOptions{})
+	created := managementCall(t, app, http.MethodPost, "/keys", nil, []byte(`{"id":"team-b","name":"Team B","rpm":10}`))
+	if created.StatusCode != http.StatusCreated {
+		t.Fatalf("create status=%d body=%s", created.StatusCode, created.Body)
 	}
-	if registration.Metadata.GitHubRepository != "https://github.com/RealLiuSha/cpa-plugin-key-policy" {
-		t.Fatalf("registration repository = %q", registration.Metadata.GitHubRepository)
+	var createdBody struct {
+		Key       publicKey `json:"key"`
+		PlainKey  string    `json:"plain_key"`
+		Generated bool      `json:"generated"`
+	}
+	decode(t, created.Body, &createdBody)
+	if createdBody.Key.ID != "team-b" || createdBody.Key.Name != "Team B" || createdBody.Key.RPM != 10 || !createdBody.Key.Enabled || !createdBody.Generated || !strings.HasPrefix(createdBody.PlainKey, "cpa_") {
+		t.Fatalf("create body = %s", created.Body)
+	}
+	if response := authenticate(t, app, http.MethodPost, "/v1/chat/completions", bearer(createdBody.PlainKey), nil); !response.Authenticated || response.Principal != "team-b" {
+		t.Fatalf("created key does not authenticate: %+v", response)
+	}
+
+	var rotated struct {
+		PlainKey string `json:"plain_key"`
+	}
+	decode(t, managementOK(t, app, http.MethodPost, "/keys/rotate", nil, []byte(`{"id":"team-b"}`)), &rotated)
+	if rotated.PlainKey == "" || rotated.PlainKey == createdBody.PlainKey {
+		t.Fatalf("rotate returned %q", rotated.PlainKey)
+	}
+	if response := authenticate(t, app, http.MethodPost, "/v1/chat/completions", bearer(createdBody.PlainKey), nil); response.Authenticated {
+		t.Fatal("rotated-out secret still authenticates")
+	}
+
+	var patched struct {
+		Key publicKey `json:"key"`
+	}
+	decode(t, managementOK(t, app, http.MethodPatch, "/keys", nil, []byte(`{"id":"team-b","daily_limit_usd":1.5,"weekly_limit_usd":10,"monthly_limit_usd":30,"enabled":false}`)), &patched)
+	if patched.Key.DailyLimitUSD != 1.5 || patched.Key.WeeklyLimitUSD != 10 || patched.Key.MonthlyLimitUSD != 30 || patched.Key.Enabled || patched.Key.Usage.Status != "disabled" || patched.Key.Usage.MonthlyLimitUSD != 30 {
+		t.Fatalf("patched key = %+v", patched.Key)
+	}
+	if response := managementCall(t, app, http.MethodPatch, "/keys", nil, []byte(`{"id":"missing","rpm":1}`)); response.StatusCode != http.StatusNotFound {
+		t.Fatalf("patch unknown key status=%d", response.StatusCode)
+	}
+
+	var audit struct {
+		Events []struct {
+			Action  string                     `json:"action"`
+			Changes map[string]json.RawMessage `json:"changes"`
+		} `json:"events"`
+	}
+	decode(t, managementOK(t, app, http.MethodGet, "/audit", url.Values{"key_id": {"team-b"}, "limit": {"10"}}, nil), &audit)
+	if len(audit.Events) < 3 || audit.Events[0].Action != "update_key" || audit.Events[0].Changes["monthly_limit_usd"] == nil {
+		t.Fatalf("audit events = %+v", audit.Events)
+	}
+
+	if response := managementCall(t, app, http.MethodDelete, "/keys", url.Values{"key_id": {"team-b"}}, nil); response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("delete without id status=%d body=%s", response.StatusCode, response.Body)
+	}
+	managementOK(t, app, http.MethodDelete, "/keys", url.Values{"id": {"team-b"}}, nil)
+	if response := managementCall(t, app, http.MethodDelete, "/keys", url.Values{"id": {"team-b"}}, nil); response.StatusCode != http.StatusNotFound {
+		t.Fatalf("second delete status=%d", response.StatusCode)
+	}
+	if response := authenticate(t, app, http.MethodPost, "/v1/chat/completions", bearer(rotated.PlainKey), nil); response.Authenticated {
+		t.Fatal("deleted key still authenticates")
+	}
+}
+
+func TestManagementResetUsage(t *testing.T) {
+	app := newTestApp(t, appOptions{})
+	usage := UsageHandleRequest{Provider: "codex", Model: "gpt-5-codex", APIKey: testKeyID, Detail: UsageDetail{InputTokens: 200_000, OutputTokens: 100_000, TotalTokens: 300_000}}
+	recordUsage(t, app, usage)
+	var result policy.UsageResetResult
+	decode(t, managementOK(t, app, http.MethodPost, "/keys/reset-usage", nil, []byte(`{"id":"priced","window":"daily"}`)), &result)
+	if result.KeyID != testKeyID || result.Window != policy.UsageResetDaily || !nearly(result.BeforeDailyUSD, 0.30) || !nearly(result.AfterDailyUSD, 0) || !nearly(result.AfterWeeklyUSD, 0.30) {
+		t.Fatalf("daily reset result = %+v", result)
+	}
+	recordUsage(t, app, usage)
+	decode(t, managementOK(t, app, http.MethodPost, "/keys/reset-usage", nil, []byte(`{"id":"priced","window":"monthly"}`)), &result)
+	if result.Window != policy.UsageResetMonthly || !nearly(result.BeforeMonthlyUSD, 0.60) || !nearly(result.AfterMonthlyUSD, 0) {
+		t.Fatalf("monthly reset result = %+v", result)
+	}
+	stale, _ := json.Marshal(map[string]any{"id": "priced", "window": "daily", "expected": policy.UsageResetExpectation{StartedAt: result.NextAccountingBoundaryAt, ResetAfterManualAt: result.NextAccountingBoundaryAt}})
+	for _, tc := range []struct {
+		name       string
+		body       []byte
+		wantStatus int
+		wantCode   string
+	}{
+		{"malformed json", []byte(`{"id":`), http.StatusBadRequest, "invalid_json"},
+		{"missing id", []byte(`{"window":"daily"}`), http.StatusBadRequest, "missing_id"},
+		{"invalid window", []byte(`{"id":"priced","window":"year"}`), http.StatusBadRequest, "invalid_window"},
+		{"unknown key", []byte(`{"id":"missing","window":"daily"}`), http.StatusNotFound, "not_found"},
+		{"stale expectation", stale, http.StatusConflict, "quota_changed"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			response := managementCall(t, app, http.MethodPost, "/keys/reset-usage", nil, tc.body)
+			if response.StatusCode != tc.wantStatus || errorCode(t, response) != tc.wantCode {
+				t.Fatalf("status=%d body=%s, want %d %s", response.StatusCode, response.Body, tc.wantStatus, tc.wantCode)
+			}
+		})
+	}
+}
+
+func TestManagementServesResourceUI(t *testing.T) {
+	app := NewApp()
+	registration := app.managementRegistration()
+	found := false
+	for _, resource := range registration.Resources {
+		if resource.Path == "/index.html" {
+			found = true
+			if resource.Menu != "密钥策略" {
+				t.Fatalf("Menu = %q, want 密钥策略", resource.Menu)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("resources do not include /index.html: %+v", registration.Resources)
+	}
+	routes := make(map[string]bool, len(registration.Routes))
+	for _, route := range registration.Routes {
+		routes[route.Method+" "+route.Path] = true
+	}
+	for _, want := range []string{"GET /plugins/cpa-key-policy/stats", "GET /plugins/cpa-key-policy/stats/export", "POST /plugins/cpa-key-policy/models/import"} {
+		if !routes[want] {
+			t.Fatalf("management routes lack %q: %v", want, routes)
+		}
+	}
+	var response ManagementResponse
+	decode(t, handle(t, app, MethodManagementHandle, ManagementRequest{Method: http.MethodGet, Path: "/v0/resource/plugins/cpa-key-policy/index.html"}), &response)
+	if response.StatusCode != http.StatusOK || response.Headers.Get("Content-Type") != "text/html; charset=utf-8" || len(response.Body) == 0 {
+		t.Fatalf("resource response = %d %v %d bytes", response.StatusCode, response.Headers, len(response.Body))
+	}
+	decode(t, handle(t, app, MethodManagementHandle, ManagementRequest{Method: http.MethodGet, Path: "/v0/resource/plugins/cpa-key-policy/assets/app.js"}), &response)
+	if response.StatusCode != http.StatusNotFound {
+		t.Fatalf("unknown resource status = %d, want 404", response.StatusCode)
 	}
 }
 
@@ -1152,5 +503,108 @@ func TestSafePluginCallRecoversPanic(t *testing.T) {
 	})
 	if err == nil || response != nil {
 		t.Fatalf("safePluginCall response=%q error=%v", response, err)
+	}
+}
+
+// A key switched to balance mode loses its period limits, is refused with
+// 429 insufficient_quota (no reset time) until credited and once its balance
+// is used up, and every adjustment is audited; request_id makes a retried
+// credit idempotent.
+func TestBalanceModeThroughManagementAndInterceptor(t *testing.T) {
+	app := newTestApp(t, appOptions{DailyLimitUSD: 2})
+	var patched struct {
+		Key publicKey `json:"key"`
+	}
+	decode(t, managementOK(t, app, http.MethodPatch, "/keys", nil, []byte(`{"id":"priced","quota_mode":"balance"}`)), &patched)
+	if patched.Key.QuotaMode != "balance" || patched.Key.DailyLimitUSD != 0 || patched.Key.Usage.BlockedReason != "balance_exhausted" || patched.Key.Usage.BalanceUSD == nil || *patched.Key.Usage.BalanceUSD != 0 {
+		t.Fatalf("switched key = %+v", patched.Key)
+	}
+	for body, code := range map[string]string{
+		`{"id":"priced","daily_limit_usd":5}`:                            "invalid_policy",
+		`{"id":"priced","quota_mode":"prepaid"}`:                         "invalid_policy",
+		`{"id":"cycle-key","quota_mode":"balance","weekly_limit_usd":1}`: "invalid_policy",
+	} {
+		method := http.MethodPatch
+		if strings.Contains(body, "cycle-key") {
+			method = http.MethodPost
+		}
+		if response := managementCall(t, app, method, "/keys", nil, []byte(body)); response.StatusCode != http.StatusBadRequest || errorCode(t, response) != code {
+			t.Fatalf("%s %s = %d %s", method, body, response.StatusCode, response.Body)
+		}
+	}
+
+	headers := bearer(testKeyPlain)
+	refused := interceptBefore(t, app, "trace-uncredited", "openai-response", headers, "/v1/responses")
+	var refusedBody struct {
+		Error struct {
+			Message, Type, Code string
+			ResetsAt            *int64 `json:"resets_at"`
+		} `json:"error"`
+	}
+	decode(t, refused.ResponseBody, &refusedBody)
+	if !refused.Terminate || refused.StatusCode != http.StatusTooManyRequests || refusedBody.Error.Type != "insufficient_quota" || refusedBody.Error.Code != "insufficient_quota" ||
+		refusedBody.Error.ResetsAt != nil || refused.ResponseHeaders.Get("Retry-After") != "" || !strings.Contains(refusedBody.Error.Message, "prepaid balance") {
+		t.Fatalf("uncredited balance rejection = %+v body=%s", refused, refused.ResponseBody)
+	}
+
+	var credit policy.BalanceAdjustment
+	decode(t, managementOK(t, app, http.MethodPost, "/keys/balance", nil, []byte(`{"id":"priced","amount_usd":1.5,"note":"top-up","request_id":"order-7"}`)), &credit)
+	if credit.KeyID != "priced" || !nearly(credit.AfterUSD, 1.5) || credit.Duplicate {
+		t.Fatalf("credit = %+v", credit)
+	}
+	decode(t, managementOK(t, app, http.MethodPost, "/keys/balance", nil, []byte(`{"id":"priced","amount_usd":1.5,"request_id":"order-7"}`)), &credit)
+	if !credit.Duplicate || !nearly(credit.AfterUSD, 1.5) {
+		t.Fatalf("retried credit = %+v", credit)
+	}
+	if response := managementCall(t, app, http.MethodPost, "/keys", nil, []byte(`{"id":"cycle-key","key":"cpa_cycle_key_secret"}`)); response.StatusCode != http.StatusCreated {
+		t.Fatalf("create cycle key = %d %s", response.StatusCode, response.Body)
+	}
+	for _, tc := range []struct {
+		body   string
+		status int
+		code   string
+	}{
+		{`{"id":"priced"}`, http.StatusBadRequest, "invalid_amount"},
+		{`{"id":"priced","amount_usd":0}`, http.StatusBadRequest, "invalid_amount"},
+		{`{"id":"priced","amount_usd":1,"extra":true}`, http.StatusBadRequest, "invalid_json"},
+		{`{"id":"nobody","amount_usd":1}`, http.StatusNotFound, "not_found"},
+		{`{"id":"cycle-key","amount_usd":1}`, http.StatusConflict, "not_balance_mode"},
+		{`{"id":"priced","amount_usd":2,"request_id":"order-7"}`, http.StatusConflict, "request_id_conflict"},
+	} {
+		if response := managementCall(t, app, http.MethodPost, "/keys/balance", nil, []byte(tc.body)); response.StatusCode != tc.status || errorCode(t, response) != tc.code {
+			t.Fatalf("POST /keys/balance %s = %d %s", tc.body, response.StatusCode, response.Body)
+		}
+	}
+
+	if response := interceptBefore(t, app, "trace-credited", "openai", headers, "/v1/chat/completions"); response.Terminate {
+		t.Fatalf("credited key refused: %s", response.ResponseBody)
+	}
+	recordUsage(t, app, UsageHandleRequest{
+		Provider: "codex", ExecutorType: "codexexecutor", Model: "gpt-5-codex", APIKey: testKeyID,
+		Detail: UsageDetail{InputTokens: 1_500_000, TotalTokens: 1_500_000},
+	})
+	var usage struct {
+		Usage policy.UsageSummary `json:"usage"`
+	}
+	decode(t, managementOK(t, app, http.MethodGet, "/keys/usage", url.Values{"id": {"priced"}}, nil), &usage)
+	if usage.Usage.BalanceUSD == nil || !nearly(*usage.Usage.BalanceUSD, 0) || usage.Usage.Status != "limited" || !nearly(*usage.Usage.NetCreditedUSD, 1.5) {
+		t.Fatalf("usage after spending the balance = %+v", usage.Usage)
+	}
+	if response := interceptBefore(t, app, "trace-spent", "claude", headers, "/v1/messages"); !response.Terminate || !strings.Contains(string(response.ResponseBody), "prepaid balance") {
+		t.Fatalf("spent balance rejection = %+v body=%s", response, response.ResponseBody)
+	}
+
+	var audit struct {
+		Events []struct {
+			Action  string                     `json:"action"`
+			Changes map[string]json.RawMessage `json:"changes"`
+		} `json:"events"`
+	}
+	decode(t, managementOK(t, app, http.MethodGet, "/audit", url.Values{"key_id": {"priced"}, "action": {"adjust_balance"}}, nil), &audit)
+	if len(audit.Events) != 1 || audit.Events[0].Action != "adjust_balance" {
+		t.Fatalf("adjust_balance events = %+v", audit.Events)
+	}
+	if changes := audit.Events[0].Changes; string(changes["note"]) == "" || string(changes["balance_usd"]) == "" {
+		t.Fatalf("adjust_balance changes = %v", changes)
 	}
 }

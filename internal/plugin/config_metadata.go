@@ -5,8 +5,22 @@ import (
 	"errors"
 	"io"
 
+	"cpa-key-policy/internal/policy"
+
 	"gopkg.in/yaml.v3"
 )
+
+// ParseConfig reads the plugin section of CPA's config.yaml the way
+// registration does: host catalog fields are dropped, everything else is
+// decoded strictly. The migration checker uses it to vet a configuration
+// before an upgrade switches to this release.
+func ParseConfig(raw []byte) (policy.Config, error) {
+	configYAML, err := stripHostConfigMetadata(raw)
+	if err != nil {
+		return policy.Config{}, err
+	}
+	return policy.ParseConfig(configYAML)
+}
 
 // stripHostConfigMetadata keeps CPA-owned plugin catalog fields outside the
 // policy configuration schema, which remains strict about unknown fields.

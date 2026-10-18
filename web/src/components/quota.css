@@ -18,7 +18,7 @@
 .key-person-name:hover { text-decoration: underline; }
 .key-status { display: inline-block; font-size: 11px; padding: 2px 6px; border-radius: var(--r-sm); background: var(--panel-2); color: var(--muted); vertical-align: middle; }
 .key-status.state-normal { background: var(--ok-soft); color: var(--ok); }
-.key-status.state-limited, .key-status.state-partial { background: var(--danger-soft); color: var(--danger); }
+.key-status.state-limited { background: var(--danger-soft); color: var(--danger); }
 .key-status.state-warning { background: var(--accent-soft); color: var(--text); }
 .key-person-id { font-size: 12px; color: var(--muted); margin-top: 5px; overflow-wrap: anywhere; }
 .key-person-meta { display: flex; flex-wrap: wrap; gap: 8px; font-size: 11px; color: var(--muted); margin-top: 8px; }
@@ -62,6 +62,31 @@
 .model-multiplier p { margin: 0 0 8px; line-height: 1.6; }
 .more-menu-options a { display: block; padding: 8px 12px; text-decoration: none; color: var(--text); font-size: 13px; }
 .more-menu-options a:hover { background: var(--row-hover); }
+/* Prepaid balance: the same card language as period quotas. */
+.key-mode { display: inline-block; font-size: 11px; padding: 2px 6px; margin-left: 4px; border-radius: var(--r-sm); border: 1px solid var(--border); color: var(--muted); vertical-align: middle; }
+.balance-detail-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 18px; }
+.balance-detail-head h2 { margin: 0; }
+.balance-history { margin-top: 22px; padding-top: 18px; border-top: 1px solid var(--border); }
+.balance-history h3 { margin: 0 0 12px; font-size: 14px; }
+.balance-history ul { list-style: none; margin: 0 0 12px; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+.balance-history li { display: grid; grid-template-columns: minmax(150px, auto) minmax(80px, auto) minmax(110px, auto) 1fr; align-items: baseline; gap: 12px; font-size: 13px; font-variant-numeric: tabular-nums; }
+.balance-history li time { font-size: 12px; }
+.balance-credit { color: var(--ok); }
+.balance-debit { color: var(--danger); }
+.balance-note { color: var(--muted); overflow-wrap: anywhere; }
+.balance-form { display: flex; flex-direction: column; gap: 14px; margin-top: 16px; }
+.balance-form .seg { margin: 0; align-self: flex-start; }
+.balance-form label { display: flex; flex-direction: column; gap: 6px; }
+.balance-presets { display: flex; flex-wrap: wrap; gap: 8px; margin-top: -4px; }
+.balance-form .quota-reset-preview { margin: 0; }
+.balance-preview-negative dd:last-child { color: var(--danger); }
+.balance-warning { margin: 0; color: var(--danger); font-size: 13px; line-height: 1.6; }
+.balance-mode-hint { display: flex; flex-direction: column; align-items: flex-start; gap: 12px; margin: 16px 0; }
+.balance-mode-hint p { margin: 0; line-height: 1.6; }
+.kf-mode { display: flex; flex-direction: column; gap: 8px; margin-bottom: 14px; }
+.kf-mode .seg { margin: 0; align-self: flex-start; }
+.kf-mode-notice { margin-bottom: 14px; }
+.kf-balance-current { margin: 0; font-size: 13px; line-height: 1.6; color: var(--muted); }
 @media (max-width: 1000px) {
   .key-row { grid-template-columns: minmax(150px, 1fr) minmax(240px, 2fr); gap: 18px; }
   .key-row-actions { grid-column: 1 / -1; flex-direction: row; justify-content: flex-end; padding-top: 12px; border-top: 1px solid var(--border); }
@@ -82,7 +107,9 @@
   .quota-reset-preview > div { gap: 12px; flex-wrap: wrap; }
   .model-multiplier { grid-template-columns: minmax(0, 1fr); gap: 8px; }
   .v5-key-list .key-list-search { flex-basis: 100%; max-width: none; }
-  .v5-key-list .key-list-sort { flex: 1; min-width: 0; }
+  .v5-key-list .key-list-sort, .v5-key-list .key-list-mode { flex: 1; min-width: 0; }
+  .balance-history li { grid-template-columns: 1fr auto; gap: 4px 12px; }
+  .balance-history li .balance-note { grid-column: 1 / -1; }
 }
 
 .key-edit-operations { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 8px; margin-bottom: 18px; }

@@ -1,10 +1,7 @@
 import "./quota.css";
 import type { QuotaCycle, UsageSummary } from "../types";
 import { useT } from "../i18n";
-
-export function formatUSD(value: number): string {
-  return new Intl.NumberFormat(undefined, { style: "currency", currency: "USD", currencyDisplay: "narrowSymbol", maximumFractionDigits: 2 }).format(value);
-}
+import { formatUSD } from "../format";
 
 export function formatQuotaDate(value: string, timezone = "Asia/Shanghai"): string {
   const date = new Date(value);

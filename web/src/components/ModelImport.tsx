@@ -1,17 +1,16 @@
 import { useEffect, useMemo, useState } from "react";
 import { fetchCatalog } from "../api/models";
-import { importModels } from "../api/modelDefinitions";
+import { importModels } from "../api/modelPrices";
 import { extractApiError } from "../api/error";
 import { useT } from "../i18n";
-import type { ModelDefinition, ModelImportResult } from "../types";
+import type { ModelImportResult, ModelPriceRow } from "../types";
 
 export interface ImportCandidate {
   model: string;
   providers: string[];
 }
 
-// One row per upstream model id; a model offered by several providers lets
-// the operator choose which provider the public model routes to.
+// One row per upstream model id, listing the CPA providers that serve it.
 export function importCandidates(catalog: { provider: string; model: string }[]): ImportCandidate[] {
   const byModel = new Map<string, ImportCandidate>();
   for (const row of catalog) {
@@ -23,7 +22,7 @@ export function importCandidates(catalog: { provider: string; model: string }[])
 }
 
 interface Props {
-  existing: ModelDefinition[];
+  existing: ModelPriceRow[];
   onImported: () => Promise<void>;
   onSyncPrices: (names: string[]) => void;
   onDone: () => void;
@@ -39,27 +38,20 @@ export default function ModelImport({ existing, onImported, onSyncPrices, onDone
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [result, setResult] = useState<ModelImportResult | null>(null);
-  // A model is already defined when its name is taken or an existing public
-  // model already routes to it.
+  // Any price row for the id, with or without a provider qualifier, counts as priced here.
   const taken = useMemo(() => {
-    const names = new Set(existing.map((model) => model.name.toLowerCase()));
-    const upstreams = new Set(existing.map((model) => `${model.provider.toLowerCase()}|${model.target_model}`));
-    return (row: ImportCandidate) => names.has(row.model.toLowerCase()) || row.providers.some((provider) => upstreams.has(`${provider}|${row.model}`));
+    const names = new Set(existing.map((row) => row.name.toLowerCase()));
+    return (row: ImportCandidate) => names.has(row.model.toLowerCase());
   }, [existing]);
 
   useEffect(() => {
     let alive = true;
-    void fetchCatalog(new Set(existing.map((model) => model.provider)))
-      .then((catalog) => {
-        if (!alive) return;
-        const rows = importCandidates(catalog);
-        setCandidates(rows);
-        setProviderOf(Object.fromEntries(rows.map((row) => [row.model, row.providers[0]])));
-      })
+    void fetchCatalog(new Set(existing.map((row) => row.provider).filter(Boolean)))
+      .then((catalog) => { if (alive) setCandidates(importCandidates(catalog)); })
       .catch((reason) => { if (alive) setError(extractApiError(reason, t("models.importCatalogFailed"))); })
       .finally(() => { if (alive) setLoading(false); });
     return () => { alive = false; };
-    // The catalog is read once per dialog; existing models only shape the filter.
+    // The catalog is read once per dialog; existing rows only shape the filter.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -82,7 +74,7 @@ export default function ModelImport({ existing, onImported, onSyncPrices, onDone
     setBusy(true);
     setError("");
     try {
-      const imported = await importModels([...selected].map((model) => ({ provider: providerOf[model], target_model: model })));
+      const imported = await importModels([...selected].map((model) => ({ name: model, provider: providerOf[model] ?? "" })));
       setResult(imported);
       await onImported();
     } catch (reason) {
@@ -128,11 +120,12 @@ export default function ModelImport({ existing, onImported, onSyncPrices, onDone
                     <input type="checkbox" disabled={exists} checked={selected.has(row.model)} onChange={() => toggle(row.model)} />
                     <span className="mono">{row.model}</span>
                   </label>
-                  {row.providers.length > 1 && !exists ? (
-                    <select className="input import-provider" aria-label={t("models.provider")} value={providerOf[row.model]} onChange={(event) => setProviderOf((current) => ({ ...current, [row.model]: event.target.value }))}>
-                      {row.providers.map((provider) => <option key={provider} value={provider}>{provider}</option>)}
+                  {exists ? <span className="badge">{row.providers.join(" / ")}</span> : (
+                    <select className="input import-provider" aria-label={t("models.providerQualifier")} value={providerOf[row.model] ?? ""} onChange={(event) => setProviderOf((current) => ({ ...current, [row.model]: event.target.value }))}>
+                      <option value="">{t("models.anyProvider")}</option>
+                      {row.providers.map((provider) => <option key={provider} value={provider}>{t("models.onlyProvider", { provider })}</option>)}
                     </select>
-                  ) : <span className="badge">{row.providers.join(" / ")}</span>}
+                  )}
                   {exists && <span className="muted import-state">{t("models.alreadyDefined")}</span>}
                 </div>
               );

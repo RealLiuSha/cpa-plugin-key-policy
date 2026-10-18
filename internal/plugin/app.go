@@ -50,14 +50,10 @@ func (a *App) handleMethod(method string, request []byte) ([]byte, error) {
 		return OKEnvelope(IdentifierResponse{Identifier: PluginID})
 	case MethodFrontendAuthAuthenticate:
 		return a.authenticate(request)
-	case MethodModelRoute:
-		return a.routeModel(request)
 	case MethodRequestInterceptBefore:
 		return a.interceptRequest(request)
 	case MethodRequestInterceptAfter:
 		return OKEnvelope(RequestInterceptResponse{})
-	case MethodResponseInterceptAfter:
-		return a.interceptResponse(request)
 	case MethodUsageHandle:
 		return a.handleUsage(request)
 	case MethodManagementRegister:
@@ -89,11 +85,7 @@ func (a *App) configure(raw []byte) error {
 	if req.SchemaVersion < MinHostSchemaVersion {
 		return fmt.Errorf("unsupported lifecycle schema_version %d; require >= %d", req.SchemaVersion, MinHostSchemaVersion)
 	}
-	configYAML, err := stripHostConfigMetadata(req.ConfigYAML)
-	if err != nil {
-		return err
-	}
-	cfg, err := policy.ParseConfig(configYAML)
+	cfg, err := ParseConfig(req.ConfigYAML)
 	if err != nil {
 		return err
 	}
@@ -104,9 +96,11 @@ func (a *App) configure(raw []byte) error {
 	return nil
 }
 
-// Shutdown flushes usage. Host calls this on plugin unload.
+// Shutdown writes the final accounting cut. The host calls it on plugin unload.
 func (a *App) Shutdown() {
-	a.store.StopUsageFlusher()
+	if err := a.store.Shutdown(); err != nil {
+		log.Printf("cpa-key-policy: final usage flush failed: %v", err)
+	}
 }
 
 func (a *App) registration() Registration {
@@ -122,15 +116,13 @@ func (a *App) registration() Registration {
 				{Name: "state_file", Type: "string", Description: "JSON state file used for key policy changes made through the Management API."},
 				{Name: "usage_timezone", Type: "string", Description: "IANA timezone used for natural-day usage buckets. Defaults to Asia/Shanghai."},
 				{Name: "keys", Type: "array", Description: "First-boot downstream key seeds. State is authoritative after initialization."},
-				{Name: "models", Type: "array", Description: "First-boot public model seeds: name, provider, target_model and prices."},
+				{Name: "models", Type: "array", Description: "First-boot price rows: upstream model id (name), optional provider qualifier, billing mode and prices."},
 			},
 		},
 		Capabilities: Capabilities{
 			FrontendAuthProvider:          true,
 			FrontendAuthProviderExclusive: false,
-			ModelRouter:                   true,
 			RequestInterceptor:            true,
-			ResponseInterceptor:           true,
 			UsagePlugin:                   true,
 			ManagementAPI:                 true,
 		},
@@ -142,27 +134,14 @@ func (a *App) authenticate(raw []byte) ([]byte, error) {
 	if err := json.Unmarshal(raw, &req); err != nil {
 		return nil, err
 	}
-	decision := a.store.Authenticate(req.Method, req.Path, req.Headers, req.Query, req.Body)
-	if !decision.Known {
+	decision := a.store.Authenticate(req.Method, req.Path, req.Headers, req.Query)
+	if !decision.Known || !decision.Allowed {
 		return OKEnvelope(FrontendAuthResponse{Authenticated: false})
-	}
-	if !decision.Allowed {
-		return OKEnvelope(FrontendAuthResponse{Authenticated: false})
-	}
-	meta := map[string]string{
-		"provider":        PluginID,
-		"key_id":          decision.KeyID,
-		"requested_model": decision.Requested,
-	}
-	if decision.Model.Name != "" {
-		meta["public_model"] = decision.Model.Name
-		meta["target_provider"] = decision.Model.Provider
-		meta["target_model"] = decision.Model.TargetModel
 	}
 	return OKEnvelope(FrontendAuthResponse{
 		Authenticated: true,
 		Principal:     decision.Principal,
-		Metadata:      meta,
+		Metadata:      map[string]string{"provider": PluginID, "key_id": decision.KeyID},
 	})
 }
 
@@ -174,89 +153,11 @@ func (a *App) interceptRequest(raw []byte) ([]byte, error) {
 		return nil, err
 	}
 	requestPath, _ := req.Metadata["request_path"].(string)
-	denial := a.store.AdmitIntercepted(req.Headers, req.RequestedModel, requestPath)
+	denial := a.store.AdmitIntercepted(req.Headers, requestPath, req.TraceID)
 	if denial == nil {
 		return OKEnvelope(RequestInterceptResponse{})
 	}
 	return OKEnvelope(rejectionResponse(req.SourceFormat, denial, time.Now()))
-}
-
-func (a *App) routeModel(raw []byte) ([]byte, error) {
-	var req ModelRouteRequest
-	if err := json.Unmarshal(raw, &req); err != nil {
-		return nil, err
-	}
-	model, keyID, ok := a.store.Route(req.Headers, req.Query, req.RequestedModel)
-	if !ok {
-		return OKEnvelope(ModelRouteResponse{Handled: false})
-	}
-	return OKEnvelope(ModelRouteResponse{
-		Handled:     true,
-		TargetKind:  "provider",
-		Target:      resolveProviderKey(model.Provider, req.AvailableProviders),
-		TargetModel: model.TargetModel,
-		Reason:      "cpa-key-policy:" + keyID,
-	})
-}
-
-// resolveProviderKey maps a routed provider to the provider key CPA's
-// auth manager uses, so HasBuiltinProvider(target) succeeds.
-//
-// OpenAI-compatibility providers are registered with auth.Provider
-// prefixed as "openai-compatible-<name>" (see synthesizer.config:
-// auth.Provider = OpenAICompatibleProviderKey(name)). The plugin's
-// ModelTarget.Provider carries the bare name (e.g. "nvidia",
-// "opencode"). Returning the bare name makes CPA skip the router
-// ("model router returned unavailable provider") and fall back to the
-// native path, which fails for non-native public model names like "test1".
-//
-// We pick the key present in AvailableProviders, trying the bare name
-// first (for built-in providers like codex/claude/gemini) then the
-// openai-compatible- prefixed form. If neither matches we return the
-// bare name and let CPA's availability check skip us (the native path
-// still resolves true model names).
-func resolveProviderKey(provider string, availableProviders []string) string {
-	p := strings.ToLower(strings.TrimSpace(provider))
-	if p == "" {
-		return p
-	}
-	if len(availableProviders) == 0 {
-		return p
-	}
-	for _, candidate := range []string{p, "openai-compatible-" + p} {
-		for _, avail := range availableProviders {
-			if strings.EqualFold(candidate, avail) {
-				return candidate
-			}
-		}
-	}
-	return p
-}
-
-func (a *App) interceptResponse(raw []byte) ([]byte, error) {
-	var req ResponseInterceptRequest
-	if err := json.Unmarshal(raw, &req); err != nil {
-		return nil, err
-	}
-	// NOTE: billing is NOT done here. The host only invokes
-	// response.intercept_after for non-streaming responses (the streaming path
-	// goes through response.intercept_stream_chunk, which we don't handle).
-	// Billing for both paths is centralized in usage.handle (handleUsage),
-	// which the host fires after every request completes with already-parsed
-	// token counts. Doing it here too would double-bill non-streaming requests.
-	if req.Stream {
-		// Streaming responses are not safe to rewrite (SSE framing) — return as-is.
-		return OKEnvelope(ResponseInterceptResponse{})
-	}
-	publicModel, ok := a.store.ResponseModel(req.RequestHeaders, nil, req.RequestedModel)
-	if !ok {
-		return OKEnvelope(ResponseInterceptResponse{})
-	}
-	body, changed := policy.RewriteTopLevelModel(req.Body, publicModel)
-	if !changed {
-		return OKEnvelope(ResponseInterceptResponse{})
-	}
-	return OKEnvelope(ResponseInterceptResponse{Body: body})
 }
 
 func (a *App) handleUsage(raw []byte) ([]byte, error) {
@@ -265,18 +166,23 @@ func (a *App) handleUsage(raw []byte) ([]byte, error) {
 	if err := json.Unmarshal(raw, &req); err != nil {
 		return OKEnvelope(UsageHandleResponse{})
 	}
-	requestedModel := req.Alias
-	if strings.TrimSpace(requestedModel) == "" {
-		requestedModel = req.Model
-	}
-	_ = a.store.RecordUsage(req.APIKey, requestedModel, req.Model, req.Failed, policy.UsageDetail{
-		InputTokens:         req.Detail.InputTokens,
-		OutputTokens:        req.Detail.OutputTokens,
-		ReasoningTokens:     req.Detail.ReasoningTokens,
-		CachedTokens:        req.Detail.CachedTokens,
-		CacheReadTokens:     req.Detail.CacheReadTokens,
-		CacheCreationTokens: req.Detail.CacheCreationTokens,
-		TotalTokens:         req.Detail.TotalTokens,
+	a.store.RecordUsage(policy.UsageEvent{
+		TraceID:        req.TraceID,
+		Provider:       req.Provider,
+		ExecutorType:   req.ExecutorType,
+		Model:          req.Model,
+		RequestedModel: req.Alias,
+		APIKey:         req.APIKey,
+		Failed:         req.Failed,
+		Detail: policy.UsageDetail{
+			InputTokens:         req.Detail.InputTokens,
+			OutputTokens:        req.Detail.OutputTokens,
+			ReasoningTokens:     req.Detail.ReasoningTokens,
+			CachedTokens:        req.Detail.CachedTokens,
+			CacheReadTokens:     req.Detail.CacheReadTokens,
+			CacheCreationTokens: req.Detail.CacheCreationTokens,
+			TotalTokens:         req.Detail.TotalTokens,
+		},
 	})
 	return OKEnvelope(UsageHandleResponse{})
 }
@@ -292,20 +198,23 @@ func (a *App) managementRegistration() ManagementRegistrationResponse {
 			{Method: http.MethodPost, Path: base + "/keys/rotate", Description: "Rotate one downstream CPA key by id."},
 			{Method: http.MethodPost, Path: base + "/keys/reset-rpm", Description: "Reset one downstream CPA key RPM counter by id."},
 			{Method: http.MethodPost, Path: base + "/keys/reset-usage", Description: "Reset one downstream CPA key daily, weekly, or monthly usage window by id."},
+			{Method: http.MethodPost, Path: base + "/keys/balance", Description: "Add to or deduct from a balance-mode key's prepaid balance (audited, request_id makes retries idempotent)."},
 			{Method: http.MethodGet, Path: base + "/keys/usage", Description: "Per-model usage breakdown for one downstream CPA key by id."},
-			{Method: http.MethodGet, Path: base + "/keys/history", Description: "Natural-day usage history for one downstream CPA key."},
+			{Method: http.MethodGet, Path: base + "/keys/history", Description: "Natural-day usage history for one downstream CPA key (days 1..90)."},
 			{Method: http.MethodGet, Path: base + "/audit", Description: "Read append-only management audit events."},
-			{Method: http.MethodGet, Path: base + "/status", Description: "Show cpa-key-policy runtime status."},
-			{Method: http.MethodGet, Path: base + "/models", Description: "List public model definitions."},
-			{Method: http.MethodPost, Path: base + "/models", Description: "Create or update a public model definition."},
-			{Method: http.MethodDelete, Path: base + "/models", Description: "Delete a public model definition by name."},
-			{Method: http.MethodPost, Path: base + "/models/import-prices", Description: "Batch-import token prices for existing models (dry_run supported)."},
+			{Method: http.MethodGet, Path: base + "/status", Description: "Show cpa-key-policy runtime status and ledger health."},
+			{Method: http.MethodGet, Path: base + "/stats", Description: "Usage totals across all keys for the last days (1..90)."},
+			{Method: http.MethodGet, Path: base + "/stats/export", Description: "Export per-day, per-key, per-model usage as CSV for a date range."},
+			{Method: http.MethodGet, Path: base + "/models", Description: "List price rows and the models seen without a price."},
+			{Method: http.MethodPost, Path: base + "/models", Description: "Create or update a price row by upstream model id and optional provider."},
+			{Method: http.MethodDelete, Path: base + "/models", Description: "Delete a price row by upstream model id and optional provider."},
+			{Method: http.MethodPost, Path: base + "/models/import-prices", Description: "Batch-import token prices for existing price rows (dry_run supported)."},
 			{Method: http.MethodPost, Path: base + "/models/pricing-preview", Description: "Preview Models.dev prices for selected CPA models without writing state."},
-			{Method: http.MethodPost, Path: base + "/models/import", Description: "Create public models for CPA capabilities at $0; existing names are skipped."},
+			{Method: http.MethodPost, Path: base + "/models/import", Description: "Create $0 price rows for upstream models; existing rows are skipped."},
 		},
 		Resources: []ResourceRoute{
 			// TRADEOFF: host menu is static Chinese only, revisit when CPA supports locale maps
-			{Path: web.IndexPath, Menu: "密钥策略", Description: "Web UI for managing downstream CPA key policies (create keys, pick models)."},
+			{Path: web.IndexPath, Menu: "密钥策略", Description: "Web UI for downstream CPA key policies, model prices and usage statistics."},
 		},
 	}
 }
@@ -349,16 +258,22 @@ func (a *App) handleManagement(raw []byte) ([]byte, error) {
 		return OKEnvelope(a.resetRPM(id))
 	case req.Method == http.MethodPost && path == base+"/keys/reset-usage":
 		return OKEnvelope(a.resetUsage(req.Body))
+	case req.Method == http.MethodPost && path == base+"/keys/balance":
+		return OKEnvelope(a.adjustBalance(req.Body))
 	case req.Method == http.MethodGet && path == base+"/keys/usage":
 		return OKEnvelope(a.keyUsage(strings.TrimSpace(req.Query.Get("id"))))
 	case req.Method == http.MethodGet && path == base+"/keys/history":
 		return OKEnvelope(a.keyHistory(strings.TrimSpace(req.Query.Get("id")), intQuery(req.Query, "days", 30)))
 	case req.Method == http.MethodGet && path == base+"/audit":
-		return OKEnvelope(a.auditEvents(strings.TrimSpace(req.Query.Get("key_id")), intQuery(req.Query, "limit", 100)))
+		return OKEnvelope(a.auditEvents(strings.TrimSpace(req.Query.Get("key_id")), strings.TrimSpace(req.Query.Get("action")), intQuery(req.Query, "limit", 100)))
 	case req.Method == http.MethodGet && path == base+"/status":
 		return OKEnvelope(jsonResponse(http.StatusOK, a.store.Status()))
+	case req.Method == http.MethodGet && path == base+"/stats":
+		return OKEnvelope(a.stats(intQuery(req.Query, "days", 30)))
+	case req.Method == http.MethodGet && path == base+"/stats/export":
+		return OKEnvelope(a.statsExport(strings.TrimSpace(req.Query.Get("from")), strings.TrimSpace(req.Query.Get("to"))))
 	case req.Method == http.MethodGet && path == base+"/models":
-		return OKEnvelope(jsonResponse(http.StatusOK, map[string]any{"models": a.store.ModelsSnapshotWithRefs()}))
+		return OKEnvelope(a.listModels())
 	case req.Method == http.MethodPost && path == base+"/models":
 		return OKEnvelope(a.upsertModel(req.Body))
 	case req.Method == http.MethodDelete && path == base+"/models":
@@ -374,33 +289,37 @@ func (a *App) handleManagement(raw []byte) ([]byte, error) {
 	}
 }
 
+// keyWriteRequest is the POST/PATCH /keys body. Unknown fields are rejected,
+// except the two settings earlier releases had: loboo-mono and
+// reeka-ai-install still send models and allow_models_endpoint, so both are
+// accepted and ignored.
 type keyWriteRequest struct {
-	ID                  string               `json:"id"`
-	Name                *string              `json:"name,omitempty"`
-	Enabled             *bool                `json:"enabled,omitempty"`
-	Key                 string               `json:"key,omitempty"`
-	RPM                 *int                 `json:"rpm,omitempty"`
-	Models              []policy.KeyModelRef `json:"models,omitempty"`
-	DailyLimitUSD       *float64             `json:"daily_limit_usd,omitempty"`
-	WeeklyLimitUSD      *float64             `json:"weekly_limit_usd,omitempty"`
-	MonthlyLimitUSD     *float64             `json:"monthly_limit_usd,omitempty"`
-	AllowModelsEndpoint *bool                `json:"allow_models_endpoint,omitempty"`
+	ID                  string          `json:"id"`
+	Name                *string         `json:"name,omitempty"`
+	Enabled             *bool           `json:"enabled,omitempty"`
+	Key                 string          `json:"key,omitempty"`
+	RPM                 *int            `json:"rpm,omitempty"`
+	DailyLimitUSD       *float64        `json:"daily_limit_usd,omitempty"`
+	WeeklyLimitUSD      *float64        `json:"weekly_limit_usd,omitempty"`
+	MonthlyLimitUSD     *float64        `json:"monthly_limit_usd,omitempty"`
+	QuotaMode           *string         `json:"quota_mode,omitempty"`
+	Models              json.RawMessage `json:"models,omitempty"`
+	AllowModelsEndpoint json.RawMessage `json:"allow_models_endpoint,omitempty"`
 }
 
 type publicKey struct {
-	ID                  string               `json:"id"`
-	Name                string               `json:"name"`
-	Enabled             bool                 `json:"enabled"`
-	KeyPreview          string               `json:"key_preview"`
-	RPM                 int                  `json:"rpm"`
-	Models              []policy.KeyModelRef `json:"models"`
-	DailyLimitUSD       float64              `json:"daily_limit_usd"`
-	WeeklyLimitUSD      float64              `json:"weekly_limit_usd"`
-	MonthlyLimitUSD     float64              `json:"monthly_limit_usd"`
-	AllowModelsEndpoint bool                 `json:"allow_models_endpoint,omitempty"`
-	Usage               policy.UsageSummary  `json:"usage"`
-	CreatedAt           string               `json:"created_at,omitempty"`
-	UpdatedAt           string               `json:"updated_at,omitempty"`
+	ID              string              `json:"id"`
+	Name            string              `json:"name"`
+	Enabled         bool                `json:"enabled"`
+	KeyPreview      string              `json:"key_preview"`
+	RPM             int                 `json:"rpm"`
+	DailyLimitUSD   float64             `json:"daily_limit_usd"`
+	WeeklyLimitUSD  float64             `json:"weekly_limit_usd"`
+	MonthlyLimitUSD float64             `json:"monthly_limit_usd"`
+	QuotaMode       string              `json:"quota_mode"`
+	Usage           policy.UsageSummary `json:"usage"`
+	CreatedAt       string              `json:"created_at,omitempty"`
+	UpdatedAt       string              `json:"updated_at,omitempty"`
 }
 
 func (a *App) createKey(body []byte) ManagementResponse {
@@ -439,30 +358,30 @@ func (a *App) createKey(body []byte) ManagementResponse {
 		name = strings.TrimSpace(*req.Name)
 	}
 	item := policy.KeyConfig{
-		ID:                  req.ID,
-		Name:                name,
-		Enabled:             enabled,
-		KeyHash:             hash,
-		KeyPreview:          policy.PreviewKey(plain),
-		RPM:                 rpm,
-		Models:              req.Models,
-		DailyLimitUSD:       applyFloat64(req.DailyLimitUSD, 0),
-		WeeklyLimitUSD:      applyFloat64(req.WeeklyLimitUSD, 0),
-		MonthlyLimitUSD:     applyFloat64(req.MonthlyLimitUSD, 0),
-		AllowModelsEndpoint: applyBool(req.AllowModelsEndpoint, false),
+		ID:              req.ID,
+		Name:            name,
+		Enabled:         enabled,
+		KeyHash:         hash,
+		KeyPreview:      policy.PreviewKey(plain),
+		RPM:             rpm,
+		DailyLimitUSD:   applyFloat64(req.DailyLimitUSD, 0),
+		WeeklyLimitUSD:  applyFloat64(req.WeeklyLimitUSD, 0),
+		MonthlyLimitUSD: applyFloat64(req.MonthlyLimitUSD, 0),
 	}
-	if err := a.store.UpsertKey(item, true); err != nil {
-		return jsonError(http.StatusBadRequest, "invalid_policy", err.Error())
+	if req.QuotaMode != nil {
+		item.QuotaMode = *req.QuotaMode
+	}
+	if err := a.store.UpsertKey(item); err != nil {
+		return keyWriteError(err)
 	}
 	if stored := a.keyByID(item.ID); stored != nil {
 		item = *stored
 	}
-	bodyMap := map[string]any{
+	return jsonResponse(http.StatusCreated, map[string]any{
 		"key":       a.publicKeyFromConfig(item),
 		"plain_key": plain,
 		"generated": generated,
-	}
-	return jsonResponse(http.StatusCreated, bodyMap)
+	})
 }
 
 func (a *App) patchKey(body []byte) ManagementResponse {
@@ -474,15 +393,7 @@ func (a *App) patchKey(body []byte) ManagementResponse {
 	if id == "" {
 		return jsonError(http.StatusBadRequest, "missing_id", "id is required")
 	}
-	keys := a.store.Keys()
-	var current *policy.KeyConfig
-	for i := range keys {
-		if keys[i].ID == id {
-			copy := keys[i]
-			current = &copy
-			break
-		}
-	}
+	current := a.keyByID(id)
 	if current == nil {
 		return jsonError(http.StatusNotFound, "not_found", "key not found")
 	}
@@ -504,11 +415,16 @@ func (a *App) patchKey(body []byte) ManagementResponse {
 	if req.MonthlyLimitUSD != nil {
 		current.MonthlyLimitUSD = *req.MonthlyLimitUSD
 	}
-	if req.AllowModelsEndpoint != nil {
-		current.AllowModelsEndpoint = *req.AllowModelsEndpoint
-	}
-	if req.Models != nil {
-		current.Models = req.Models
+	if req.QuotaMode != nil {
+		switching := !strings.EqualFold(strings.TrimSpace(*req.QuotaMode), current.Mode())
+		current.QuotaMode = *req.QuotaMode
+		// A balance key has no period limits: switching to it clears those the
+		// request does not set, so a caller only has to name the mode.
+		if switching && current.BalanceMode() {
+			current.DailyLimitUSD = applyFloat64(req.DailyLimitUSD, 0)
+			current.WeeklyLimitUSD = applyFloat64(req.WeeklyLimitUSD, 0)
+			current.MonthlyLimitUSD = applyFloat64(req.MonthlyLimitUSD, 0)
+		}
 	}
 	if strings.TrimSpace(req.Key) != "" {
 		hash, err := policy.HashKey(req.Key)
@@ -518,8 +434,8 @@ func (a *App) patchKey(body []byte) ManagementResponse {
 		current.KeyHash = hash
 		current.KeyPreview = policy.PreviewKey(req.Key)
 	}
-	if err := a.store.UpsertKey(*current, true); err != nil {
-		return jsonError(http.StatusBadRequest, "invalid_policy", err.Error())
+	if err := a.store.UpsertKey(*current); err != nil {
+		return keyWriteError(err)
 	}
 	if stored := a.keyByID(current.ID); stored != nil {
 		current = stored
@@ -595,9 +511,42 @@ func (a *App) resetUsage(body []byte) ManagementResponse {
 	return jsonResponse(http.StatusOK, result)
 }
 
+func (a *App) adjustBalance(body []byte) ManagementResponse {
+	var req struct {
+		ID        string   `json:"id"`
+		AmountUSD *float64 `json:"amount_usd"`
+		Note      string   `json:"note,omitempty"`
+		RequestID string   `json:"request_id,omitempty"`
+	}
+	if err := decodeStrictBody(body, &req); err != nil {
+		return jsonError(http.StatusBadRequest, "invalid_json", err.Error())
+	}
+	if strings.TrimSpace(req.ID) == "" {
+		return jsonError(http.StatusBadRequest, "missing_id", "id is required")
+	}
+	if req.AmountUSD == nil {
+		return jsonError(http.StatusBadRequest, "invalid_amount", "amount_usd is required")
+	}
+	result, err := a.store.AdjustBalance(req.ID, *req.AmountUSD, req.Note, req.RequestID)
+	if err != nil {
+		switch {
+		case errors.Is(err, policy.ErrUnknownKey):
+			return jsonError(http.StatusNotFound, "not_found", "key not found")
+		case errors.Is(err, policy.ErrNotBalanceMode):
+			return jsonError(http.StatusConflict, "not_balance_mode", "Switch the key to balance mode before adjusting its balance")
+		case errors.Is(err, policy.ErrBalanceRequestConflict):
+			return jsonError(http.StatusConflict, "request_id_conflict", err.Error())
+		case errors.Is(err, policy.ErrInvalidBalanceAdjustment):
+			return jsonError(http.StatusBadRequest, "invalid_amount", err.Error())
+		default:
+			return jsonError(http.StatusInternalServerError, "persist_failed", err.Error())
+		}
+	}
+	return jsonResponse(http.StatusOK, result)
+}
+
 // keyUsage returns the per-model usage breakdown for one downstream key.
 func (a *App) keyUsage(id string) ManagementResponse {
-	id = strings.TrimSpace(id)
 	if id == "" {
 		return jsonError(http.StatusBadRequest, "missing_id", "id is required")
 	}
@@ -617,12 +566,11 @@ func (a *App) keyUsage(id string) ManagementResponse {
 }
 
 func (a *App) keyHistory(id string, days int) ManagementResponse {
-	id = strings.TrimSpace(id)
 	if id == "" {
 		return jsonError(http.StatusBadRequest, "missing_id", "id is required")
 	}
-	if days < 1 || days > 35 {
-		return jsonError(http.StatusBadRequest, "invalid_days", "days must be between 1 and 35")
+	if days < 1 || days > policy.UsageRetentionDays {
+		return jsonError(http.StatusBadRequest, "invalid_days", fmt.Sprintf("days must be between 1 and %d", policy.UsageRetentionDays))
 	}
 	key, history, ok := a.store.UsageHistoryFor(id, days)
 	if !ok {
@@ -630,16 +578,16 @@ func (a *App) keyHistory(id string, days int) ManagementResponse {
 	}
 	return jsonResponse(http.StatusOK, map[string]any{
 		"key_id":   key.ID,
-		"timezone": a.store.UsageSummaryFor(key).Timezone,
+		"timezone": a.store.Timezone(),
 		"days":     history,
 	})
 }
 
-func (a *App) auditEvents(keyID string, limit int) ManagementResponse {
+func (a *App) auditEvents(keyID, action string, limit int) ManagementResponse {
 	if limit < 1 || limit > 1000 {
 		return jsonError(http.StatusBadRequest, "invalid_limit", "limit must be between 1 and 1000")
 	}
-	events, err := a.store.AuditEvents(keyID, limit)
+	events, err := a.store.AuditEvents(keyID, action, limit)
 	if err != nil {
 		return jsonError(http.StatusInternalServerError, "audit_read_failed", err.Error())
 	}
@@ -658,11 +606,38 @@ func intQuery(query map[string][]string, name string, fallback int) int {
 	return value
 }
 
-func storeError(err error) ManagementResponse {
-	if errors.Is(err, policy.ErrUnknownKey) {
-		return jsonError(http.StatusNotFound, "not_found", "key not found")
+// keyWriteError maps a rejected key write: a secret already in use is a
+// conflict, a failed state write a server error, anything else a validation
+// failure.
+func keyWriteError(err error) ManagementResponse {
+	switch {
+	case errors.Is(err, policy.ErrDuplicateKeyHash):
+		return jsonError(http.StatusConflict, "duplicate_key", err.Error())
+	case errors.Is(err, policy.ErrStatePersist):
+		return persistError(err)
+	default:
+		return jsonError(http.StatusBadRequest, "invalid_policy", err.Error())
 	}
-	return jsonError(http.StatusBadRequest, "invalid_request", err.Error())
+}
+
+func storeError(err error) ManagementResponse {
+	switch {
+	case errors.Is(err, policy.ErrUnknownKey):
+		return jsonError(http.StatusNotFound, "not_found", "key not found")
+	case errors.Is(err, policy.ErrDuplicateKeyHash):
+		return jsonError(http.StatusConflict, "duplicate_key", err.Error())
+	case errors.Is(err, policy.ErrStatePersist):
+		return persistError(err)
+	default:
+		return jsonError(http.StatusBadRequest, "invalid_request", err.Error())
+	}
+}
+
+// persistError answers a management write whose state file could not be
+// written. It is logged here because the host only sees the response.
+func persistError(err error) ManagementResponse {
+	log.Printf("cpa-key-policy: state write failed: %v", err)
+	return jsonError(http.StatusInternalServerError, "persist_failed", err.Error())
 }
 
 func idFromBody(body []byte) (string, error) {
@@ -685,17 +660,16 @@ func (a *App) publicKeys(keys []policy.KeyConfig) []publicKey {
 
 func (a *App) publicKeyFromConfig(key policy.KeyConfig) publicKey {
 	out := publicKey{
-		ID:                  key.ID,
-		Name:                key.Name,
-		Enabled:             key.Enabled,
-		KeyPreview:          key.KeyPreview,
-		RPM:                 key.RPM,
-		Models:              append([]policy.KeyModelRef{}, key.Models...),
-		DailyLimitUSD:       key.DailyLimitUSD,
-		WeeklyLimitUSD:      key.WeeklyLimitUSD,
-		MonthlyLimitUSD:     key.MonthlyLimitUSD,
-		AllowModelsEndpoint: key.AllowModelsEndpoint,
-		Usage:               a.store.UsageSummaryFor(key),
+		ID:              key.ID,
+		Name:            key.Name,
+		Enabled:         key.Enabled,
+		KeyPreview:      key.KeyPreview,
+		RPM:             key.RPM,
+		DailyLimitUSD:   key.DailyLimitUSD,
+		WeeklyLimitUSD:  key.WeeklyLimitUSD,
+		MonthlyLimitUSD: key.MonthlyLimitUSD,
+		QuotaMode:       key.Mode(),
+		Usage:           a.store.UsageSummaryFor(key),
 	}
 	if !key.CreatedAt.IsZero() {
 		out.CreatedAt = key.CreatedAt.UTC().Format("2006-01-02T15:04:05Z07:00")
@@ -707,13 +681,6 @@ func (a *App) publicKeyFromConfig(key policy.KeyConfig) publicKey {
 }
 
 func applyFloat64(v *float64, def float64) float64 {
-	if v == nil {
-		return def
-	}
-	return *v
-}
-
-func applyBool(v *bool, def bool) bool {
 	if v == nil {
 		return def
 	}

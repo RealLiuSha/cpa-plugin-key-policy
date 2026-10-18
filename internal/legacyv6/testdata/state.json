@@ -1,0 +1,106 @@
+{
+  "version": 6,
+  "dataset_id": "f2c9c9e7f82278cd5a822c8996827db9",
+  "keys": [
+    {
+      "id": "team-a",
+      "name": "Team A",
+      "enabled": true,
+      "key_hash": "sha256:650b7e4673773b8f8d0330016af9183c21244a13593feb507fc7c669c0d9e9d1",
+      "key_preview": "cpa_v6_...alpha",
+      "rpm": 60,
+      "models": [
+        {
+          "name": "Chat",
+          "daily_limit_usd": 5
+        },
+        {
+          "name": "grok-imagine-image"
+        }
+      ],
+      "allow_models_endpoint": true,
+      "daily_limit_usd": 10,
+      "weekly_limit_usd": 50,
+      "monthly_limit_usd": 100,
+      "limits_changed_at": "2026-09-01T00:00:00Z",
+      "created_at": "2026-09-01T00:00:00Z",
+      "updated_at": "2026-09-01T00:00:00Z"
+    },
+    {
+      "id": "team-b",
+      "name": "Team B",
+      "enabled": true,
+      "key_hash": "sha256:1b400e9adc6ad4d2ef2240c6d4b8c67a27ad7e8f0a8aee748720d24edc4a3d0b",
+      "key_preview": "cpa_v6_...beta",
+      "rpm": 0,
+      "models": [
+        {
+          "name": "Chat"
+        },
+        {
+          "name": "gpt-5.6"
+        },
+        {
+          "name": "Fast",
+          "daily_limit_usd": 3
+        },
+        {
+          "name": "grok-imagine-image"
+        },
+        {
+          "name": "Community"
+        }
+      ],
+      "limits_changed_at": "0001-01-01T00:00:00Z",
+      "created_at": "2026-09-15T00:00:00Z",
+      "updated_at": "2026-09-15T00:00:00Z"
+    }
+  ],
+  "models": [
+    {
+      "name": "Chat",
+      "provider": "codex",
+      "target_model": "gpt-5.6",
+      "billing_mode": "tokens",
+      "billing_multiplier": 1.2,
+      "input_price_per_million": 1,
+      "output_price_per_million": 2,
+      "cache_read_price_per_million": 0.1,
+      "cache_write_price_per_million": 0.3
+    },
+    {
+      "name": "gpt-5.6",
+      "provider": "openai",
+      "target_model": "gpt-5.6",
+      "billing_mode": "tokens",
+      "billing_multiplier": 1,
+      "input_price_per_million": 1.25,
+      "output_price_per_million": 10
+    },
+    {
+      "name": "Fast",
+      "provider": "codex",
+      "target_model": "gpt-5.6",
+      "billing_mode": "tokens",
+      "billing_multiplier": 1,
+      "input_price_per_million": 0.5,
+      "output_price_per_million": 1
+    },
+    {
+      "name": "grok-imagine-image",
+      "provider": "xai",
+      "target_model": "grok-imagine-image",
+      "billing_mode": "per_call",
+      "billing_multiplier": 1,
+      "per_call_usd": 0.07
+    },
+    {
+      "name": "Community",
+      "provider": "codex",
+      "target_model": "community-model",
+      "billing_mode": "tokens",
+      "billing_multiplier": 1
+    }
+  ],
+  "updated_at": "2026-10-16T17:13:35.696214Z"
+}

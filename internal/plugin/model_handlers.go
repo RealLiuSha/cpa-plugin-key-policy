@@ -1,70 +1,46 @@
 package plugin
 
 import (
+	"context"
 	"errors"
 	"net/http"
-	"strings"
+	"time"
 
 	"cpa-key-policy/internal/policy"
 )
 
-type modelUpsertRequest struct {
-	BillingMultiplier         *float64 `json:"billing_multiplier,omitempty"`
-	Name                      string   `json:"name"`
-	Provider                  string   `json:"provider"`
-	TargetModel               string   `json:"target_model"`
-	BillingMode               string   `json:"billing_mode"`
-	InputPricePerMillion      float64  `json:"input_price_per_million"`
-	OutputPricePerMillion     float64  `json:"output_price_per_million"`
-	CacheReadPricePerMillion  float64  `json:"cache_read_price_per_million"`
-	CacheWritePricePerMillion *float64 `json:"cache_write_price_per_million,omitempty"`
-	PerCallUSD                float64  `json:"per_call_usd"`
+// listModels answers GET /models: the price table and the models that were
+// billed without any price row in the retention window.
+func (a *App) listModels() ManagementResponse {
+	return jsonResponse(http.StatusOK, map[string]any{
+		"models":   a.store.PriceRows(),
+		"unpriced": a.store.UnpricedModels(),
+	})
 }
 
+// upsertModel answers POST /models. The body is a price row; provider is an
+// optional qualifier and an all-zero row is allowed (it bills $0, unpriced).
 func (a *App) upsertModel(raw []byte) ManagementResponse {
-	var req modelUpsertRequest
-	if err := decodeStrictBody(raw, &req); err != nil {
+	var price policy.ModelPrice
+	if err := decodeStrictBody(raw, &price); err != nil {
 		return jsonError(http.StatusBadRequest, "bad_request", err.Error())
 	}
-	model := policy.ModelDefinition{
-		Name:                      req.Name,
-		Provider:                  req.Provider,
-		TargetModel:               req.TargetModel,
-		BillingMode:               req.BillingMode,
-		InputPricePerMillion:      req.InputPricePerMillion,
-		OutputPricePerMillion:     req.OutputPricePerMillion,
-		CacheReadPricePerMillion:  req.CacheReadPricePerMillion,
-		CacheWritePricePerMillion: req.CacheWritePricePerMillion,
-		PerCallUSD:                req.PerCallUSD,
-	}
-	if req.BillingMultiplier != nil {
-		if *req.BillingMultiplier < 1 {
-			return jsonError(http.StatusBadRequest, "validation_error", "billing_multiplier must be at least 1")
+	if err := a.store.UpsertModel(price); err != nil {
+		if errors.Is(err, policy.ErrStatePersist) {
+			return persistError(err)
 		}
-		model.BillingMultiplier = *req.BillingMultiplier
-	} else {
-		// Older management clients do not know this field. Preserve the setting
-		// instead of silently reverting an operator's multiplier on an edit.
-		for _, stored := range a.store.ModelsSnapshot() {
-			if strings.EqualFold(stored.Name, strings.TrimSpace(model.Name)) {
-				model.BillingMultiplier = stored.BillingMultiplier
-				break
-			}
-		}
-	}
-	if err := a.store.UpsertModel(model); err != nil {
 		return jsonError(http.StatusBadRequest, "validation_error", err.Error())
 	}
-	for _, stored := range a.store.ModelsSnapshot() {
-		if strings.EqualFold(stored.Name, strings.TrimSpace(model.Name)) {
-			return jsonResponse(http.StatusOK, map[string]any{"model": stored})
-		}
+	row, ok := a.store.PriceRowFor(price.Name, price.Provider)
+	if !ok {
+		return jsonError(http.StatusInternalServerError, "model_publish_failed", "saved price row is missing from the runtime table")
 	}
-	return jsonError(http.StatusInternalServerError, "model_publish_failed", "saved model is missing from the runtime index")
+	return jsonResponse(http.StatusOK, map[string]any{"model": row})
 }
 
 type modelDeleteRequest struct {
-	Name string `json:"name"`
+	Name     string `json:"name"`
+	Provider string `json:"provider"`
 }
 
 func (a *App) deleteModel(raw []byte) ManagementResponse {
@@ -72,8 +48,15 @@ func (a *App) deleteModel(raw []byte) ManagementResponse {
 	if err := decodeStrictBody(raw, &req); err != nil {
 		return jsonError(http.StatusBadRequest, "bad_request", err.Error())
 	}
-	if err := a.store.DeleteModel(req.Name); err != nil {
-		return jsonError(http.StatusBadRequest, "delete_failed", err.Error())
+	if err := a.store.DeleteModel(req.Name, req.Provider); err != nil {
+		switch {
+		case errors.Is(err, policy.ErrUnknownModel):
+			return jsonError(http.StatusNotFound, "not_found", err.Error())
+		case errors.Is(err, policy.ErrStatePersist):
+			return persistError(err)
+		default:
+			return jsonError(http.StatusBadRequest, "delete_failed", err.Error())
+		}
 	}
 	return jsonResponse(http.StatusOK, map[string]any{"deleted": true})
 }
@@ -93,10 +76,60 @@ func (a *App) importModelPrices(raw []byte) ManagementResponse {
 	}
 	result, err := a.store.ImportModelPrices(req.Matches, req.DryRun)
 	if err != nil {
-		if errors.Is(err, policy.ErrInvalidModelPriceImport) {
+		switch {
+		case errors.Is(err, policy.ErrInvalidModelPriceImport):
 			return jsonError(http.StatusBadRequest, "validation_error", err.Error())
+		case errors.Is(err, policy.ErrStatePersist):
+			return persistError(err)
+		default:
+			return jsonError(http.StatusInternalServerError, "import_failed", err.Error())
 		}
-		return jsonError(http.StatusInternalServerError, "import_failed", err.Error())
+	}
+	return jsonResponse(http.StatusOK, result)
+}
+
+type pricingPreviewRequest struct {
+	Models []string `json:"models"`
+}
+
+func (a *App) previewModelPrices(raw []byte) ManagementResponse {
+	var req pricingPreviewRequest
+	if err := decodeStrictBody(raw, &req); err != nil {
+		return jsonError(http.StatusBadRequest, "bad_request", err.Error())
+	}
+	if req.Models == nil {
+		req.Models = []string{}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	preview, err := a.pricing.Preview(ctx, req.Models)
+	if err != nil {
+		return jsonError(http.StatusBadGateway, "pricing_unavailable", err.Error())
+	}
+	return jsonResponse(http.StatusOK, preview)
+}
+
+type modelImportRequest struct {
+	Items []policy.ModelImportItem `json:"items"`
+}
+
+// importModels answers POST /models/import: $0 rows for upstream model ids
+// that have no row yet; existing rows are reported as skipped.
+func (a *App) importModels(raw []byte) ManagementResponse {
+	var req modelImportRequest
+	if err := decodeStrictBody(raw, &req); err != nil {
+		return jsonError(http.StatusBadRequest, "bad_request", err.Error())
+	}
+	result, err := a.store.ImportModels(req.Items)
+	if err != nil {
+		switch {
+		case errors.Is(err, policy.ErrInvalidModelImport):
+			return jsonError(http.StatusBadRequest, "validation_error", err.Error())
+		case errors.Is(err, policy.ErrStatePersist):
+			return persistError(err)
+		default:
+			return jsonError(http.StatusInternalServerError, "import_failed", err.Error())
+		}
 	}
 	return jsonResponse(http.StatusOK, result)
 }

@@ -1,0 +1,46 @@
+{
+  "RequestID": "6f1c2a4e-9b7d-4c3e-8a21-0d5f7e9c1b23",
+  "TraceID": "a1b2c3d4",
+  "Provider": "codex",
+  "BaseURL": "https://chatgpt.com/backend-api/codex",
+  "ExecutorType": "codexexecutor",
+  "Model": "gpt-5-codex",
+  "Alias": "fast",
+  "APIKey": "priced",
+  "IsNativeKey": false,
+  "AccessProvider": "cpa-key-policy",
+  "SessionID": "sess-1",
+  "ParentSessionID": "",
+  "AuthID": "auth-1",
+  "AuthIndex": "0",
+  "AuthType": "codex",
+  "Source": "codex-cli",
+  "ReasoningEffort": "medium",
+  "ServiceTier": "default",
+  "ResponseServiceTier": "default",
+  "ResponseModel": "gpt-5-codex",
+  "Generate": true,
+  "Stream": true,
+  "RequestedAt": "2026-10-17T01:02:03Z",
+  "Latency": 1234567890,
+  "TTFT": 345678901,
+  "Failed": false,
+  "Failure": {
+    "StatusCode": 0,
+    "Body": ""
+  },
+  "Detail": {
+    "InputTokens": 200000,
+    "OutputTokens": 100000,
+    "ReasoningTokens": 20000,
+    "CachedTokens": 0,
+    "CacheReadTokens": 0,
+    "CacheCreationTokens": 0,
+    "TotalTokens": 300000
+  },
+  "ResponseHeaders": {
+    "X-Request-Id": [
+      "req-1"
+    ]
+  }
+}

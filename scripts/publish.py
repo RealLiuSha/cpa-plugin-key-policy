@@ -35,6 +35,17 @@ import uuid
 PLUGIN = "cpa-key-policy"
 VERSION_FILES = ("internal/plugin/types.go", "web/package.json", "web/package-lock.json")
 EMBED = "internal/plugin/web/dist/index.html"
+# Data formats the publisher accepts: 6 is converted offline while the instance is
+# stopped (migration-check --out), 7 is the only format the plugin reads. Drop 6 once
+# no instance runs it.
+LEGACY_VERSION = 6
+DATA_VERSIONS = (LEGACY_VERSION, 7)
+USAGE_FILE = PLUGIN + "-usage.json"
+HISTORY_FILE = PLUGIN + "-history.json"
+AUDIT_FILE = PLUGIN + "-audit.jsonl"
+# Recovery pairs earlier releases wrote next to the state file; they are backed up and
+# leave the live directory with the format 6 data.
+RECOVERY_SUFFIXES = (".before-v5.json", ".before-v6.json", ".before-v7.json")
 TERMINAL = {"succeeded", "failed", "restored", "needs_attention"}
 VERSION_RE = re.compile(r"(\bVersion\s*=\s*\")([0-9]+\.[0-9]+\.[0-9]+)(\")")
 PROGRAM_SOURCE = Path(__file__).read_bytes() if "__file__" in globals() else b""
@@ -342,12 +353,37 @@ def runtime_plugin(url, key):
 
 
 def paired_data(state_path, usage_path):
+    """Read the state and live usage pair, and the history file the live file references.
+
+    A format 7 live file names the day its history file reaches; the plugin refuses to
+    start when that file is missing or behind, so the publisher refuses as well.
+    """
     state, usage = read_json(state_path), read_json(usage_path)
     require(state.get("dataset_id") and state.get("dataset_id") == usage.get("dataset_id"),
             "state/usage 数据集不匹配")
-    require(state.get("version") in (3, 4, 5, 6) and usage.get("version") in (3, 4, 5, 6),
+    require(state.get("version") in DATA_VERSIONS and usage.get("version") in DATA_VERSIONS,
             "目标数据格式不受当前发布脚本支持")
+    if usage.get("history_through"):
+        history_path = Path(usage_path).with_name(HISTORY_FILE)
+        require(history_path.is_file(), "usage 文件引用的 history 文件不存在：" + str(history_path))
+        history = read_json(history_path)
+        require(history.get("dataset_id") == state["dataset_id"] and history.get("version") == usage["version"]
+                and str(history.get("through", "")) >= str(usage["history_through"]),
+                "history 文件与 state/usage 不配对")
     return state, usage
+
+
+def ledger_files(state_path):
+    """Every ledger file kept next to the state file, for backup: live usage, history,
+    the audit log with its rotations, and each recovery pair with its archives."""
+    state = Path(state_path)
+    audit = state.with_name(AUDIT_FILE)
+    candidates = [state.with_name(USAGE_FILE), state.with_name(HISTORY_FILE),
+                  audit, *audit.parent.glob(audit.name + ".*")]
+    for suffix in RECOVERY_SUFFIXES:
+        recovery = Path(str(state) + suffix)
+        candidates.extend([recovery, *recovery.parent.glob(recovery.name + ".*")])
+    return [str(path) for path in candidates if path.is_file()]
 
 
 def inspect_target(request):
@@ -377,15 +413,10 @@ def inspect_target(request):
     plugin_path = mounted_file(container, plugin["path"])
     plugin_dir = mounted_file(container, config["plugins"].get("dir", "plugins"))
     state_path = mounted_file(container, item.get("state_file", "cpa-key-policy-state.json"))
-    usage_path = str(Path(state_path).with_name(PLUGIN + "-usage.json"))
+    usage_path = str(Path(state_path).with_name(USAGE_FILE))
     state, usage = paired_data(state_path, usage_path)
     http_get(url + "/healthz")
-    audit = Path(state_path).with_name(PLUGIN + "-audit.jsonl")
-    files = [str(config_path), plugin_path, state_path, usage_path]
-    files.extend(str(path) for path in [audit, *audit.parent.glob(audit.name + ".*")] if path.is_file())
-    for suffix in (".before-v5.json", ".before-v6.json"):
-        recovery = Path(state_path + suffix)
-        files.extend(str(path) for path in [recovery, *recovery.parent.glob(recovery.name + ".*")] if path.is_file())
+    files = [str(config_path), plugin_path, state_path, *ledger_files(state_path)]
     needed = sum(Path(path).stat().st_size for path in files) * 3 + 64 * 1024 * 1024
     require(shutil.disk_usage(root).free >= needed, "远端可用空间不足以保存发布包及完整备份")
     return {
@@ -500,11 +531,43 @@ def backup_files(directory, target):
     return backup
 
 
-def restore_before_start(backup, target):
+def replace_dataset(target, staging, backup):
+    """Swap the format 6 ledger for the converted format 7 dataset while CPA is stopped.
+
+    Every file that leaves must still match its backup. The audit log stays; the state
+    file is replaced last and the new files take over its owner and mode.
+    """
+    state = Path(target["state_path"])
+    manifest = {entry["source"]: entry for entry in read_json(backup / "manifest.json")["files"]}
+    audit = state.with_name(AUDIT_FILE)
+    leaving = [Path(path) for path in [str(state), *ledger_files(state)]
+               if not Path(path).name.startswith(audit.name)]
+    for path in leaving:
+        require(str(path) in manifest and sha(path.read_bytes()) == manifest[str(path)]["sha256"],
+                "待替换的数据与备份不一致：" + str(path))
+    owner = manifest[str(state)]
+    for path in leaving:
+        path.unlink()
+    for name in (HISTORY_FILE, USAGE_FILE, state.name):
+        source, destination = staging / name, state.with_name(name)
+        os.chmod(source, owner["mode"])
+        os.chown(source, owner["uid"], owner["gid"])
+        os.replace(source, destination)
+    staging.rmdir()
+
+
+def restore_before_start(backup, target, data=False):
     # Only used before docker start for the new version has even been attempted.
+    # Data is restored only when the format 6 ledger was already swapped out.
     manifest = read_json(backup / "manifest.json")
+    restored = {target["config_path"], target["plugin_path"]}
+    if data:
+        restored = {entry["source"] for entry in manifest["files"]}
+        history = Path(target["state_path"]).with_name(HISTORY_FILE)
+        if str(history) not in restored and history.exists():
+            history.unlink()
     for entry in manifest["files"]:
-        if entry["source"] not in (target["config_path"], target["plugin_path"]):
+        if entry["source"] not in restored:
             continue
         raw = (backup / entry["file"]).read_bytes()
         require(sha(raw) == entry["sha256"], "恢复文件校验失败")
@@ -554,7 +617,9 @@ def deploy_locked(directory):
     expected = request["target"]
     status = {"release_id": directory.name, "version": request["version"], "updated_at": now()}
     backup = None
+    staging = None
     stopped = False
+    swapped = False
     start_attempted = False
 
     def phase(value, **fields):
@@ -573,6 +638,9 @@ def deploy_locked(directory):
         require(not destination.exists(), "目标版本插件文件已存在，拒绝覆盖")
         config_raw = Path(target["config_path"]).read_bytes()
         updated_config = patch_config(config_raw, request["version"])
+        # A plugin section the new release rejects would fail registration after the switch.
+        accepted = json.loads(command([directory / "migration-check", "--config", target["config_path"]], timeout=60))
+        require(accepted.get("result") == "passed", "新版本不接受当前插件配置")
         phase("stopping")
         command(["docker", "stop", "--time=-1", target["container_id"]], timeout=300)
         require(not docker_inspect(target["container_id"])["State"]["Running"], "CPA 尚未停止")
@@ -583,18 +651,29 @@ def deploy_locked(directory):
         target["keys"], target["models"] = len(before.get("keys", [])), len(before.get("models", []))
         backup = backup_files(directory, target)
         phase("backed_up", backup=str(backup))
-        checker = json.loads(command([directory / "migration-check", "--state", target["state_path"],
-                                      "--timezone", target["timezone"]], timeout=120))
-        require(checker.get("result") == "passed", "最终落盘数据迁移演练失败")
+        check = [directory / "migration-check", "--state", target["state_path"], "--timezone", target["timezone"]]
+        if before["version"] == LEGACY_VERSION:
+            # Converted next to the state file so the swap is a rename on one filesystem.
+            staging = Path(target["state_path"]).with_name(".cpa-key-policy-v7-" + directory.name)
+            check += ["--out", str(staging)]
+        checker = json.loads(command(check, timeout=300))
+        require(checker.get("result") == "passed", "停机数据的迁移检查失败")
+        require(checker.get("keys") == target["keys"], "迁移检查后的 Key 数量与停机数据不符")
+        # Converting format 6 merges price rows that shared one upstream model, so
+        # the row count the new plugin will serve is the converted one, not the old state's.
+        target["models"] = checker["models"]
         phase("switching", migration=checker)
+        if staging:
+            swapped = True
+            replace_dataset(target, staging, backup)
         destination.parent.mkdir(parents=True, exist_ok=True)
         atomic_write(destination, (directory / request["library"]).read_bytes(), 0o755)
         config_path = Path(target["config_path"])
         info = config_path.stat()
         atomic_write(config_path, updated_config, info.st_mode & 0o777)
         os.chown(config_path, info.st_uid, info.st_gid)
-        # Once start is attempted, migration or traffic may already have written
-        # new data even if Docker/SSH reports an error. Never restore old data.
+        # Once start is attempted, traffic may already have written new data even
+        # if Docker/SSH reports an error. Never restore old data.
         phase("starting")
         start_attempted = True
         command(["docker", "start", target["container_id"]], timeout=60)
@@ -616,12 +695,15 @@ def deploy_locked(directory):
         message = str(error) if isinstance(error, PublishError) else type(error).__name__
         if stopped and not start_attempted:
             try:
+                if staging and staging.exists():
+                    shutil.rmtree(staging)
                 if backup:
-                    restore_before_start(backup, target)
+                    restore_before_start(backup, target, data=swapped)
                 else:
                     command(["docker", "start", expected["container_id"]], timeout=60)
                 verify_runtime(target, target["version"], target["plugin_container_path"])
-                phase("restored", error=message, detail="新版尚未启动，原版本已恢复；未回写任何旧账本")
+                detail = "新版尚未启动，原版本和停机时的账本已从备份恢复" if swapped else "新版尚未启动，原版本已恢复；账本未改动"
+                phase("restored", error=message, detail=detail)
             except Exception:
                 phase("needs_attention", error=message, detail="恢复旧版本未通过验收；保留备份和现场")
         elif start_attempted or status.get("phase") == "stopping":
@@ -687,7 +769,7 @@ def build_release(root, directory, target, version):
         print("[2/6] 在源码副本中构建前端并执行现有检查", flush=True)
         command(["make", "web-build"], cwd=source, env=env, show=True, timeout=900)
         for args, cwd in [(["npm", "test"], source / "web"), (["npm", "run", "typecheck"], source / "web"),
-                          (["npm", "audit", "--audit-level=moderate"], source / "web"),
+                          (["npm", "audit", "--omit=dev", "--audit-level=moderate"], source / "web"),
                           (["go", "test", "-race", "./..."], source), (["go", "vet", "./..."], source),
                           (["make", "check-version", "check-model-domain"], source)]:
             command(args, cwd=cwd, env=env, show=True, timeout=900)

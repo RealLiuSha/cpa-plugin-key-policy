@@ -1,5 +1,6 @@
 import { apiClient, pluginPath } from "./client";
 import type {
+  BalanceAdjustment,
   KeyPublic,
   KeyWriteRequest,
   CreateKeyResponse,
@@ -81,6 +82,20 @@ export async function fetchKeyHistory(id: string, days = 30): Promise<KeyHistory
   const c = apiClient();
   const { data } = await c.get<KeyHistoryResponse>(pluginPath("/keys/history"), {
     params: { id, days },
+  });
+  return data;
+}
+
+// adjustBalance adds amountUSD (negative to deduct) to a balance key. The same
+// requestId makes a retried request return the first result instead of
+// adjusting twice.
+export async function adjustBalance(id: string, amountUSD: number, note: string, requestId: string): Promise<BalanceAdjustment> {
+  const c = apiClient();
+  const { data } = await c.post<BalanceAdjustment>(pluginPath("/keys/balance"), {
+    id,
+    amount_usd: amountUSD,
+    ...(note.trim() ? { note: note.trim() } : {}),
+    request_id: requestId,
   });
   return data;
 }

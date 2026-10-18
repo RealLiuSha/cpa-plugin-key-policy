@@ -51,7 +51,7 @@ describe("fetchCatalog current CPA contract", () => {
     expect(client.post).not.toHaveBeenCalled();
   });
 
-  it("keeps channels that existing models route to", async () => {
+  it("keeps channels that existing price rows are qualified with", async () => {
     await expect(fetchCatalog(new Set(["XAI"]))).resolves.toContainEqual({ provider: "xai", model: "grok-4.6" });
   });
 });

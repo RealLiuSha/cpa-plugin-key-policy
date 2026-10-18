@@ -1,11 +1,25 @@
-import type { ModelDefinition } from "../types";
+import type { ModelPrice } from "../types";
 
 type Translate = (key: string, variables?: Record<string, string | number>) => string;
 
 const clean = (value: number) => Number(value.toPrecision(12));
 
-// A model without any price bills $0 until prices are synced or entered.
-export function isUnpriced(model: ModelDefinition): boolean {
+export const MAX_MULTIPLIER = 50;
+
+export function validMultiplier(input: string): boolean {
+  const value = Number(input);
+  return input.trim() !== "" && Number.isFinite(value) && value >= 1 && value <= MAX_MULTIPLIER;
+}
+
+// A row's identity, as the plugin keys it: the model id ignoring case and the
+// provider qualifier without CPA's "openai-compatible-" prefix.
+export function priceRowKey(name: string, provider: string): string {
+  return name.trim().toLowerCase() + "\u0000" + provider.trim().toLowerCase().replace(/^openai-compatible-/, "");
+}
+
+// Mirrors the plugin's rule for a draft row: a row without any price bills $0
+// as unpriced. Saved rows carry the plugin's own `priced` flag.
+export function isUnpriced(model: ModelPrice): boolean {
   if (model.billing_mode === "per_call") return !((model.per_call_usd ?? 0) > 0);
   return ![
     model.input_price_per_million,
@@ -18,7 +32,7 @@ export function isUnpriced(model: ModelDefinition): boolean {
 // What a key is charged per 1M tokens. Mirrors the ledger: a zero cache-read
 // price and a missing cache-write price fall back to the input price, and the
 // multiplier scales every token charge.
-export function effectiveTokenPrices(model: ModelDefinition) {
+export function effectiveTokenPrices(model: ModelPrice) {
   const multiplier = model.billing_multiplier ?? 1;
   const input = model.input_price_per_million ?? 0;
   return {
@@ -30,8 +44,8 @@ export function effectiveTokenPrices(model: ModelDefinition) {
 }
 
 // The configured prices, before the multiplier.
-export function basePriceSummary(model: ModelDefinition, translate: Translate): string {
-  if (isUnpriced(model)) return translate("models.unpriced");
+export function basePriceSummary(model: ModelPrice, translate: Translate): string {
+  if (isUnpriced(model)) return translate("usage.unpriced");
   if (model.billing_mode === "per_call") return translate("models.pricePerCallSummary", { price: clean(model.per_call_usd ?? 0) });
   const sameAsInput = translate("models.sameAsInput");
   return translate("models.priceTokenSummary", {
@@ -43,8 +57,8 @@ export function basePriceSummary(model: ModelDefinition, translate: Translate): 
 }
 
 // The prices a key actually pays, for places that show one line per model.
-export function modelPriceSummary(model: ModelDefinition, translate: Translate): string {
-  if (isUnpriced(model)) return translate("models.unpriced");
+export function modelPriceSummary(model: ModelPrice, translate: Translate): string {
+  if (isUnpriced(model)) return translate("usage.unpriced");
   if (model.billing_mode === "per_call") return translate("models.pricePerCallSummary", { price: clean(model.per_call_usd ?? 0) });
   const prices = effectiveTokenPrices(model);
   return translate("models.priceTokenSummary", {

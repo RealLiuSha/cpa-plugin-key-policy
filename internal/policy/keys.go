@@ -14,8 +14,6 @@ import (
 
 const HashPrefix = "sha256:"
 
-var ErrUnknownKey = errors.New("unknown key")
-
 func GenerateKey() (string, error) {
 	buf := make([]byte, 32)
 	if _, err := rand.Read(buf); err != nil {
@@ -54,6 +52,8 @@ func PreviewKey(key string) string {
 	return fmt.Sprintf("%s...%s", key[:7], key[len(key)-5:])
 }
 
+// ExtractAPIKey reads the client key from the request headers first and the
+// query string second.
 func ExtractAPIKey(headers http.Header, query map[string][]string) string {
 	for _, name := range []string{"Authorization", "X-API-Key", "api-key", "x-api-key", "x-goog-api-key"} {
 		value := strings.TrimSpace(headerValue(headers, name))

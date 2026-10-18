@@ -8,51 +8,69 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math"
-	"sort"
+	"os"
 	"strings"
 	"time"
 
 	"cpa-key-policy/internal/policy/persist"
 )
 
-const (
-	currentStateFileVersion = 6
-	currentUsageFileVersion = 6
-	minReadableFileVersion  = 3
-	maxReadableFileVersion  = 6
-)
+// currentFileVersion is the data format of all three files and the only one
+// the plugin reads. Older datasets are converted offline before the upgrade
+// (cmd/cpa-key-policy-check --out).
+const currentFileVersion = 7
 
-type persistedState struct {
-	Version   int               `json:"version"`
-	DatasetID string            `json:"dataset_id"`
-	Keys      []KeyConfig       `json:"keys"`
-	Models    []ModelDefinition `json:"models"`
-	UpdatedAt time.Time         `json:"updated_at"`
+type stateFile struct {
+	Version   int          `json:"version"`
+	DatasetID string       `json:"dataset_id"`
+	Keys      []KeyConfig  `json:"keys"`
+	Models    []ModelPrice `json:"models"`
+	UpdatedAt time.Time    `json:"updated_at"`
 }
 
-// compatState is the state layout of versions 3 through 5.
-type compatState struct {
-	Version       int           `json:"version"`
-	DatasetID     string        `json:"dataset_id"`
-	Keys          []KeyConfig   `json:"keys"`
-	Models        []compatModel `json:"models"`
-	ClassifyRules []compatRule  `json:"classify_rules,omitempty"`
-	UpdatedAt     time.Time     `json:"updated_at"`
+// liveFile holds every key's quota cycles and the days newer than the
+// history watermark. Keys that no longer exist in state keep their days.
+type liveFile struct {
+	Version        int                `json:"version"`
+	DatasetID      string             `json:"dataset_id"`
+	UpdatedAt      time.Time          `json:"updated_at"`
+	Timezone       string             `json:"timezone"`
+	HistoryThrough string             `json:"history_through"`
+	Keys           map[string]liveKey `json:"keys"`
 }
 
-type persistedUsage struct {
-	Version   int                    `json:"version"`
-	DatasetID string                 `json:"dataset_id"`
-	Usage     map[string]*UsageState `json:"usage"`
-	UpdatedAt time.Time              `json:"updated_at"`
+type liveKey struct {
+	Cycles  *Cycles                      `json:"cycles,omitempty"`
+	Balance *Balance                     `json:"balance,omitempty"`
+	Days    map[string]map[string]Bucket `json:"days,omitempty"`
 }
 
-type UsageFile struct {
+// historyFile holds the closed days (≤ through) inside retention.
+type historyFile struct {
+	Version   int                                     `json:"version"`
+	DatasetID string                                  `json:"dataset_id"`
+	UpdatedAt time.Time                               `json:"updated_at"`
+	Through   string                                  `json:"through"`
+	Days      map[string]map[string]map[string]Bucket `json:"days"`
+}
+
+type State struct {
 	Version   int
 	DatasetID string
-	Usage     map[string]*UsageState
+	Keys      []KeyConfig
+	Models    []ModelPrice
 	UpdatedAt time.Time
+}
+
+// UsageDataset is the merged view of the live and history files.
+type UsageDataset struct {
+	DatasetID string
+	Timezone  string
+	// Through is the history watermark: days up to it came from the history
+	// file, later days from the live file.
+	Through   string
+	UpdatedAt time.Time
+	Keys      map[string]*KeyUsage
 }
 
 func ResolveStatePath(path string) (string, error) {
@@ -67,10 +85,32 @@ func NewDatasetID() (string, error) {
 	return hex.EncodeToString(raw[:]), nil
 }
 
-func LoadState(path string) (*State, error) {
-	if err := persist.CleanupStaleTemps(path, time.Now()); err != nil {
-		return nil, err
+type fileHeader struct {
+	Version   int    `json:"version"`
+	DatasetID string `json:"dataset_id"`
+}
+
+func readHeader(raw []byte, kind string) (fileHeader, error) {
+	var header fileHeader
+	if err := json.Unmarshal(raw, &header); err != nil {
+		return header, fmt.Errorf("decode %s header: %w", kind, err)
 	}
+	if strings.TrimSpace(header.DatasetID) == "" {
+		return header, fmt.Errorf("%s dataset_id is required", kind)
+	}
+	return header, nil
+}
+
+// unsupportedVersion is the one judgement of a file version that is not the
+// one a decoder expects.
+func unsupportedVersion(kind string, version int) error {
+	if version < currentFileVersion {
+		return fmt.Errorf("unsupported %s version %d; convert the dataset offline with cpa-key-policy-check --out before starting this release", kind, version)
+	}
+	return fmt.Errorf("unsupported %s version %d; require version %d", kind, version, currentFileVersion)
+}
+
+func LoadState(path string) (*State, error) {
 	raw, err := persist.Read(path)
 	if err != nil {
 		return nil, err
@@ -79,100 +119,194 @@ func LoadState(path string) (*State, error) {
 }
 
 func decodeState(raw []byte) (*State, error) {
-	var header struct {
-		Version   int    `json:"version"`
-		DatasetID string `json:"dataset_id"`
-	}
-	if err := json.Unmarshal(raw, &header); err != nil {
-		return nil, fmt.Errorf("decode state header: %w", err)
-	}
-	if header.Version < minReadableFileVersion || header.Version > maxReadableFileVersion {
-		return nil, schemaVersionError("state", header.Version)
-	}
-	if strings.TrimSpace(header.DatasetID) == "" {
-		return nil, errors.New("state dataset_id is required")
-	}
-	var disk persistedState
-	var removed []string
-	if header.Version >= currentStateFileVersion {
-		if err := decodeJSONStrict(raw, &disk); err != nil {
-			return nil, fmt.Errorf("decode current state: %w", err)
-		}
-	} else {
-		var legacy compatState
-		if err := decodeJSONStrict(raw, &legacy); err != nil {
-			return nil, fmt.Errorf("decode state version %d: %w", header.Version, err)
-		}
-		models, notes, err := projectCompatModels(legacy.Models, legacy.ClassifyRules)
-		if err != nil {
-			return nil, fmt.Errorf("convert state version %d: %w", header.Version, err)
-		}
-		disk = persistedState{Version: legacy.Version, DatasetID: legacy.DatasetID, Keys: legacy.Keys, Models: models, UpdatedAt: legacy.UpdatedAt}
-		removed = notes
-	}
-	cfg := Config{Enabled: true, Keys: disk.Keys, Models: disk.Models}
-	if err := normalizeConfig(&cfg); err != nil {
-		return nil, fmt.Errorf("validate current state: %w", err)
-	}
-	return &State{
-		Version:         disk.Version,
-		DatasetID:       strings.TrimSpace(disk.DatasetID),
-		Keys:            cfg.Keys,
-		Models:          cfg.Models,
-		UpdatedAt:       disk.UpdatedAt,
-		RemovedSettings: removed,
-	}, nil
-}
-
-func LoadUsage(path string) (*UsageFile, error) {
-	raw, err := persist.Read(path)
+	header, err := readHeader(raw, "state")
 	if err != nil {
 		return nil, err
 	}
-	return decodeUsage(raw)
+	if header.Version != currentFileVersion {
+		return nil, unsupportedVersion("state", header.Version)
+	}
+	var disk stateFile
+	if err := decodeJSONStrict(raw, &disk); err != nil {
+		return nil, fmt.Errorf("decode state: %w", err)
+	}
+	if err := normalizeKeys(disk.Keys); err != nil {
+		return nil, fmt.Errorf("validate state: %w", err)
+	}
+	if _, err := normalizeModelPrices(disk.Models); err != nil {
+		return nil, fmt.Errorf("validate state: %w", err)
+	}
+	if disk.Models == nil {
+		disk.Models = []ModelPrice{}
+	}
+	if disk.Keys == nil {
+		disk.Keys = []KeyConfig{}
+	}
+	return &State{Version: disk.Version, DatasetID: strings.TrimSpace(disk.DatasetID), Keys: disk.Keys, Models: disk.Models, UpdatedAt: disk.UpdatedAt}, nil
 }
 
-func decodeUsage(raw []byte) (*UsageFile, error) {
-	var header struct {
-		Version   int    `json:"version"`
-		DatasetID string `json:"dataset_id"`
+// LoadUsage reads the live file and, when the live file says history exists,
+// the history file, and merges them: history owns every day up to its
+// watermark, the live file owns the later days.
+func LoadUsage(statePath string) (*UsageDataset, error) {
+	liveRaw, err := persist.Read(persist.UsagePath(statePath))
+	if err != nil {
+		return nil, fmt.Errorf("read live usage: %w", err)
 	}
-	if err := json.Unmarshal(raw, &header); err != nil {
-		return nil, fmt.Errorf("decode usage header: %w", err)
+	live, err := decodeLive(liveRaw)
+	if err != nil {
+		return nil, err
 	}
-	if header.Version < minReadableFileVersion || header.Version > maxReadableFileVersion {
-		return nil, schemaVersionError("usage", header.Version)
+	historyRaw, err := persist.Read(persist.HistoryPath(statePath))
+	var history *historyFile
+	switch {
+	case err == nil:
+		if history, err = decodeHistory(historyRaw); err != nil {
+			return nil, err
+		}
+	case errors.Is(err, os.ErrNotExist):
+		if live.HistoryThrough != "" {
+			return nil, fmt.Errorf("live usage expects history through %s but %s is missing", live.HistoryThrough, persist.HistoryPath(statePath))
+		}
+	default:
+		return nil, fmt.Errorf("read usage history: %w", err)
 	}
-	if strings.TrimSpace(header.DatasetID) == "" {
-		return nil, errors.New("usage dataset_id is required")
+	return mergeUsage(live, history)
+}
+
+func mergeUsage(live *liveFile, history *historyFile) (*UsageDataset, error) {
+	dataset := &UsageDataset{DatasetID: live.DatasetID, Timezone: live.Timezone, UpdatedAt: live.UpdatedAt, Keys: make(map[string]*KeyUsage, len(live.Keys))}
+	if history != nil {
+		if history.DatasetID != live.DatasetID {
+			return nil, fmt.Errorf("live/history dataset_id mismatch: live=%q history=%q", live.DatasetID, history.DatasetID)
+		}
+		if live.HistoryThrough > history.Through {
+			return nil, fmt.Errorf("live usage was written against history through %s but the history file only reaches %s", live.HistoryThrough, history.Through)
+		}
+		dataset.Through = history.Through
+		for id, days := range history.Days {
+			dataset.Keys[id] = &KeyUsage{Days: cloneDays(days, func(string) bool { return true })}
+		}
 	}
-	var disk persistedUsage
-	if err := decodeJSONStrict(raw, &disk); err != nil {
-		return nil, fmt.Errorf("decode current usage: %w", err)
-	}
-	if disk.Usage == nil {
-		disk.Usage = make(map[string]*UsageState)
-	}
-	if err := ValidateUsageStates(disk.Usage); err != nil {
-		return nil, fmt.Errorf("validate current usage: %w", err)
-	}
-	if disk.Version >= 5 {
-		for id, state := range disk.Usage {
-			if state.Cycles == nil {
-				return nil, fmt.Errorf("usage version %d key %q is missing quota cycles", disk.Version, id)
+	for id, key := range live.Keys {
+		usage := dataset.Keys[id]
+		if usage == nil {
+			usage = &KeyUsage{Days: make(map[string]map[string]Bucket)}
+			dataset.Keys[id] = usage
+		}
+		usage.Cycles, usage.Balance = key.Cycles, key.Balance
+		for date, models := range key.Days {
+			if date > dataset.Through {
+				usage.Days[date] = models
 			}
 		}
 	}
-	return &UsageFile{
-		Version:   disk.Version,
-		DatasetID: strings.TrimSpace(disk.DatasetID),
-		Usage:     disk.Usage,
-		UpdatedAt: disk.UpdatedAt,
-	}, nil
+	return dataset, nil
 }
 
-func schemaVersionError(kind string, version int) error {
-	return fmt.Errorf("unsupported %s version %d; require version %d through %d", kind, version, minReadableFileVersion, maxReadableFileVersion)
+func decodeLive(raw []byte) (*liveFile, error) {
+	header, err := readHeader(raw, "usage")
+	if err != nil {
+		return nil, err
+	}
+	if header.Version != currentFileVersion {
+		return nil, unsupportedVersion("usage", header.Version)
+	}
+	var disk liveFile
+	if err := decodeJSONStrict(raw, &disk); err != nil {
+		return nil, fmt.Errorf("decode live usage: %w", err)
+	}
+	disk.DatasetID = strings.TrimSpace(disk.DatasetID)
+	location, err := time.LoadLocation(disk.Timezone)
+	if err != nil || disk.Timezone == "" {
+		return nil, fmt.Errorf("invalid live usage timezone %q", disk.Timezone)
+	}
+	if disk.HistoryThrough != "" {
+		if err := validateDate(disk.HistoryThrough); err != nil {
+			return nil, fmt.Errorf("live usage history_through: %w", err)
+		}
+	}
+	if disk.Keys == nil {
+		disk.Keys = make(map[string]liveKey)
+	}
+	for id, key := range disk.Keys {
+		if strings.TrimSpace(id) == "" {
+			return nil, errors.New("live usage has an empty key id")
+		}
+		if key.Cycles != nil {
+			if err := validateCycles(key.Cycles, location); err != nil {
+				return nil, fmt.Errorf("live usage key %q: %w", id, err)
+			}
+		}
+		if key.Balance != nil {
+			if err := key.Balance.validate(); err != nil {
+				return nil, fmt.Errorf("live usage key %q: %w", id, err)
+			}
+		}
+		if err := validateDays(key.Days); err != nil {
+			return nil, fmt.Errorf("live usage key %q: %w", id, err)
+		}
+	}
+	return &disk, nil
+}
+
+func decodeHistory(raw []byte) (*historyFile, error) {
+	header, err := readHeader(raw, "history")
+	if err != nil {
+		return nil, err
+	}
+	if header.Version != currentFileVersion {
+		return nil, unsupportedVersion("history", header.Version)
+	}
+	var disk historyFile
+	if err := decodeJSONStrict(raw, &disk); err != nil {
+		return nil, fmt.Errorf("decode usage history: %w", err)
+	}
+	disk.DatasetID = strings.TrimSpace(disk.DatasetID)
+	if err := validateDate(disk.Through); err != nil {
+		return nil, fmt.Errorf("usage history through: %w", err)
+	}
+	if disk.Days == nil {
+		disk.Days = make(map[string]map[string]map[string]Bucket)
+	}
+	for id, days := range disk.Days {
+		if strings.TrimSpace(id) == "" {
+			return nil, errors.New("usage history has an empty key id")
+		}
+		if err := validateDays(days); err != nil {
+			return nil, fmt.Errorf("usage history key %q: %w", id, err)
+		}
+		for date := range days {
+			if date > disk.Through {
+				return nil, fmt.Errorf("usage history key %q has day %s after through %s", id, date, disk.Through)
+			}
+		}
+	}
+	return &disk, nil
+}
+
+func validateDate(date string) error {
+	if _, err := time.Parse(dateLayout, date); err != nil {
+		return fmt.Errorf("invalid date %q", date)
+	}
+	return nil
+}
+
+func validateDays(days map[string]map[string]Bucket) error {
+	for date, models := range days {
+		if err := validateDate(date); err != nil {
+			return err
+		}
+		for model, bucket := range models {
+			if strings.TrimSpace(model) == "" {
+				return fmt.Errorf("day %s has an empty model name", date)
+			}
+			if err := bucket.validate(); err != nil {
+				return fmt.Errorf("day %s model %q: %w", date, model, err)
+			}
+		}
+	}
+	return nil
 }
 
 func decodeJSONStrict(raw []byte, target any) error {
@@ -190,7 +324,7 @@ func decodeJSONStrict(raw []byte, target any) error {
 	return nil
 }
 
-func SaveState(path, datasetID string, keys []KeyConfig, models []ModelDefinition) error {
+func SaveState(path, datasetID string, keys []KeyConfig, models []ModelPrice) error {
 	raw, err := MarshalState(datasetID, keys, models, time.Now().UTC())
 	if err != nil {
 		return err
@@ -198,111 +332,108 @@ func SaveState(path, datasetID string, keys []KeyConfig, models []ModelDefinitio
 	return persist.AtomicWrite(path, raw)
 }
 
-func MarshalState(datasetID string, keys []KeyConfig, models []ModelDefinition, updatedAt time.Time) ([]byte, error) {
+// WriteDataset creates a complete dataset next to statePath, none of whose
+// files may exist yet: days before now's accounting day go to the history
+// file, the quota periods and today to the live file, and the state is
+// written last. Days outside retention are dropped. Everything is validated
+// as on load before the first file is written.
+func WriteDataset(statePath, datasetID, timezone string, now time.Time, keys []KeyConfig, models []ModelPrice, usage map[string]*KeyUsage) error {
+	location, err := time.LoadLocation(timezone)
+	if err != nil || strings.TrimSpace(timezone) == "" {
+		return fmt.Errorf("invalid usage timezone %q", timezone)
+	}
+	livePath, historyPath := persist.UsagePath(statePath), persist.HistoryPath(statePath)
+	for _, path := range []string{statePath, livePath, historyPath} {
+		if _, err := os.Stat(path); err == nil {
+			return fmt.Errorf("%s already exists", path)
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	if _, err := MarshalState(datasetID, keys, models, now); err != nil {
+		return fmt.Errorf("validate state: %w", err)
+	}
+	for id, key := range usage {
+		if strings.TrimSpace(id) == "" || key == nil {
+			return errors.New("usage has an empty key id or entry")
+		}
+		if key.Cycles != nil {
+			if err := validateCycles(key.Cycles, location); err != nil {
+				return fmt.Errorf("usage key %q: %w", id, err)
+			}
+		}
+		if err := validateDays(key.Days); err != nil {
+			return fmt.Errorf("usage key %q: %w", id, err)
+		}
+	}
+	ledger := newUsageLedger(func() time.Time { return now }, location, timezone)
+	ledger.load(usage, "")
+	through := ledger.dateKeyOffset(now, -1)
+	ledger.mu.Lock()
+	history := ledger.historySnapshotLocked(through)
+	live := ledger.liveSnapshotLocked(through)
+	ledger.mu.Unlock()
+	if err := writeHistory(historyPath, datasetID, through, history, now); err != nil {
+		return fmt.Errorf("write usage history: %w", err)
+	}
+	if err := writeLive(livePath, datasetID, timezone, through, live, now); err != nil {
+		return fmt.Errorf("write live usage: %w", err)
+	}
+	if err := SaveState(statePath, datasetID, keys, models); err != nil {
+		return fmt.Errorf("write state: %w", err)
+	}
+	return nil
+}
+
+func MarshalState(datasetID string, keys []KeyConfig, models []ModelPrice, updatedAt time.Time) ([]byte, error) {
 	datasetID = strings.TrimSpace(datasetID)
 	if datasetID == "" {
 		return nil, errors.New("state dataset_id is required")
 	}
-	cfg := Config{Enabled: true, Keys: append([]KeyConfig(nil), keys...), Models: append([]ModelDefinition(nil), models...)}
-	if err := normalizeConfig(&cfg); err != nil {
+	keys = append([]KeyConfig{}, keys...)
+	models = append([]ModelPrice{}, models...)
+	if err := normalizeKeys(keys); err != nil {
 		return nil, err
 	}
-	state := persistedState{
-		Version: currentStateFileVersion, DatasetID: datasetID, Keys: cfg.Keys, Models: cfg.Models, UpdatedAt: updatedAt.UTC(),
+	if _, err := normalizeModelPrices(models); err != nil {
+		return nil, err
 	}
-	return json.MarshalIndent(state, "", "  ")
+	return json.MarshalIndent(stateFile{Version: currentFileVersion, DatasetID: datasetID, Keys: keys, Models: models, UpdatedAt: updatedAt.UTC()}, "", "  ")
 }
 
-func SaveUsage(path, datasetID string, usage map[string]*UsageState) error {
-	raw, err := MarshalUsage(datasetID, usage, time.Now().UTC())
+// writeLive replaces the live file. The snapshot is taken against the
+// watermark before the flush, so a failed history write keeps the closed
+// days here; through is the watermark the history file actually reached,
+// and days at or before it are trimmed. The ledger is rewritten whole on
+// every flush, so the file stays compact.
+func writeLive(path, datasetID, timezone, through string, keys map[string]liveKey, updatedAt time.Time) error {
+	disk := liveFile{Version: currentFileVersion, DatasetID: datasetID, UpdatedAt: updatedAt.UTC(), Timezone: timezone, HistoryThrough: through, Keys: make(map[string]liveKey, len(keys))}
+	for id, key := range keys {
+		days := make(map[string]map[string]Bucket, len(key.Days))
+		for date, models := range key.Days {
+			if date > through && len(models) > 0 {
+				days[date] = models
+			}
+		}
+		if key.Cycles == nil && key.Balance == nil && len(days) == 0 {
+			continue
+		}
+		disk.Keys[id] = liveKey{Cycles: key.Cycles, Balance: key.Balance, Days: days}
+	}
+	raw, err := json.Marshal(disk)
 	if err != nil {
 		return err
 	}
 	return persist.AtomicWrite(path, raw)
 }
 
-func MarshalUsage(datasetID string, usage map[string]*UsageState, updatedAt time.Time) ([]byte, error) {
-	datasetID = strings.TrimSpace(datasetID)
-	if datasetID == "" {
-		return nil, errors.New("usage dataset_id is required")
+func writeHistory(path, datasetID, through string, days map[string]map[string]map[string]Bucket, updatedAt time.Time) error {
+	if days == nil {
+		days = make(map[string]map[string]map[string]Bucket)
 	}
-	if err := ValidateUsageStates(usage); err != nil {
-		return nil, err
+	raw, err := json.Marshal(historyFile{Version: currentFileVersion, DatasetID: datasetID, UpdatedAt: updatedAt.UTC(), Through: through, Days: days})
+	if err != nil {
+		return err
 	}
-	for id, state := range usage {
-		if state.Cycles == nil {
-			return nil, fmt.Errorf("cannot save key %q without quota cycles", id)
-		}
-	}
-	disk := persistedUsage{
-		Version: currentUsageFileVersion, DatasetID: datasetID, Usage: usage, UpdatedAt: updatedAt.UTC(),
-	}
-	// The ledger is rewritten whole on every flush; indentation would add
-	// about 40% to each write and most of its encoding time.
-	return json.Marshal(disk)
-}
-
-func ValidateUsageStates(states map[string]*UsageState) error {
-	keyIDs := make([]string, 0, len(states))
-	for keyID := range states {
-		keyIDs = append(keyIDs, keyID)
-	}
-	sort.Strings(keyIDs)
-	for _, keyID := range keyIDs {
-		state := states[keyID]
-		if state == nil {
-			return fmt.Errorf("key %q has null usage state", keyID)
-		}
-		if err := validateUsageCycles(state.Cycles); err != nil {
-			return fmt.Errorf("key %q: %w", keyID, err)
-		}
-		if state.Days == nil {
-			state.Days = make(map[string]UsageBucket)
-		}
-		if state.ByModel == nil {
-			state.ByModel = make(map[string]map[string]UsageBucket)
-		}
-		modelNames := make([]string, 0, len(state.ByModel))
-		for name := range state.ByModel {
-			if strings.TrimSpace(name) == "" {
-				return fmt.Errorf("key %q has empty by_model name", keyID)
-			}
-			modelNames = append(modelNames, name)
-		}
-		sort.Strings(modelNames)
-		allDates := make(map[string]struct{}, len(state.Days))
-		for date := range state.Days {
-			allDates[date] = struct{}{}
-		}
-		for _, name := range modelNames {
-			for date := range state.ByModel[name] {
-				allDates[date] = struct{}{}
-			}
-		}
-		for date := range allDates {
-			var sum UsageBucket
-			for _, name := range modelNames {
-				sum = addUsageBucket(sum, state.ByModel[name][date])
-			}
-			if !usageBucketsEqual(state.Days[date], sum) {
-				return fmt.Errorf("key %q date %q days bucket does not equal by_model sum", keyID, date)
-			}
-		}
-	}
-	return nil
-}
-
-func usageBucketsEqual(left, right UsageBucket) bool {
-	return nearlyEqual(left.TotalUSD, right.TotalUSD) &&
-		left.CallCount == right.CallCount &&
-		left.CacheReadTokens == right.CacheReadTokens &&
-		nearlyEqual(left.CacheCostUSD, right.CacheCostUSD) &&
-		left.CacheWriteTokens == right.CacheWriteTokens &&
-		nearlyEqual(left.CacheWriteUSD, right.CacheWriteUSD) &&
-		left.InputTokens == right.InputTokens &&
-		left.OutputTokens == right.OutputTokens
-}
-
-func nearlyEqual(left, right float64) bool {
-	return math.Abs(left-right) <= 1e-9
+	return persist.AtomicWrite(path, raw)
 }

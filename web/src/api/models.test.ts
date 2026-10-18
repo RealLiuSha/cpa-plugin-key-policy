@@ -4,7 +4,7 @@ import {
   filterByConfigured,
   fromAuthFileModels,
   fromAuthFiles,
-  fromModelDefinitions,
+  fromStaticModels,
   fromOpenAICompat,
 } from "./models";
 
@@ -56,11 +56,11 @@ describe("current CPA response adapters", () => {
   });
 
   it("reads canonical static model definition ids and validates the channel", () => {
-    expect(fromModelDefinitions("claude", {
+    expect(fromStaticModels("claude", {
       channel: "claude",
       models: [{ id: "claude-sonnet-4", display_name: "Sonnet" }],
     })).toEqual({ provider: "claude", models: ["claude-sonnet-4"], static: true });
-    expect(() => fromModelDefinitions("claude", { channel: "gemini", definitions: [] })).toThrow();
+    expect(() => fromStaticModels("claude", { channel: "gemini", definitions: [] })).toThrow();
   });
 });
 

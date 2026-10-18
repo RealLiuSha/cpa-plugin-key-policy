@@ -5,7 +5,8 @@ import type { KeyUsageResponse, QuotaWindow } from "../types";
 import { extractApiError } from "../api/error";
 import { useT } from "../i18n";
 import Modal from "./Modal";
-import { formatQuotaDate, formatUSD } from "./QuotaUsage";
+import { formatQuotaDate } from "./QuotaUsage";
+import { formatUSD } from "../format";
 
 export default function QuotaResetDialog({ keyId, initialWindow, onClose, onComplete }: {
   keyId: string;
@@ -32,7 +33,7 @@ export default function QuotaResetDialog({ keyId, initialWindow, onClose, onComp
       setData(value);
       if (!initialWindow && retry === 0) {
         const blocked = value.usage?.cycles?.find((cycle) => `${cycle.window}_exceeded` === value.usage?.blocked_reason);
-        setSelected(blocked?.window ?? (value.usage?.limited_models?.length ? "daily" : value.usage?.cycles?.find((cycle) => cycle.limit_usd > 0)?.window) ?? "weekly");
+        setSelected(blocked?.window ?? value.usage?.cycles?.find((cycle) => cycle.limit_usd > 0)?.window ?? "weekly");
       }
     }).catch((reason: unknown) => { if (active) setError(extractApiError(reason, t("keys.loadFailed"))); })
       .finally(() => { if (active) setLoading(false); });
@@ -81,7 +82,6 @@ export default function QuotaResetDialog({ keyId, initialWindow, onClose, onComp
             </fieldset>
             {cycle && <dl className="quota-reset-preview"><div><dt>{t("quota.currentUsed")}</dt><dd>{formatUSD(cycle.used_usd)} → {formatUSD(0)}</dd></div><div><dt>{t("quota.afterReset")}</dt><dd>{formatQuotaDate(cycle.reset_after_manual_at, data.usage.timezone)}</dd></div></dl>}
             <p className="muted quota-reset-help">{t("quota.resetHelp")}</p>
-            {selected === "daily" && <p className="muted quota-reset-help">{t("quota.resetDailyHelp")}</p>}
           </> : <p className="error">{t("quota.unavailable")}</p>}
         </>}
       </>}

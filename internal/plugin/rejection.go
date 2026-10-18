@@ -41,11 +41,22 @@ func rejectionBody(sourceFormat string, denial *policy.Denial, message string) [
 	case strings.HasPrefix(format, "gemini"):
 		payload = map[string]any{"error": map[string]any{"code": http.StatusTooManyRequests, "message": message, "status": "RESOURCE_EXHAUSTED"}}
 	default:
-		errorType, code := "insufficient_quota", "insufficient_quota"
-		if denial.Reason == "rpm_exceeded" {
-			errorType, code = "rate_limit_error", "rate_limit_exceeded"
+		errorBody := map[string]any{"message": message, "type": "insufficient_quota", "code": "insufficient_quota"}
+		switch {
+		case denial.Reason == "rpm_exceeded":
+			errorBody["type"], errorBody["code"] = "rate_limit_error", "rate_limit_exceeded"
+		case format == "openai-response" && denial.Reason != "balance_exhausted":
+			// Codex shows fixed text for insufficient_quota but names the reset
+			// time for usage_limit_reached with resets_at (Unix seconds). code
+			// stays insufficient_quota for SDKs that branch on it. A used-up
+			// balance never resets, so it keeps insufficient_quota, whose fixed
+			// "check your plan and billing" text is the right advice.
+			errorBody["type"] = "usage_limit_reached"
+			if !denial.RetryAt.IsZero() {
+				errorBody["resets_at"] = denial.RetryAt.Unix()
+			}
 		}
-		payload = map[string]any{"error": map[string]any{"message": message, "type": errorType, "code": code}}
+		payload = map[string]any{"error": errorBody}
 	}
 	body, _ := json.Marshal(payload)
 	return body
@@ -69,8 +80,8 @@ func denialMessage(denial *policy.Denial, now time.Time) string {
 		return fmt.Sprintf("7-day quota of $%.2f for this API key is used up. It resets at %s.", denial.Limit, resetsAt)
 	case "monthly_exceeded":
 		return fmt.Sprintf("30-day quota of $%.2f for this API key is used up. It resets at %s.", denial.Limit, resetsAt)
-	case "model_daily_exceeded":
-		return fmt.Sprintf("Daily quota of $%.2f for model %s on this API key is used up. It resets at %s.", denial.Limit, denial.Model, resetsAt)
+	case "balance_exhausted":
+		return "The prepaid balance of this API key is used up. Ask your administrator to add credit."
 	default:
 		return "This API key cannot send more requests right now."
 	}
