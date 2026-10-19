@@ -217,7 +217,10 @@ func (a *App) configure(raw []byte, register bool) error {
 	defer a.lifecycleMu.Unlock()
 	var req LifecycleRequest
 	if len(raw) > 0 {
-		if err := decodeStrictBody(raw, &req); err != nil {
+		// Lenient like the YAML block: a newer host may add fields along with
+		// the higher schema_version accepted below, and refusing them would
+		// drop every capability, leaving CPA without this access provider.
+		if err := json.Unmarshal(raw, &req); err != nil {
 			return err
 		}
 	}

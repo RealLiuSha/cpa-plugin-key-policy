@@ -120,16 +120,31 @@ func TestLifecycleAcceptsNewerHostSchema(t *testing.T) {
 	}
 }
 
-func TestLifecycleRejectsOlderHostSchemaAndUnknownFields(t *testing.T) {
+// A newer host may add envelope fields; refusing one would leave CPA without
+// the plugin's auth. The schema floor still holds.
+func TestLifecycleRejectsOlderHostSchemaAndIgnoresUnknownFields(t *testing.T) {
 	app := NewApp()
+	t.Cleanup(app.Shutdown)
 	statePath := filepath.ToSlash(filepath.Join(t.TempDir(), "state.json"))
-	older, _ := json.Marshal(map[string]any{"schema_version": MinHostSchemaVersion - 1, "config_yaml": []byte("enabled: true\nstate_file: \"" + statePath + "\"\n")})
+	config := []byte("enabled: true\nstate_file: \"" + statePath + "\"\n")
+	older, _ := json.Marshal(map[string]any{"schema_version": MinHostSchemaVersion - 1, "config_yaml": config})
 	if _, err := app.HandleMethod(MethodPluginRegister, older); err == nil {
 		t.Fatalf("host schema_version %d was accepted", MinHostSchemaVersion-1)
 	}
-	unknown, _ := json.Marshal(map[string]any{"schema_version": SchemaVersion, "config_yaml": []byte("enabled: true\nstate_file: \"" + statePath + "\"\n"), "unexpected": true})
-	if _, err := app.HandleMethod(MethodPluginRegister, unknown); err == nil {
-		t.Fatal("unknown lifecycle field was accepted")
+	unknown, _ := json.Marshal(map[string]any{"schema_version": SchemaVersion + 1, "config_yaml": config, "unexpected": map[string]any{"nested": true}})
+	if _, err := app.HandleMethod(MethodPluginRegister, append(unknown, []byte(" {}")...)); err == nil {
+		t.Fatal("a second JSON value after the lifecycle request was accepted")
+	}
+	response, err := app.HandleMethod(MethodPluginRegister, unknown)
+	if err != nil {
+		t.Fatalf("unknown lifecycle field was refused: %v", err)
+	}
+	var env struct {
+		Result Registration `json:"result"`
+	}
+	decode(t, response, &env)
+	if !env.Result.Capabilities.FrontendAuthProvider {
+		t.Fatalf("registration with an unknown field lost the auth capability: %+v", env.Result.Capabilities)
 	}
 }
 
