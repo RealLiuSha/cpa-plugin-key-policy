@@ -81,19 +81,35 @@ func (cycle *Cycle) used() Nano {
 }
 
 func (l *usageLedger) startOfDay(at time.Time) time.Time {
-	local := at.In(l.location)
-	return time.Date(local.Year(), local.Month(), local.Day(), 0, 0, 0, 0, l.location)
+	return dayStart(at, 0, l.location)
+}
+
+// dayStart is the first instant of the calendar day `days` after at's local
+// day. Where DST starts at local midnight (Santiago, Cairo) 00:00 does not
+// exist and time.Date may resolve it to 23:00 of the day before; the day
+// then starts when that zone ends. Boundaries are always derived from a
+// calendar date this way, since AddDate on such a 23:00 would carry the
+// hour into every later period.
+func dayStart(at time.Time, days int, loc *time.Location) time.Time {
+	local := at.In(loc)
+	year, month, day := time.Date(local.Year(), local.Month(), local.Day()+days, 0, 0, 0, 0, time.UTC).Date()
+	start := time.Date(year, month, day, 0, 0, 0, 0, loc)
+	if start.Day() != day {
+		_, start = start.ZoneBounds()
+	}
+	return start
 }
 
 // newCycles opens the three periods at the key's creation (or migration)
 // instant: the daily period starts at that day's 00:00, the longer periods
-// at the instant itself; every period ends at 00:00 N days after that day.
+// at the instant itself; every period ends when the day N days after that
+// day starts.
 func (l *usageLedger) newCycles(at time.Time, kind string) *Cycles {
 	cycles := &Cycles{}
 	for _, window := range quotaWindows {
 		cycle := cycles.cycle(window)
 		*cycle = Cycle{
-			StartedAt: at, ResetsAt: l.startOfDay(at).AddDate(0, 0, window.days()),
+			StartedAt: at, ResetsAt: dayStart(at, window.days(), l.location),
 			ResetKind: kind, ByModel: make(map[string]Bucket),
 		}
 		if window == UsageResetDaily {
@@ -114,17 +130,18 @@ func (l *usageLedger) advanceCyclesLocked(cycles *Cycles, now time.Time) bool {
 			continue
 		}
 		start := cycle.ResetsAt.In(l.location)
-		for !now.Before(start.AddDate(0, 0, window.days())) {
-			start = start.AddDate(0, 0, window.days())
+		next := dayStart(start, window.days(), l.location)
+		for !now.Before(next) {
+			start, next = next, dayStart(next, window.days(), l.location)
 		}
-		*cycle = Cycle{StartedAt: start, ResetsAt: start.AddDate(0, 0, window.days()), ResetKind: "automatic", ByModel: make(map[string]Bucket)}
+		*cycle = Cycle{StartedAt: start, ResetsAt: next, ResetKind: "automatic", ByModel: make(map[string]Bucket)}
 		changed = true
 	}
 	return changed
 }
 
 func (l *usageLedger) manualResetDeadline(now time.Time, window UsageResetWindow) time.Time {
-	return l.startOfDay(now).AddDate(0, 0, window.days())
+	return dayStart(now, window.days(), l.location)
 }
 
 func validateCycles(cycles *Cycles, location *time.Location) error {
@@ -133,9 +150,7 @@ func validateCycles(cycles *Cycles, location *time.Location) error {
 		if cycle.StartedAt.IsZero() || !cycle.ResetsAt.After(cycle.StartedAt) {
 			return fmt.Errorf("invalid %s quota interval", window)
 		}
-		start := cycle.StartedAt.In(location)
-		deadline := time.Date(start.Year(), start.Month(), start.Day(), 0, 0, 0, 0, location).AddDate(0, 0, window.days())
-		if !deadline.Equal(cycle.ResetsAt) {
+		if !dayStart(cycle.StartedAt, window.days(), location).Equal(cycle.ResetsAt) {
 			return fmt.Errorf("invalid %s quota reset date", window)
 		}
 		switch cycle.ResetKind {

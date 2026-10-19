@@ -4,7 +4,6 @@ import { listKeys } from "../api/keys";
 import { extractApiError } from "../api/error";
 import type { KeyPublic, KeyStatus, QuotaMode } from "../types";
 import { useT } from "../i18n";
-import { MobileTabBar } from "../components/MobileChrome";
 import PlainKeyModal from "../components/PlainKeyModal";
 import KeyMoreMenu from "../components/KeyMoreMenu";
 import QuotaUsage from "../components/QuotaUsage";
@@ -12,6 +11,7 @@ import QuotaResetDialog from "../components/QuotaResetDialog";
 import BalanceUsage, { balanceOf, balanceSpentRatio, isBalanceKey } from "../components/BalanceUsage";
 import BalanceDialog from "../components/BalanceDialog";
 import { useSearchDraft } from "../search";
+import { useVisiblePolling } from "../polling";
 
 export const KEY_LIST_PAGE_SIZE = 20;
 export type KeySort = "attention" | "ratio" | "reset" | "name";
@@ -104,11 +104,9 @@ export default function KeyList() {
   }, [t]);
   useEffect(() => {
     void load();
-    const refreshVisible = () => { if (document.visibilityState === "visible") void load(); };
-    const timer = window.setInterval(refreshVisible, 30_000);
-    window.addEventListener("focus", refreshVisible);
-    return () => { requestID.current++; window.clearInterval(timer); window.removeEventListener("focus", refreshVisible); };
+    return () => { requestID.current++; };
   }, [load]);
+  useVisiblePolling(() => void load(), 30_000);
 
   const filtered = useMemo(() => sortKeys(filterKeys(keys, query, status, mode), sort), [keys, query, status, mode, sort]);
   const pageCount = Math.max(1, Math.ceil(filtered.length / KEY_LIST_PAGE_SIZE));
@@ -149,7 +147,6 @@ export default function KeyList() {
         })}
       </div> : <div className="card key-empty"><strong>{t(keys.length ? "keys.searchNoMatch" : "keys.empty")}</strong>{keys.length > 0 && <button className="btn" onClick={clearFilters}>{t("quota.clearFilters")}</button>}</div>}
       {pageCount > 1 && <nav className="key-list-pager" aria-label={t("quota.pagination")}><button className="btn sm" disabled={safePage === 0} onClick={() => updateFilter("page", String(safePage - 1))}>{t("keys.prevPage")}</button><span>{t("keys.pageInfo", { cur: safePage + 1, total: pageCount })}</span><button className="btn sm" disabled={safePage >= pageCount - 1} onClick={() => updateFilter("page", String(safePage + 1))}>{t("keys.nextPage")}</button></nav>}
-      <MobileTabBar active="keys" />
       {resetKey && <QuotaResetDialog keyId={resetKey} onClose={() => setResetKey(null)} onComplete={load} />}
       {balanceKey && <BalanceDialog keyId={balanceKey} onClose={() => setBalanceKey(null)} onComplete={load} />}
       {plain && <PlainKeyModal plainKey={plain} title={t("keys.rotated")} onClose={() => setPlain(null)} />}

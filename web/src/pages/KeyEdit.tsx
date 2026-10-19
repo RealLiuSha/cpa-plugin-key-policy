@@ -9,7 +9,7 @@ import { useLocation, useNavigate, useParams } from "react-router-dom";
 import { listKeys, patchKey } from "../api/keys";
 import KeyForm, { keyWriteRequestFromForm } from "../components/KeyForm";
 import KeyMoreMenu, { type KeyMoreMenuItem } from "../components/KeyMoreMenu";
-import { MobileFormHeader, MobileTabBar } from "../components/MobileChrome";
+import { MobileFormHeader } from "../components/MobileChrome";
 import PlainKeyModal from "../components/PlainKeyModal";
 import { useT } from "../i18n";
 import type { KeyPublic } from "../types";
@@ -99,7 +99,6 @@ export default function KeyEdit() {
         } else navigate(backTo);
       }} />}
       {plain && <PlainKeyModal plainKey={plain} title={plainTitle} onClose={() => setPlain(null)} />}
-      <MobileTabBar active="keys" />
     </div>
   );
 }

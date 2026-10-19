@@ -18,7 +18,43 @@ var (
 	priceRowFields    = []string{"name", "provider", "billing_mode", "billing_multiplier", "input_price_per_million", "output_price_per_million", "cache_read_price_per_million", "per_call_usd", "priced"}
 	statsTotalsFields = []string{"charged_usd", "calls", "unpriced_calls", "input_tokens", "cache_read_tokens", "cache_write_tokens", "output_tokens"}
 	healthFields      = []string{"last_flush_at", "last_flush_error", "flush_failures", "skipped_failed", "ignored_unknown_key", "ignored_no_model", "ignored_empty_usage", "clamped_tokens", "invalid_usage", "unmetered_per_call", "unpriced_calls"}
+
+	// The 萝卜 console routes.
+	overviewFields       = []string{"today", "keys", "channels", "modules", "warnings", "recent_changes"}
+	settingsFields       = []string{"version", "plugin_id", "display_name", "modules", "module_errors", "hooks", "config_warnings", "files", "ui", "ownership", "health", "timezone"}
+	searchStateFields    = []string{"enabled", "declared", "settings", "status"}
+	channelViewFields    = []string{"auth_index", "meta", "last_24h", "today", "rules"}
+	channelViewOptional  = []string{"auth_id", "provider", "base_url", "balance"}
+	channelSummaryFields = []string{"attempts", "failures", "success_rate", "latency_p50_ms", "latency_p95_ms", "ttft_p50_ms", "ttft_p95_ms", "input_tokens", "output_tokens", "list_cost_usd", "upstream_cost_usd"}
 )
+
+func TestConsoleResponseShapes(t *testing.T) {
+	app := newTestApp(t, appOptions{})
+	recordUsage(t, app, UsageHandleRequest{AuthIndex: "0123456789abcdef", AuthID: "codex:apikey:1", Provider: "codex", Model: "gpt-5-codex", APIKey: testKeyID, Detail: UsageDetail{InputTokens: 10}})
+	assertShape(t, "GET /overview", managementOK(t, app, http.MethodGet, "/overview", nil, nil), overviewFields, nil)
+	assertShape(t, "GET /settings", managementOK(t, app, http.MethodGet, "/settings", nil, nil), settingsFields, nil)
+	assertShape(t, "GET /search", managementOK(t, app, http.MethodGet, "/search", nil, nil), searchStateFields, nil)
+	assertShape(t, "GET /adapters", managementOK(t, app, http.MethodGet, "/adapters", nil, nil), []string{"rules", "types"}, nil)
+
+	var channels struct {
+		Channels []json.RawMessage `json:"channels"`
+	}
+	body := managementOK(t, app, http.MethodGet, "/channels", nil, nil)
+	assertShape(t, "GET /channels", body, []string{"channels", "groups"}, nil)
+	decode(t, body, &channels)
+	if len(channels.Channels) != 1 {
+		t.Fatalf("channels = %s", body)
+	}
+	assertShape(t, "channels[0]", channels.Channels[0], channelViewFields, channelViewOptional)
+	var row struct {
+		Last24h json.RawMessage `json:"last_24h"`
+	}
+	decode(t, channels.Channels[0], &row)
+	assertShape(t, "channels[0].last_24h", row.Last24h, channelSummaryFields, []string{"status_codes", "last_at"})
+	if strings.Contains(string(body), "0001-01-01") {
+		t.Fatalf("zero times leak into GET /channels: %s", body)
+	}
+}
 
 func assertKeyObject(t *testing.T, label string, raw json.RawMessage) {
 	t.Helper()

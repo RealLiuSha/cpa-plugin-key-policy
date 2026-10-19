@@ -72,7 +72,8 @@ const (
 )
 
 // Routes on which CPA (v7.2.103 and later) applies request interceptors with
-// termination before contacting upstream.
+// termination before contacting upstream. The speech and TTS routes exist
+// from CPA v8.0.18; on older hosts gin answers 404 before authentication.
 var interceptedPOSTPaths = map[string]bool{
 	"/v1/chat/completions":                 true,
 	"/v1/completions":                      true,
@@ -83,6 +84,8 @@ var interceptedPOSTPaths = map[string]bool{
 	"/v1/videos/edits":                     true,
 	"/v1/videos/extensions":                true,
 	"/openai/v1/videos":                    true,
+	"/v1/audio/speech":                     true,
+	"/v1/tts":                              true,
 	"/v1/messages":                         true,
 	"/v1/messages/count_tokens":            true,
 	"/v1/responses":                        true,

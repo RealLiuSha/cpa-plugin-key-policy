@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"cpa-key-policy/internal/policy/audit"
@@ -35,6 +36,19 @@ type Store struct {
 	flusher     *usageFlusher
 	mediaTraces *mediaTraceSet
 	health      *Health
+
+	// handoff is set from Quiesce until Resume: billed usage and admitted
+	// media generations are then also journaled for the newer instance.
+	handoff  atomic.Pointer[handoffWriter]
+	followMu sync.Mutex
+	follower *handoffFollower
+
+	// logf, when set, receives the ledger turning unsaved and saved again,
+	// so they reach CPA's log; stdlib log only reaches stderr.
+	logf func(level, message string)
+	// unsaved is set from a failed usage flush to the next successful one,
+	// whichever path flushes; persistMu guards it.
+	unsaved bool
 }
 
 var (
@@ -64,6 +78,21 @@ func NewStore() *Store {
 	}
 }
 
+// SetLogf sends the lines that report the usage ledger turning unsaved and
+// saved again to logf. It is called before the first configuration.
+func (s *Store) SetLogf(logf func(level, message string)) {
+	s.logf = logf
+}
+
+// report writes one line through logf, or to stderr without it.
+func (s *Store) report(level, message string) {
+	if s.logf != nil {
+		s.logf(level, message)
+		return
+	}
+	log.Print(message)
+}
+
 // SetClock replaces the time source of every time-dependent component.
 func (s *Store) SetClock(now func() time.Time) {
 	if now == nil {
@@ -86,24 +115,58 @@ func (s *Store) clock() func() time.Time {
 	return ledger.now
 }
 
-func (s *Store) Configure(cfg Config) (err error) {
+func (s *Store) Configure(cfg Config) error {
+	return s.configure(cfg, false, false)
+}
+
+// Reload replaces what memory holds with the dataset in the files, which
+// another instance may have written since this store gave them up. Memory is
+// not written out first, and the journal this store kept since its quiesce
+// is closed once the files have loaded; the caller replays the journal in
+// the directory next (AdoptHandoff). journaled says this store gave the files
+// up by a quiesce, which journaled the media generations it had admitted.
+func (s *Store) Reload(cfg Config, journaled bool) error {
+	return s.configure(cfg, true, journaled)
+}
+
+func (s *Store) configure(cfg Config, reload, journaled bool) (err error) {
 	s.updateMu.Lock()
 	defer s.updateMu.Unlock()
+	statePath, err := ResolveStatePath(cfg.StateFile)
+	if err != nil {
+		return err
+	}
+	// CPA re-sends the configuration on every config apply, panel saves that
+	// never touch this block included. With the same dataset already in
+	// memory only the enabled switch can change, so nothing is reloaded and
+	// the request path is never held up. Edits made to the files while the
+	// plugin runs are not picked up; they need a restart. Another timezone
+	// for the same files is refused right here: the files carry the zone in
+	// memory, so loading them again could only fail.
+	if loaded, current := s.datasetLoaded(statePath); loaded && !reload {
+		if zone, _ := resolveUsageZone(cfg.UsageTimezone); zone != current {
+			return fmt.Errorf("usage ledger uses quota timezone %q; keep usage_timezone consistent", current)
+		}
+		s.mu.Lock()
+		s.enabled = cfg.Enabled
+		s.mu.Unlock()
+		return nil
+	}
 	s.lifecycleMu.Lock()
 	defer s.lifecycleMu.Unlock()
 	s.mu.RLock()
 	wasFlushing := s.flusher != nil
 	s.mu.RUnlock()
 	defer func() {
-		if err != nil && wasFlushing {
+		if err != nil && wasFlushing && !reload {
 			s.StartUsageFlusher()
 		}
 	}()
-	statePath, err := ResolveStatePath(cfg.StateFile)
-	if err != nil {
-		return err
-	}
-	if err := s.stopUsageFlusher(); err != nil {
+	s.stopFollowing()
+	if reload {
+		// Memory is older than the files: it is replaced, never written.
+		s.stopFlusher()
+	} else if err := s.stopUsageFlusher(); err != nil {
 		return fmt.Errorf("flush usage before reconfigure: %w", err)
 	}
 	clockNow := s.clock()
@@ -204,6 +267,12 @@ func (s *Store) Configure(cfg Config) (err error) {
 		nextUsage.mu.Unlock()
 	}
 
+	if reload {
+		// Billing waits on lifecycleMu, so nothing is journaled after this.
+		if writer := s.handoff.Swap(nil); writer != nil {
+			writer.close()
+		}
+	}
 	s.mu.Lock()
 	if s.flusher != nil {
 		s.flusher.stop()
@@ -218,9 +287,23 @@ func (s *Store) Configure(cfg Config) (err error) {
 	s.rebuildKeysByHashLocked()
 	s.usage = nextUsage
 	// mediaTraces outlives reconfiguration: a media generation admitted before
-	// a reload still has to be billed when its usage record arrives.
+	// a reload still has to be billed when its usage record arrives. After a
+	// quiesce a reload takes the generations still awaiting a record from the
+	// journal instead: the instance that adopted this store's journal may have
+	// billed them. A store shut down without a quiesce handed its own to no one.
+	if reload && journaled {
+		s.mediaTraces = newMediaTraceSet(clockNow)
+	}
 	s.mu.Unlock()
 	return nil
+}
+
+// datasetLoaded reports whether the dataset at statePath is in memory, and
+// the usage timezone its ledger counts in.
+func (s *Store) datasetLoaded(statePath string) (bool, string) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.datasetID != "" && s.statePath == statePath, s.usage.timezone
 }
 
 func (s *Store) Enabled() bool {
@@ -251,6 +334,12 @@ func (s *Store) recordAudit(event audit.Event) {
 	if err := logWriter.Append(event); err != nil {
 		log.Printf("cpa-key-policy: audit write failed action=%q key_id=%q: %v", event.Action, event.KeyID, err)
 	}
+}
+
+// RecordChange audits a management change outside the key store, such as a
+// channel or adapter rule; target names what changed.
+func (s *Store) RecordChange(action, target string, changes map[string]audit.Change) {
+	s.recordAudit(audit.Event{Actor: "management", Action: action, Target: target, Changes: changes})
 }
 
 func (s *Store) AuditEvents(keyID, action string, limit int) ([]audit.Event, error) {
@@ -385,14 +474,32 @@ func (s *Store) FlushUsage() error {
 			err = fmt.Errorf("%w; %v", historyErr, err)
 		}
 		health.flushFailed(err)
+		s.noteFlushLocked(err)
 		return err
 	}
 	if historyErr != nil {
 		health.flushFailed(historyErr)
+		s.noteFlushLocked(historyErr)
 		return historyErr
 	}
 	health.flushSucceeded(time.Now())
+	s.noteFlushLocked(nil)
 	return nil
+}
+
+// noteFlushLocked reports the ledger turning unsaved and saved again, once
+// each way, whichever flush sees it: the periodic one, a quiesce, a shutdown
+// or a key deletion. A failed flush keeps the ledger dirty, so only a real
+// write reports it saved again. persistMu is held.
+func (s *Store) noteFlushLocked(err error) {
+	switch {
+	case err != nil && !s.unsaved:
+		s.unsaved = true
+		s.report("error", fmt.Sprintf("cpa-key-policy: usage ledger cannot be saved, billing stays in memory until a flush succeeds (retried every %s): %v", usageFlushInterval, err))
+	case err == nil && s.unsaved:
+		s.unsaved = false
+		s.report("info", "cpa-key-policy: usage ledger saved again")
+	}
 }
 
 // saveState writes the state file for a management write. Callers validate
@@ -425,12 +532,50 @@ func (s *Store) StartUsageFlusher() func() {
 }
 
 // Shutdown stops the periodic flusher and writes the final accounting cut,
-// history first when days have closed, so nothing stays only in memory.
+// history first when days have closed, so nothing stays only in memory. A
+// store that is handing off wrote its cut at Quiesce and no longer owns the
+// files, so it writes nothing.
 func (s *Store) Shutdown() error {
+	s.stopFollowing()
+	if writer := s.handoff.Swap(nil); writer != nil {
+		writer.close()
+		return nil
+	}
 	return s.stopUsageFlusher()
 }
 
+// Stop ends the journal follower, the handoff journal and the periodic
+// flusher without writing anything: the plugin calls it at shutdown when the
+// data directory is not its own.
+//
+// The closed journal writer stays in place. On CPA HEAD a hot replacement by
+// the same bytes reaches this same store: when CPA discards that load, it
+// shuts the store down here and then rolls back with a reconfigure, whose
+// Resume removes the journal only through the writer. Memory holds every
+// entry of that journal, so a journal left behind would bill them again at
+// the next start or replacement. A closed writer appends nothing.
+func (s *Store) Stop() {
+	s.stopFollowing()
+	if writer := s.handoff.Load(); writer != nil {
+		writer.close()
+	}
+	s.stopFlusher()
+}
+
+// Loaded reports whether a dataset has been loaded.
+func (s *Store) Loaded() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.datasetID != ""
+}
+
 func (s *Store) stopUsageFlusher() error {
+	s.stopFlusher()
+	return s.FlushUsage()
+}
+
+// stopFlusher ends the periodic flusher and waits for a flush under way.
+func (s *Store) stopFlusher() {
 	s.mu.Lock()
 	f := s.flusher
 	s.flusher = nil
@@ -439,7 +584,6 @@ func (s *Store) stopUsageFlusher() error {
 		f.stop()
 		<-f.doneCh
 	}
-	return s.FlushUsage()
 }
 
 type usageFlusher struct {
@@ -458,9 +602,24 @@ func (f *usageFlusher) loop() {
 		case <-f.stopCh:
 			return
 		case <-ticker.C:
-			if err := f.store.FlushUsage(); err != nil {
-				log.Printf("cpa-key-policy: usage flush failed, retrying next interval: %v", err)
-			}
+			f.flush()
 		}
+	}
+}
+
+// flush runs one periodic flush. A panic here would end the whole CPA
+// process, since the plugin shares it, so it is counted as a failed flush
+// and retried next interval. Every failure goes to stderr; FlushUsage sends
+// the first one and the recovery to CPA's log.
+func (f *usageFlusher) flush() {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err := fmt.Errorf("usage flush panicked: %v", recovered)
+			f.store.health.flushFailed(err)
+			log.Printf("cpa-key-policy: %v", err)
+		}
+	}()
+	if err := f.store.FlushUsage(); err != nil {
+		log.Printf("cpa-key-policy: usage flush failed, retrying next interval: %v", err)
 	}
 }

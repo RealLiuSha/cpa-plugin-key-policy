@@ -8,22 +8,102 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"path/filepath"
+	"runtime/debug"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
+	"cpa-key-policy/internal/channel"
 	"cpa-key-policy/internal/plugin/web"
 	"cpa-key-policy/internal/policy"
+	"cpa-key-policy/internal/policy/persist"
 	"cpa-key-policy/internal/pricingmetadata"
+	"cpa-key-policy/internal/search"
 )
 
 type App struct {
 	store   *policy.Store
 	pricing *pricingmetadata.Client
+	// host calls back into CPA (host.log); nil outside CPA, as in tests.
+	host HostCaller
+
+	// lifecycleMu serializes register, reconfigure and quiesce.
+	lifecycleMu sync.Mutex
+	// writeMu orders management writes against a change of ownership. A
+	// write holds it shared and checks quiesced under it; quiesce and a move
+	// to another data directory hold it exclusively, so a write lands while
+	// this instance owns the files or is refused. Lock order: lifecycleMu,
+	// writeMu, channelPatchMu, then the channel registry's and the store's
+	// locks.
+	writeMu sync.RWMutex
+	// channelPatchMu serializes PATCH /channels, the only channel metadata
+	// write: its audit line compares the metadata read before the update with
+	// what the update stored, and no other patch may land in between.
+	channelPatchMu sync.Mutex
+	settings       atomic.Pointer[pluginSettings]
+	// warnings belong to the configuration in effect; rejected says why the
+	// latest one was not applied and is cleared once one is.
+	warnings atomic.Pointer[[]string]
+	rejected atomic.Pointer[string]
+	// declaredRouter is what the last registration told CPA about
+	// model_router; the settings can ask for a change that is not yet live.
+	declaredRouter atomic.Bool
+	// hostSchema is the lifecycle version the host offered.
+	hostSchema atomic.Uint32
+	// quiesced is set between plugin.quiesce and the next configuration: a
+	// newer instance owns the data files, so nothing here writes them.
+	quiesced atomic.Bool
+	// readOnly is set while quiesced when a rollback could not take the data
+	// directory back: writes are refused until a later config apply can.
+	readOnly atomic.Bool
+	// owner is the data directory's lock. Two instances of this plugin live
+	// in one CPA process during a hot replacement; only the holder writes.
+	owner     *persist.Lock
+	ownerPath string
+	// ownsData mirrors owner != nil for module goroutines.
+	ownsData atomic.Bool
+
+	modules        atomic.Pointer[moduleSet]
+	cpaCredentials cpaConfigCache
+	backgroundMu   sync.Mutex
+	loop           *background
+	timings        hookTimings
+	ui             web.Server
+
+	// usageDecodeLogged is when a usage record that did not decode was last
+	// logged (Unix nanoseconds).
+	usageDecodeLogged atomic.Int64
+}
+
+// HostCaller performs one host callback with a JSON request and returns the
+// host's JSON envelope.
+type HostCaller interface {
+	Call(method string, request []byte) ([]byte, error)
 }
 
 func NewApp() *App {
-	return &App{store: policy.NewStore(), pricing: pricingmetadata.NewClient()}
+	app := &App{store: policy.NewStore(), pricing: pricingmetadata.NewClient()}
+	app.cpaCredentials.path = func() string { return app.pluginSettings().CPAConfigPath }
+	app.cpaCredentials.logf = app.logf
+	app.store.SetLogf(app.logf)
+	return app
+}
+
+// SetHost connects the App to CPA's host callbacks.
+func (a *App) SetHost(host HostCaller) {
+	a.host = host
+}
+
+// pluginSettings returns the plugin's own settings from the last valid
+// configuration.
+func (a *App) pluginSettings() pluginSettings {
+	if settings := a.settings.Load(); settings != nil {
+		return *settings
+	}
+	return pluginSettings{CPAConfigPath: defaultCPAConfigPath}
 }
 
 func (a *App) SetPricingClient(client *pricingmetadata.Client) {
@@ -33,8 +113,13 @@ func (a *App) SetPricingClient(client *pricingmetadata.Client) {
 	a.pricing = client
 }
 
+// HandleMethod answers one host call. request may point into memory the
+// host owns and frees when the call returns: nothing may keep it, or any
+// slice of it, past the return.
 func (a *App) HandleMethod(method string, request []byte) ([]byte, error) {
-	return safePluginCall(func() ([]byte, error) {
+	started := time.Now()
+	defer func() { a.timings.record(method, time.Since(started)) }()
+	return safePluginCall(method, func() ([]byte, error) {
 		return a.handleMethod(method, request)
 	})
 }
@@ -42,10 +127,17 @@ func (a *App) HandleMethod(method string, request []byte) ([]byte, error) {
 func (a *App) handleMethod(method string, request []byte) ([]byte, error) {
 	switch method {
 	case MethodPluginRegister, MethodPluginReconfigure:
-		if err := a.configure(request); err != nil {
+		if err := a.configure(request, method == MethodPluginRegister); err != nil {
 			return nil, err
 		}
 		return OKEnvelope(a.registration())
+	case MethodPluginQuiesce:
+		// CPA only logs a failed quiesce; the data directory this instance
+		// kept is what stops the replacement.
+		if err := a.quiesce(); err != nil {
+			return ErrorEnvelope("handoff_failed", err.Error(), http.StatusInternalServerError), nil
+		}
+		return OKEnvelope(struct{}{})
 	case MethodFrontendAuthIdentifier:
 		return OKEnvelope(IdentifierResponse{Identifier: PluginID})
 	case MethodFrontendAuthAuthenticate:
@@ -53,7 +145,9 @@ func (a *App) handleMethod(method string, request []byte) ([]byte, error) {
 	case MethodRequestInterceptBefore:
 		return a.interceptRequest(request)
 	case MethodRequestInterceptAfter:
-		return OKEnvelope(RequestInterceptResponse{})
+		return a.adaptAttempt(request)
+	case MethodModelRoute:
+		return a.routeModel(request)
 	case MethodUsageHandle:
 		return a.handleUsage(request)
 	case MethodManagementRegister:
@@ -65,17 +159,62 @@ func (a *App) handleMethod(method string, request []byte) ([]byte, error) {
 	}
 }
 
-func safePluginCall(call func() ([]byte, error)) (response []byte, err error) {
+// safePluginCall answers a panic in call with an error that names the method
+// and the value. CPA turns a failed authentication into a 401 without a log
+// line and logs a failed usage.handle only at debug level, so the panic is
+// logged here as well.
+func safePluginCall(method string, call func() ([]byte, error)) (response []byte, err error) {
 	defer func() {
-		if recover() != nil {
+		if recovered := recover(); recovered != nil {
 			response = nil
-			err = errors.New("plugin panic recovered")
+			err = fmt.Errorf("plugin panic in %s: %v", method, recovered)
+			panicLogs.report(method, recovered)
 		}
 	}()
 	return call()
 }
 
-func (a *App) configure(raw []byte) error {
+// panicLogs writes the stack of a panic at most once a minute per method,
+// and one line otherwise: a panic on the request path repeats on every
+// request. It logs to stderr, not through a host callback.
+var panicLogs = panicLog{last: map[string]time.Time{}}
+
+type panicLog struct {
+	mu   sync.Mutex
+	last map[string]time.Time
+}
+
+func (p *panicLog) report(method string, recovered any) {
+	now := time.Now()
+	p.mu.Lock()
+	withStack := now.Sub(p.last[method]) >= time.Minute
+	if withStack {
+		p.last[method] = now
+	}
+	p.mu.Unlock()
+	if withStack {
+		log.Printf("cpa-key-policy: %s panicked: %v\n%s", method, recovered, debug.Stack())
+		return
+	}
+	log.Printf("cpa-key-policy: %s panicked: %v", method, recovered)
+}
+
+// configure applies a register or reconfigure. CPA sends reconfigure on
+// every config apply and drops the plugin from its active set when it fails,
+// taking auth, billing and routing down until the next apply. So once a
+// dataset is loaded, a configuration that cannot be applied keeps the last
+// valid one and is reported on the settings page instead; only a first
+// registration that cannot load its data fails, closed.
+//
+// A register can also reach an App that loaded its dataset before: CPA maps
+// a library whose bytes already ran in the process to the image still
+// resident (a rollback by store.version, or a re-enable after another build
+// ran). When this App gave the data directory up meanwhile, another instance
+// may have written the files, so it reloads them and replays the journal
+// like a first registration, and fails, closed, when they do not load.
+func (a *App) configure(raw []byte, register bool) error {
+	a.lifecycleMu.Lock()
+	defer a.lifecycleMu.Unlock()
 	var req LifecycleRequest
 	if len(raw) > 0 {
 		if err := decodeStrictBody(raw, &req); err != nil {
@@ -85,27 +224,236 @@ func (a *App) configure(raw []byte) error {
 	if req.SchemaVersion < MinHostSchemaVersion {
 		return fmt.Errorf("unsupported lifecycle schema_version %d; require >= %d", req.SchemaVersion, MinHostSchemaVersion)
 	}
-	cfg, err := ParseConfig(req.ConfigYAML)
+	a.hostSchema.Store(req.SchemaVersion)
+	cfg, settings, warnings, err := parseConfigDocument(req.ConfigYAML, false)
+	var claimed *persist.Lock
+	var claimedPath string
+	if err == nil {
+		claimed, claimedPath, err = a.claimDataDirectory(cfg.StateFile)
+	}
+	if claimed != nil {
+		// The dataset and the modules move to another directory: no
+		// management write lands in either one meanwhile.
+		a.writeMu.Lock()
+		defer a.writeMu.Unlock()
+	}
+	firstLoad := !a.store.Loaded()
+	stale := register && !firstLoad && a.owner == nil
+	if err == nil {
+		if stale {
+			err = a.store.Reload(cfg, a.quiesced.Load())
+		} else {
+			err = a.store.Configure(cfg)
+		}
+	}
+	if err == nil && stale {
+		// The modules reopen from the files too. The old ones write nothing:
+		// this instance does not own the directory yet.
+		if previous := a.modules.Swap(nil); previous != nil {
+			previous.detach(a.logf)
+		}
+		firstLoad = true
+	}
 	if err != nil {
-		return err
+		// The directory that failed to load is free again; the one this
+		// instance serves from stays locked.
+		_ = claimed.Release()
+		if !a.store.Loaded() || stale {
+			return err
+		}
+		rejected := "configuration not applied, the last valid one stays in effect: " + err.Error()
+		if a.owner == nil && errors.Is(err, persist.ErrLocked) {
+			rejected = "cannot take the data directory back after a rolled-back replacement; management writes are refused until the lock is free and the next config apply: " + err.Error()
+		}
+		a.rejected.Store(&rejected)
+		a.logf("warn", "cpa-key-policy: "+rejected)
+		a.resume(a.pluginSettings())
+		return nil
 	}
-	if err := a.store.Configure(cfg); err != nil {
-		return err
+	// The directory just loaded is this instance's from here on. The one it
+	// leaves stays locked until its modules are closed, which writes their
+	// statistics there.
+	left := a.adoptDataLock(claimed, claimedPath)
+	dir := filepath.Dir(a.store.StatePath())
+	if firstLoad {
+		// The modules open before the journal replays, so the channel
+		// observations it carries find their registry.
+		a.openModules(dir)
+		if replayed, err := a.store.AdoptHandoff(a.replayHandoff); err != nil {
+			warnings = append(warnings, "handoff journal not replayed: "+err.Error())
+		} else if replayed > 0 {
+			a.logf("info", fmt.Sprintf("cpa-key-policy: took over %d journaled entries from the previous instance", replayed))
+		}
 	}
-	a.store.StartUsageFlusher()
+	a.settings.Store(&settings)
+	a.warnings.Store(&warnings)
+	a.rejected.Store(nil)
+	a.ui.SetDataDir(dir)
+	a.openModules(dir)
+	_ = left.Release()
+	a.resume(settings)
 	return nil
 }
 
-// Shutdown writes the final accounting cut. The host calls it on plugin unload.
+// claimDataDirectory locks the data directory the configuration points at
+// and returns that lock and its path, or a nil lock when this instance holds
+// it already. Ownership changes only when the caller adopts the lock, once
+// the dataset there has loaded. A newer instance gets the directory only
+// after the older one released it at quiesce; without it a first
+// registration fails, closed, and CPA keeps the older instance.
+func (a *App) claimDataDirectory(stateFile string) (*persist.Lock, string, error) {
+	statePath, err := policy.ResolveStatePath(stateFile)
+	if err != nil {
+		return nil, "", err
+	}
+	path := persist.LockPath(statePath)
+	if a.owner != nil && a.ownerPath == path {
+		return nil, "", nil
+	}
+	lock, err := persist.TryLock(path)
+	if err != nil {
+		return nil, "", err
+	}
+	return lock, path, nil
+}
+
+// adoptDataLock makes a claimed lock this instance's ownership and returns
+// the lock it held before, for the caller to release. A nil lock changes
+// nothing.
+func (a *App) adoptDataLock(lock *persist.Lock, path string) *persist.Lock {
+	if lock == nil {
+		return nil
+	}
+	previous := a.owner
+	a.owner, a.ownerPath = lock, path
+	a.ownsData.Store(true)
+	return previous
+}
+
+// resume restarts what quiesce stopped; it is also the normal start. A
+// reconfigure after quiesce means CPA rolled the replacement back and this
+// instance serves again.
+func (a *App) resume(settings pluginSettings) {
+	if a.owner == nil {
+		// Rolled back after quiesce released the lock: take it again.
+		lock, path, err := a.claimDataDirectory(a.store.StatePath())
+		if err != nil {
+			a.readOnly.Store(true)
+			a.logf("error", "cpa-key-policy: cannot take the data directory back, staying read-only: "+err.Error())
+			return
+		}
+		a.adoptDataLock(lock, path)
+	}
+	a.readOnly.Store(false)
+	a.quiesced.Store(false)
+	a.store.Resume()
+	if set := a.modules.Load(); set != nil {
+		if set.channels != nil {
+			set.channels.Resume()
+		}
+		// A shutdown stopped the detection tests when CPA discarded a load
+		// that reached this same App (a hot replacement by the same bytes)
+		// before rolling back to it.
+		if set.quality != nil {
+			set.quality.Resume()
+		}
+	}
+	a.startBackground()
+	a.syncSearch(a.modules.Load(), settings)
+}
+
+// quiesce prepares for a hot replacement: CPA loads a newer instance next,
+// which reads the same files. Everything is written once more and nothing
+// here writes again until a configuration arrives (a rollback); what still
+// arrives goes to the handoff journal.
+//
+// When the accounting cut, the journal or the channel statistics cannot be
+// written, the newer instance would miss what this one billed or counted.
+// This instance then keeps the data directory and serves on unchanged: the
+// newer one cannot register, and CPA 911f49c and later roll the replacement
+// back to this one. CPA v8.0.13 unloads the failed library instead and
+// hangs, which is why hot replacement is not used there.
+func (a *App) quiesce() error {
+	a.lifecycleMu.Lock()
+	defer a.lifecycleMu.Unlock()
+	// Management writes under way finish first and later ones are refused,
+	// so none lands after the newer instance read the files.
+	a.writeMu.Lock()
+	defer a.writeMu.Unlock()
+	if a.owner == nil {
+		// Handed off already, or read-only since a rollback could not take
+		// the directory back: the files are not this instance's to write.
+		return nil
+	}
+	a.stopBackground()
+	// The journal opens first, so the channel statistics hand over from the
+	// instant they are written; both writes need the files still owned.
+	err := a.store.Quiesce()
+	if set := a.modules.Load(); err == nil && set != nil {
+		if err = set.handOff(a.journalObservation, a.logf); err != nil {
+			err = fmt.Errorf("hand off channel statistics: %w", err)
+		}
+	}
+	if err != nil {
+		a.logf("error", "cpa-key-policy: cannot hand off for a hot replacement, keeping the data directory so CPA keeps this instance: "+err.Error())
+		a.resume(a.pluginSettings())
+		return err
+	}
+	a.quiesced.Store(true)
+	if a.owner != nil {
+		_ = a.owner.Release()
+		a.owner = nil
+		a.ownsData.Store(false)
+	}
+	a.logf("info", "cpa-key-policy: quiesced for a hot replacement")
+	return nil
+}
+
+// Shutdown writes the final accounting cut. The host calls it on plugin
+// unload and at process exit. A quiesced instance wrote its cut already and
+// no longer owns the files.
+//
+// CPA refuses every callback of the plugin, stream_close included, before it
+// calls shutdown, so a detection test still reading a model stream ends only
+// when the upstream sends again, and CPA gives the whole shutdown 30 seconds.
+// The order follows from that: the accounting cut first, which also applies
+// the tail of a journal being followed; then the modules, whose channel
+// statistics then include that tail and are written before the detection
+// tests are waited for; the data directory lock last, so every write still
+// owns the files. The tests are always waited for: CPA v8.0.13 unloads the
+// library right after shutdown returns.
 func (a *App) Shutdown() {
+	a.lifecycleMu.Lock()
+	defer a.lifecycleMu.Unlock()
+	a.stopBackground()
+	set := a.modules.Load()
+	if a.quiesced.Load() || a.owner == nil {
+		// The files are not this instance's: nothing is written.
+		a.store.Stop()
+		if set != nil && set.quality != nil {
+			set.quality.Stop()
+		}
+		return
+	}
 	if err := a.store.Shutdown(); err != nil {
+		// Not through host.log: CPA has closed the callback instance by now
+		// and refuses the line.
 		log.Printf("cpa-key-policy: final usage flush failed: %v", err)
 	}
+	if set != nil {
+		set.close()
+	}
+	_ = a.owner.Release()
+	a.owner = nil
+	a.ownsData.Store(false)
 }
 
 func (a *App) registration() Registration {
+	set := a.modules.Load()
+	router := a.pluginSettings().SearchEnabled && set != nil && set.search != nil
+	a.declaredRouter.Store(router)
 	return Registration{
-		SchemaVersion: SchemaVersion,
+		SchemaVersion: min(SchemaVersion, max(a.hostSchema.Load(), MinHostSchemaVersion)),
 		Metadata: Metadata{
 			Name:             PluginName,
 			Version:          Version,
@@ -117,11 +465,14 @@ func (a *App) registration() Registration {
 				{Name: "usage_timezone", Type: "string", Description: "IANA timezone used for natural-day usage buckets. Defaults to Asia/Shanghai."},
 				{Name: "keys", Type: "array", Description: "First-boot downstream key seeds. State is authoritative after initialization."},
 				{Name: "models", Type: "array", Description: "First-boot price rows: upstream model id (name), optional provider qualifier, billing mode and prices."},
+				{Name: "search_enabled", Type: "boolean", Description: "Route Codex alpha search (registers a model router; settings are on the plugin's search page)."},
+				{Name: "cpa_config_path", Type: "string", Description: "CPA config.yaml, read only for the upstream keys of balance queries and detection tests. Defaults to config.yaml."},
 			},
 		},
 		Capabilities: Capabilities{
 			FrontendAuthProvider:          true,
 			FrontendAuthProviderExclusive: false,
+			ModelRouter:                   router,
 			RequestInterceptor:            true,
 			UsagePlugin:                   true,
 			ManagementAPI:                 true,
@@ -131,7 +482,7 @@ func (a *App) registration() Registration {
 
 func (a *App) authenticate(raw []byte) ([]byte, error) {
 	var req FrontendAuthRequest
-	if err := json.Unmarshal(raw, &req); err != nil {
+	if _, err := decodeSkippingBody(raw, &req); err != nil {
 		return nil, err
 	}
 	decision := a.store.Authenticate(req.Method, req.Path, req.Headers, req.Query)
@@ -149,7 +500,7 @@ func (a *App) authenticate(raw []byte) ([]byte, error) {
 // deferred, terminating it with 429 when the key is over a limit.
 func (a *App) interceptRequest(raw []byte) ([]byte, error) {
 	var req RequestInterceptRequest
-	if err := json.Unmarshal(raw, &req); err != nil {
+	if _, err := decodeSkippingBody(raw, &req); err != nil {
 		return nil, err
 	}
 	requestPath, _ := req.Metadata["request_path"].(string)
@@ -160,13 +511,78 @@ func (a *App) interceptRequest(raw []byte) ([]byte, error) {
 	return OKEnvelope(rejectionResponse(req.SourceFormat, denial, time.Now()))
 }
 
+// adaptAttempt runs the channel's adapter rules on one upstream attempt.
+// The body is decoded only when a rule of the selected credential applies to
+// the request path; any problem leaves the attempt unchanged.
+func (a *App) adaptAttempt(raw []byte) ([]byte, error) {
+	set := a.modules.Load()
+	if set == nil || set.adapters == nil {
+		return OKEnvelope(RequestInterceptResponse{})
+	}
+	var req RequestInterceptRequest
+	value, err := decodeSkippingBody(raw, &req)
+	if err != nil {
+		return OKEnvelope(RequestInterceptResponse{})
+	}
+	authIndex, _ := req.Metadata["selected_auth_index"].(string)
+	requestPath, _ := req.Metadata["request_path"].(string)
+	book := set.adapters.Book()
+	if !book.Match(authIndex, requestPath) {
+		return OKEnvelope(RequestInterceptResponse{})
+	}
+	body, err := decodeBodyBytes(value)
+	if err != nil {
+		return OKEnvelope(RequestInterceptResponse{})
+	}
+	rewritten, applied, err := book.Apply(authIndex, requestPath, body)
+	if err != nil || rewritten == nil {
+		return OKEnvelope(RequestInterceptResponse{})
+	}
+	set.adapters.RecordHits(applied)
+	return OKEnvelope(RequestInterceptResponse{Body: rewritten})
+}
+
+// routeModel answers model.route: alpha search requests only.
+func (a *App) routeModel(raw []byte) ([]byte, error) {
+	set := a.modules.Load()
+	if set == nil || set.search == nil || !a.pluginSettings().SearchEnabled {
+		return OKEnvelope(search.Decision{})
+	}
+	var req ModelRouteRequest
+	if _, err := decodeSkippingBody(raw, &req); err != nil {
+		return OKEnvelope(search.Decision{})
+	}
+	return OKEnvelope(set.search.Route(search.RouteRequest{SourceFormat: req.SourceFormat, RequestedModel: req.RequestedModel, Headers: req.Headers}))
+}
+
 func (a *App) handleUsage(raw []byte) ([]byte, error) {
 	var req UsageHandleRequest
-	// A malformed record must never break the request path: bill nothing.
+	// A record that cannot be read must never break the request path: it
+	// bills nothing. A field whose type changed is left zero and the record
+	// still counts, unless billing reads that field.
 	if err := json.Unmarshal(raw, &req); err != nil {
-		return OKEnvelope(UsageHandleResponse{})
+		var typeErr *json.UnmarshalTypeError
+		billable := errors.As(err, &typeErr)
+		if billable {
+			// encoding/json reports only the first field whose type changed
+			// and leaves later ones zero, so the fields billing reads are
+			// decoded once more on their own: the fields of this struct
+			// shadow the embedded ones billing does not read.
+			var billing struct {
+				UsageHandleRequest
+				BaseURL, AuthID, AuthIndex, RequestedAt, Latency, TTFT, Failure json.RawMessage
+			}
+			if billingErr := json.Unmarshal(raw, &billing); billingErr != nil {
+				billable, err = false, billingErr
+			}
+		}
+		a.reportUsageDecode(err, billable)
+		if !billable {
+			return OKEnvelope(UsageHandleResponse{})
+		}
 	}
-	a.store.RecordUsage(policy.UsageEvent{
+	requestedAt, _ := time.Parse(time.RFC3339Nano, req.RequestedAt)
+	event := policy.UsageEvent{
 		TraceID:        req.TraceID,
 		Provider:       req.Provider,
 		ExecutorType:   req.ExecutorType,
@@ -183,14 +599,45 @@ func (a *App) handleUsage(raw []byte) ([]byte, error) {
 			CacheCreationTokens: req.Detail.CacheCreationTokens,
 			TotalTokens:         req.Detail.TotalTokens,
 		},
-	})
+	}
+	// Channel statistics see every attempt, also those billing ignores:
+	// they describe the upstream, not the downstream key.
+	if set := a.modules.Load(); set != nil && set.channels != nil {
+		listCost, _ := a.store.ListCost(event)
+		set.channels.Observe(channel.Observation{
+			AuthIndex: req.AuthIndex, AuthID: req.AuthID, Provider: req.Provider, BaseURL: req.BaseURL, Model: req.Model,
+			Failed: req.Failed, StatusCode: req.Failure.StatusCode,
+			Latency: time.Duration(req.Latency), TTFT: time.Duration(req.TTFT), At: time.Now(), RequestedAt: requestedAt, TraceID: req.TraceID,
+			InputTokens: req.Detail.InputTokens, OutputTokens: req.Detail.OutputTokens,
+			CacheReadTokens: req.Detail.CacheReadTokens, CacheWriteTokens: req.Detail.CacheCreationTokens,
+			ListCostNano: int64(listCost), ErrorSnippet: req.Failure.Body,
+		})
+	}
+	a.store.RecordUsage(event)
 	return OKEnvelope(UsageHandleResponse{})
+}
+
+// reportUsageDecode logs a usage record that did not decode cleanly, at most
+// once a minute: CPA logs a failed usage.handle only at debug level, and a
+// wire type that changed fails every record. The error names the field and
+// the types, never the record.
+func (a *App) reportUsageDecode(err error, billed bool) {
+	now := time.Now().UnixNano()
+	last := a.usageDecodeLogged.Load()
+	if now-last < int64(time.Minute) || !a.usageDecodeLogged.CompareAndSwap(last, now) {
+		return
+	}
+	outcome := "not billed"
+	if billed {
+		outcome = "billed without that field"
+	}
+	a.logf("warn", fmt.Sprintf("cpa-key-policy: usage record does not decode (%s): %v", outcome, err))
 }
 
 func (a *App) managementRegistration() ManagementRegistrationResponse {
 	base := "/plugins/" + PluginID
 	return ManagementRegistrationResponse{
-		Routes: []ManagementRoute{
+		Routes: append([]ManagementRoute{
 			{Method: http.MethodGet, Path: base + "/keys", Description: "List downstream CPA key policies."},
 			{Method: http.MethodPost, Path: base + "/keys", Description: "Create a downstream CPA key policy."},
 			{Method: http.MethodPatch, Path: base + "/keys", Description: "Update a downstream CPA key policy by id."},
@@ -211,10 +658,24 @@ func (a *App) managementRegistration() ManagementRegistrationResponse {
 			{Method: http.MethodPost, Path: base + "/models/import-prices", Description: "Batch-import token prices for existing price rows (dry_run supported)."},
 			{Method: http.MethodPost, Path: base + "/models/pricing-preview", Description: "Preview Models.dev prices for selected CPA models without writing state."},
 			{Method: http.MethodPost, Path: base + "/models/import", Description: "Create $0 price rows for upstream models; existing rows are skipped."},
-		},
+			{Method: http.MethodGet, Path: base + "/overview", Description: "Today's numbers and what needs attention across keys and channels."},
+			{Method: http.MethodGet, Path: base + "/channels", Description: "Per-channel statistics, metadata and balances by CPA auth_index."},
+			{Method: http.MethodGet, Path: base + "/channels/detail", Description: "One channel's 7-day history and recent errors."},
+			{Method: http.MethodPatch, Path: base + "/channels", Description: "Update one channel's name, vendor, note, cost ratio or balance source."},
+			{Method: http.MethodPost, Path: base + "/channels/balance/refresh", Description: "Query one channel's upstream balance now."},
+			{Method: http.MethodGet, Path: base + "/adapters", Description: "List per-channel request rewrite rules."},
+			{Method: http.MethodPost, Path: base + "/adapters", Description: "Create or update a request rewrite rule."},
+			{Method: http.MethodDelete, Path: base + "/adapters", Description: "Delete a request rewrite rule by id."},
+			{Method: http.MethodPost, Path: base + "/adapters/preview", Description: "Show what a rule does to a sample body."},
+			{Method: http.MethodPost, Path: base + "/adapters/try", Description: "Send one real request with a rule applied, pinned to the rule's channel."},
+			{Method: http.MethodGet, Path: base + "/search", Description: "Alpha search routing settings and live channel state."},
+			{Method: http.MethodPut, Path: base + "/search", Description: "Replace the alpha search routing settings."},
+			{Method: http.MethodPost, Path: base + "/search/import", Description: "Import settings from an alpha-search-model plugin block."},
+			{Method: http.MethodGet, Path: base + "/settings", Description: "Module state, hook timings, data files and warnings."},
+		}, qualityRoutes(base)...),
 		Resources: []ResourceRoute{
 			// TRADEOFF: host menu is static Chinese only, revisit when CPA supports locale maps
-			{Path: web.IndexPath, Menu: "密钥策略", Description: "Web UI for downstream CPA key policies, model prices and usage statistics."},
+			{Path: web.IndexPath, Menu: PluginName, Description: "萝卜: keys, channels, prices, statistics, alpha search, detection and settings."},
 		},
 	}
 }
@@ -230,11 +691,24 @@ func (a *App) handleManagement(raw []byte) ([]byte, error) {
 	// the same management.handle method by CPA's ServeResourceHTTP.
 	resourcePrefix := "/v0/resource/plugins/" + PluginID
 	if req.Method == http.MethodGet && strings.HasPrefix(path, resourcePrefix) {
-		status, headers, body := web.Serve(strings.TrimPrefix(path, resourcePrefix))
+		status, headers, body := a.ui.Serve(strings.TrimPrefix(path, resourcePrefix), req.Headers)
 		return OKEnvelope(ManagementResponse{StatusCode: status, Headers: headers, Body: body})
 	}
 
+	// After quiesce a newer instance owns every data file; writes wait for
+	// it. A write holds writeMu shared and checks quiesced under it, so it
+	// lands before quiesce writes the accounting cut or is refused.
 	base := "/v0/management/plugins/" + PluginID
+	if req.Method != http.MethodGet {
+		if !networkBoundCalls[strings.TrimPrefix(path, base)] {
+			a.writeMu.RLock()
+			defer a.writeMu.RUnlock()
+		}
+		if a.quiesced.Load() {
+			return OKEnvelope(a.writeRefused())
+		}
+	}
+
 	switch {
 	case req.Method == http.MethodGet && path == base+"/keys":
 		return OKEnvelope(jsonResponse(http.StatusOK, map[string]any{"keys": a.publicKeys(a.store.Keys())}))
@@ -284,9 +758,66 @@ func (a *App) handleManagement(raw []byte) ([]byte, error) {
 		return OKEnvelope(a.previewModelPrices(req.Body))
 	case req.Method == http.MethodPost && path == base+"/models/import":
 		return OKEnvelope(a.importModels(req.Body))
+	case req.Method == http.MethodGet && path == base+"/overview":
+		return OKEnvelope(a.overview())
+	case req.Method == http.MethodGet && path == base+"/channels":
+		return OKEnvelope(a.listChannels())
+	case req.Method == http.MethodGet && path == base+"/channels/detail":
+		return OKEnvelope(a.channelDetail(req.Query.Get("auth_index")))
+	case req.Method == http.MethodPatch && path == base+"/channels":
+		return OKEnvelope(a.patchChannel(req.Body))
+	case req.Method == http.MethodPost && path == base+"/channels/balance/refresh":
+		return OKEnvelope(a.refreshChannelBalance(req.Body))
+	case req.Method == http.MethodGet && path == base+"/adapters":
+		return OKEnvelope(a.listAdapters())
+	case req.Method == http.MethodPost && path == base+"/adapters":
+		return OKEnvelope(a.upsertAdapter(req.Body))
+	case req.Method == http.MethodDelete && path == base+"/adapters":
+		return OKEnvelope(a.deleteAdapter(req.Query.Get("id")))
+	case req.Method == http.MethodPost && path == base+"/adapters/preview":
+		return OKEnvelope(a.previewAdapter(req.Body))
+	case req.Method == http.MethodPost && path == base+"/adapters/try":
+		return OKEnvelope(a.tryAdapter(req.Body, req.HostCallbackID))
+	case req.Method == http.MethodGet && path == base+"/search":
+		return OKEnvelope(a.searchState())
+	case req.Method == http.MethodPut && path == base+"/search":
+		return OKEnvelope(a.updateSearch(req.Body))
+	case req.Method == http.MethodPost && path == base+"/search/import":
+		return OKEnvelope(a.importSearch(req.Body))
+	case req.Method == http.MethodGet && path == base+"/settings":
+		return OKEnvelope(a.settingsPage())
+	case path == base+"/quality" || strings.HasPrefix(path, base+"/quality/"):
+		return OKEnvelope(a.handleQuality(req, strings.TrimPrefix(path, base+"/quality")))
 	default:
 		return OKEnvelope(jsonError(http.StatusNotFound, "not_found", "unknown management route"))
 	}
+}
+
+// networkBoundCalls wait on the network and write no data file: an adapter
+// test request through host.model.execute (its audit line is written under
+// writeMu before the call), a models.dev price preview and an upstream
+// balance query, whose reading stays in memory. They do not hold writeMu,
+// which would hold quiesce up for as long as they wait.
+var networkBoundCalls = map[string]bool{
+	"/adapters/try":             true,
+	"/models/pricing-preview":   true,
+	"/channels/balance/refresh": true,
+}
+
+// upgrading answers a write that reached a quiesced instance.
+func upgrading() ManagementResponse {
+	return jsonError(http.StatusServiceUnavailable, "upgrading", "a newer plugin instance is taking over; retry in a moment")
+}
+
+// writeRefused answers a write while quiesced. After a rollback that could
+// not take the data directory back, a retry does not help until the lock is
+// free and CPA applies its config again; the code stays upgrading, which
+// every caller already treats as "not now".
+func (a *App) writeRefused() ManagementResponse {
+	if a.readOnly.Load() {
+		return jsonError(http.StatusServiceUnavailable, "upgrading", "this plugin instance is read-only: it could not take the data directory back after a rolled-back replacement; see the settings page")
+	}
+	return upgrading()
 }
 
 // keyWriteRequest is the POST/PATCH /keys body. Unknown fields are rejected,

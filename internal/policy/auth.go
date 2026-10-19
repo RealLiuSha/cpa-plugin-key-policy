@@ -2,6 +2,7 @@ package policy
 
 import (
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -69,6 +70,15 @@ func (s *Store) Authenticate(method, path string, headers http.Header, query map
 			decision.Reason = "media_generation_requires_header_key"
 			return decision
 		}
+		if strings.EqualFold(strings.TrimSpace(method), http.MethodGet) &&
+			websocketResponsePaths[strings.TrimRight(strings.TrimSpace(path), "/")] &&
+			ExtractAPIKey(headers, nil) == "" {
+			// Each turn of the socket is admitted by the request interceptor,
+			// which gets the handshake headers and no query, so a query key
+			// would be checked once and never again.
+			decision.Reason = "websocket_requires_header_key"
+			return decision
+		}
 		if denial := s.admit(key, path, true); denial != nil {
 			decision.Denial = denial
 			decision.Reason = denial.Reason
@@ -103,6 +113,7 @@ func (s *Store) AdmitIntercepted(headers http.Header, requestPath, traceID strin
 		traces := s.mediaTraces
 		s.mu.RUnlock()
 		traces.remember(traceID)
+		s.journalTrace(traceID, time.Now())
 	}
 	return nil
 }

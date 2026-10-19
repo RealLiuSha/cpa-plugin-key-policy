@@ -13,6 +13,14 @@ plugins:
       state_file: "cpa-key-policy-state.json"
       usage_timezone: "Asia/Shanghai"
 
+      # The plugin's own settings, both optional. search_enabled registers a
+      # model router for Codex alpha search (routing is set on the Search
+      # page). cpa_config_path is CPA's config.yaml, relative to CPA's working
+      # directory; balance queries and detection read the config's API keys
+      # from it. Releases 0.16.0 and earlier reject both keys.
+      # search_enabled: false
+      # cpa_config_path: "config.yaml"
+
       # A price row prices one upstream model id (the Model CPA reports in
       # usage records). provider is an optional qualifier; an empty provider
       # matches any provider. Prices are USD per million tokens; omitted

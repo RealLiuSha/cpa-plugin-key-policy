@@ -4,7 +4,7 @@ import { adjustBalance, createKey } from "../api/keys";
 import KeyForm, { keyWriteRequestFromForm } from "../components/KeyForm";
 import PlainKeyModal from "../components/PlainKeyModal";
 import { newRequestId } from "../components/BalanceDialog";
-import { MobileFormHeader, MobileTabBar } from "../components/MobileChrome";
+import { MobileFormHeader } from "../components/MobileChrome";
 import { useT } from "../i18n";
 
 export interface KeyUsageNotice {
@@ -53,7 +53,6 @@ export default function KeyNew() {
           }}
         />
       )}
-      <MobileTabBar active="new" />
     </div>
   );
 }

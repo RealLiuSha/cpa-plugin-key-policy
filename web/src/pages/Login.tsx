@@ -30,7 +30,7 @@ export default function Login() {
     try {
       setSession(baseUrl, secretKey);
       await verifySession(fetch);
-      nav("/keys");
+      nav("/overview");
     } catch (err) {
       setError((err as Error).message || t("login.loginFailed"));
     } finally {

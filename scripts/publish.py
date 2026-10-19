@@ -178,7 +178,7 @@ def bump_source(root, old, new):
 
 def ssh_arguments(value):
     args = shlex.split(value)
-    require(args and Path(args[0]).name == "ssh", "--ssh 应为完整 ssh 命令或 ssh 主机别名")
+    require(args and Path(args[0]).name == "ssh", "--ssh 应为以 ssh 开头的完整命令，例如 ssh my-cpa")
     # OpenSSH options with operands; reject a remote shell command after target.
     operand_options = set("BbcFijJlmoSp")
     position = 1
@@ -373,6 +373,22 @@ def paired_data(state_path, usage_path):
     return state, usage
 
 
+MODULE_FILES = (PLUGIN + "-adapters.json", PLUGIN + "-search.json",
+                PLUGIN + "-channels.json", PLUGIN + "-channel-stats.json", PLUGIN + "-quality.json")
+# Written by an instance handing off in a hot replacement; the next instance replays it
+# and renames it to .applied-<time>, so only a journal nobody replayed has this name.
+HANDOFF_FILE = PLUGIN + "-handoff.jsonl"
+
+
+def module_files(state_path):
+    """Module files kept next to the state file, for backup: adapter rules, alpha
+    search settings, channel metadata and statistics, detection history, and a hot
+    replacement journal not replayed yet. Releases before them ignore the module
+    files, but a journal must be restored together with the ledger it belongs to."""
+    state = Path(state_path)
+    return [str(state.with_name(name)) for name in (*MODULE_FILES, HANDOFF_FILE) if state.with_name(name).is_file()]
+
+
 def ledger_files(state_path):
     """Every ledger file kept next to the state file, for backup: live usage, history,
     the audit log with its rotations, and each recovery pair with its archives."""
@@ -416,7 +432,7 @@ def inspect_target(request):
     usage_path = str(Path(state_path).with_name(USAGE_FILE))
     state, usage = paired_data(state_path, usage_path)
     http_get(url + "/healthz")
-    files = [str(config_path), plugin_path, state_path, *ledger_files(state_path)]
+    files = [str(config_path), plugin_path, state_path, *ledger_files(state_path), *module_files(state_path)]
     needed = sum(Path(path).stat().st_size for path in files) * 3 + 64 * 1024 * 1024
     require(shutil.disk_usage(root).free >= needed, "远端可用空间不足以保存发布包及完整备份")
     return {
@@ -596,8 +612,14 @@ def verify_runtime(target, version, plugin_container_path, timeout=90):
             require(len(keys.get("keys", [])) == target["keys"], "Key 数量发生变化")
             require(len(models.get("models", [])) == target["models"], "模型数量发生变化")
             page = http_get(url + f"/v0/resource/plugins/{PLUGIN}/index.html", binary=True)
+            # A cpa-key-policy-ui/index.html in the data directory replaces the
+            # embedded page; versions before 0.17.0 have no /settings to say so.
+            try:
+                ui_source = http_get(url + f"/v0/management/plugins/{PLUGIN}/settings", key).get("ui", {}).get("source")
+            except PublishError:
+                ui_source = None
             return {"healthy": True, "version": version, "keys": target["keys"],
-                    "models": target["models"], "ui_sha256": sha(page)}
+                    "models": target["models"], "ui_sha256": sha(page), "ui_source": ui_source}
         except PublishError as error:
             last_error = str(error)
             time.sleep(2)
@@ -649,6 +671,10 @@ def deploy_locked(directory):
         require(sha(Path(target["config_path"]).read_bytes()) == target["config_sha256"], "停机前配置发生变化")
         before, _ = paired_data(target["state_path"], target["usage_path"])
         target["keys"], target["models"] = len(before.get("keys", [])), len(before.get("models", []))
+        # The preflight list was taken while CPA ran; shutdown can write a module or
+        # ledger file for the first time (detection history is saved on every stop).
+        target["backup_files"] = sorted(set([*target["backup_files"], *ledger_files(target["state_path"]),
+                                             *module_files(target["state_path"])]))
         backup = backup_files(directory, target)
         phase("backed_up", backup=str(backup))
         check = [directory / "migration-check", "--state", target["state_path"], "--timezone", target["timezone"]]
@@ -659,9 +685,10 @@ def deploy_locked(directory):
         checker = json.loads(command(check, timeout=300))
         require(checker.get("result") == "passed", "停机数据的迁移检查失败")
         require(checker.get("keys") == target["keys"], "迁移检查后的 Key 数量与停机数据不符")
-        # Converting format 6 merges price rows that shared one upstream model, so
-        # the row count the new plugin will serve is the converted one, not the old state's.
-        target["models"] = checker["models"]
+        # Converting format 6 merges price rows that shared one upstream model, so the new
+        # plugin serves the converted row count; target keeps the stopped data's count for
+        # verifying a restored old version.
+        converted = {**target, "models": checker["models"]}
         phase("switching", migration=checker)
         if staging:
             swapped = True
@@ -679,8 +706,9 @@ def deploy_locked(directory):
         command(["docker", "start", target["container_id"]], timeout=60)
         phase("verifying")
         new_container_path = str(PurePosixPath(target["plugin_dir_container"]) / "linux" / "amd64" / request["library"])
-        result = verify_runtime(target, request["version"], new_container_path)
-        require(result["ui_sha256"] == request["ui_sha256"], "远端内嵌页面与候选包不一致")
+        result = verify_runtime(converted, request["version"], new_container_path)
+        if result.get("ui_source") != "override":
+            require(result["ui_sha256"] == request["ui_sha256"], "远端内嵌页面与候选包不一致")
         after, usage = paired_data(target["state_path"], target["usage_path"])
         require(after["version"] == usage["version"] == checker["target_version"], "实际数据迁移版本不符")
         require(before["dataset_id"] == after["dataset_id"], "实际数据集发生变化")
@@ -706,8 +734,14 @@ def deploy_locked(directory):
                 phase("restored", error=message, detail=detail)
             except Exception:
                 phase("needs_attention", error=message, detail="恢复旧版本未通过验收；保留备份和现场")
-        elif start_attempted or status.get("phase") == "stopping":
-            phase("needs_attention", error=message, detail="启动或停机结果可能已生效；禁止自动恢复旧账本")
+        elif start_attempted:
+            phase("needs_attention", error=message, detail="新版启动已尝试，结果可能已生效；禁止自动恢复旧账本")
+        elif status.get("phase") == "stopping":
+            # docker stop --time=-1 never kills; a CPA process that unloaded a Go plugin
+            # library (v8.0.13) can hang on exit. Nothing has been written at this point.
+            phase("needs_attention", error=message,
+                  detail="停机未完成，发布脚本尚未改动插件、配置和数据；用 docker inspect 查看容器，"
+                         "卡住不退出时 docker kill 后 docker start 即回到旧版本（kill 最多丢失最近 15 秒的计费和上次落盘后的渠道统计）")
         else:
             phase("failed", error=message)
 
@@ -891,6 +925,9 @@ def main():
         result = watch_release(ssh, directory, request["target"], directory.name)
         print(f"发布完成：{request['target']['container']} → {request['version']}\n备份：{result['backup']}\n"
               "已验证运行版本、加载路径、页面和数据；未发送真实模型计费请求。", flush=True)
+        if (result.get("verification") or {}).get("ui_source") == "override":
+            print("注意：数据目录里有 cpa-key-policy-ui/index.html，面板显示的是这个覆盖页面，没有和新版内嵌页面比对；"
+                  "要用新版界面，删掉这个文件即可。", flush=True)
 
 
 if __name__ == "__main__":

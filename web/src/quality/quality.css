@@ -1,0 +1,109 @@
+/* ===== Quality (检测): tabs, settings, credential rows, detail dialogs =====
+ * Builds on the shared .card, .badge, .seg, .detail-* and .code-block rules
+ * and on the .quality-* basics in styles.css. The app loads styles.css after
+ * this file, so overrides of its rules need a more specific selector. */
+/* styles.css hides .seg on desktop except where a page opts in. */
+.quality-page .quality-tabs { display: inline-flex !important; margin: 0; align-self: flex-start; flex-wrap: wrap; }
+.quality-page .quality-tabs .seg-btn { padding: 6px 14px; white-space: nowrap; }
+.quality-panel { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+.quality-intro .field-hint { margin: 0; }
+.quality-prompt > summary { cursor: pointer; color: var(--muted); font-size: 13px; font-weight: 600; width: fit-content; }
+.quality-prompt .code-block { max-height: 360px; }
+
+.card.quality-settings { display: flex; flex-direction: column; gap: 12px; padding: 16px 18px; }
+.quality-settings .form-actions { margin-top: 0; }
+.quality-cost { font-size: 12px; line-height: 1.5; }
+
+.card.quality-list { padding: 0; overflow: hidden; }
+.quality-list-head {
+  display: flex; align-items: center; gap: 4px 16px; flex-wrap: wrap;
+  padding: 6px 14px; background: var(--muted-bg); border-bottom: 1px solid var(--border); font-size: 13px;
+}
+.quality-list-head .check-row { min-height: 36px; }
+.quality-type { width: auto; min-width: 180px; padding: 6px 10px; font-size: 13px; }
+.quality-empty { margin: 14px; }
+.quality-rows { list-style: none; margin: 0; padding: 0; }
+.quality-row { border-bottom: 1px solid var(--border); }
+.quality-row:last-child { border-bottom: 0; }
+.quality-row-main {
+  display: grid; align-items: start; gap: 10px 16px; padding: 12px 14px;
+  /* A fixed action column keeps the columns of every row aligned. */
+  grid-template-columns: 16px minmax(180px, 1.3fr) minmax(170px, 1.2fr) minmax(130px, 1fr) 200px;
+}
+.quality-select { width: 16px; height: 16px; margin: 3px 0 0; accent-color: var(--accent); }
+.quality-credential { display: flex; flex-direction: column; gap: 4px; }
+.quality-row.inactive .quality-credential .channel-name { color: var(--muted); }
+.quality-url { font-size: 12px; overflow-wrap: anywhere; }
+.quality-badges { display: flex; gap: 4px; flex-wrap: wrap; }
+.quality-summary { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; font-size: 12px; min-width: 0; }
+.quality-row .quality-actions { justify-content: flex-end; }
+.quality-progress { width: 100%; max-width: 220px; height: 6px; accent-color: var(--accent); }
+.quality-metrics { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+
+.quality-marks { display: flex; flex-wrap: wrap; gap: 3px; }
+.quality-mark {
+  width: 20px; height: 20px; padding: 0; display: inline-flex; align-items: center; justify-content: center;
+  border: 1px solid var(--border); border-radius: var(--r-full); background: var(--panel);
+  color: var(--muted); font: inherit; font-size: 11px; font-weight: 700; line-height: 1; cursor: pointer;
+}
+.quality-mark:focus-visible { outline: none; box-shadow: 0 0 0 3px var(--accent-ring); }
+.quality-mark.ok { color: var(--ok); border-color: var(--ok-border); background: var(--ok-soft); }
+.quality-mark.bad { color: var(--danger); border-color: var(--danger-border); background: var(--danger-soft); }
+.quality-mark.err { color: var(--warn-text); border-color: color-mix(in srgb, var(--warn) 45%, transparent); background: color-mix(in srgb, var(--warn) 12%, transparent); }
+/* Answers of another model or effort than the one rated. */
+.quality-mark.dim { opacity: 0.4; }
+
+.quality-history { display: flex; flex-direction: column; gap: 8px; padding: 0 14px 14px 46px; }
+.quality-history > p { margin: 0; }
+.quality-history ol { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.quality-history-item {
+  display: flex; align-items: center; justify-content: space-between; gap: 6px 16px; flex-wrap: wrap;
+  padding: 8px 10px; border: 1px solid var(--border); border-radius: var(--r-md); background: var(--panel-2); font-size: 12px;
+}
+.quality-history-meta, .quality-history-body { display: flex; align-items: center; gap: 6px 10px; flex-wrap: wrap; min-width: 0; }
+.quality-history-body .quality-result { flex-direction: row; align-items: center; flex-wrap: wrap; gap: 4px 8px; min-width: 0; }
+
+.quality-dialog { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+.quality-dialog .detail-section, .quality-dialog .field-hint, .quality-dialog .notice { margin: 0; }
+.quality-dialog .quality-dialog-name { margin: -8px 0 0; overflow-wrap: anywhere; }
+.quality-dialog-meta { display: flex; align-items: center; gap: 6px 10px; flex-wrap: wrap; font-size: 13px; }
+.quality-dialog .error { margin: 0; }
+.code-block.quality-answer { margin: 0; max-height: 60vh; font-family: inherit; font-size: 13px; line-height: 1.6; }
+.quality-detail-table { font-size: 12px; }
+.quality-detail-table th, .quality-detail-table td { padding: 6px 8px; }
+.quality-detail-table tr.nearest td { background: var(--accent-soft); }
+.quality-inline-field { display: inline-flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 600; }
+.quality-inline-field select { width: auto; padding: 6px 10px; font-size: 12px; }
+.quality-families { display: flex; flex-wrap: wrap; gap: 6px; }
+.quality-ranking { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.quality-ranking li {
+  display: grid; align-items: center; gap: 8px; font-size: 12px;
+  grid-template-columns: 22px minmax(0, 1fr) minmax(80px, 32%) 52px;
+}
+.quality-rank-name { overflow-wrap: anywhere; }
+.quality-bar { display: block; height: 6px; border-radius: var(--r-full); background: var(--muted-bg); overflow: hidden; }
+.quality-bar > span { display: block; height: 100%; background: var(--accent); }
+.quality-sample { border: 1px solid var(--border); border-radius: var(--r-md); padding: 8px 10px; background: var(--panel-2); }
+.quality-sample > summary { display: flex; align-items: center; gap: 6px 10px; flex-wrap: wrap; cursor: pointer; font-size: 13px; font-weight: 600; }
+.quality-sample .error { margin: 8px 0 0; }
+/* The model's page draws on its own white canvas in every theme. */
+.quality-frame { display: block; width: 100%; aspect-ratio: 4 / 3; border: 1px solid var(--border); border-radius: var(--r-md); background: #fff; }
+.quality-credits { margin: 8px 0 0; font-size: 12px; text-align: center; }
+
+@media (max-width: 1000px) {
+  .quality-row-main { grid-template-columns: 16px minmax(0, 1fr) minmax(0, 1fr); }
+  .quality-row-main > .quality-summary { grid-column: 2; }
+  .quality-row-main > .quality-actions { grid-column: 3; justify-content: flex-start; }
+}
+
+@media (max-width: 640px) {
+  .quality-page .quality-tabs { align-self: stretch; }
+  .quality-page .quality-tabs .seg-btn { flex: 1; padding: 6px 8px; }
+  .quality-row-main { grid-template-columns: 16px minmax(0, 1fr); }
+  .quality-row-main > :not(.quality-select) { grid-column: 2; }
+  .quality-row-main > .quality-actions { grid-column: 2; }
+  .quality-history { padding-left: 14px; }
+  .quality-type { flex: 1 1 180px; }
+  .quality-ranking li { grid-template-columns: 22px minmax(0, 1fr) 52px; }
+  .quality-ranking .quality-bar { grid-column: 2 / -1; grid-row: 2; }
+}

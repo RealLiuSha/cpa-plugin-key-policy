@@ -166,16 +166,7 @@ func ParseConfig(raw []byte) (Config, error) {
 }
 
 func normalizeConfig(cfg *Config) error {
-	zone := strings.TrimSpace(cfg.UsageTimezone)
-	if zone == "" {
-		zone = DefaultConfig().UsageTimezone
-	}
-	location, err := time.LoadLocation(zone)
-	if err != nil {
-		log.Printf("cpa-key-policy: invalid usage_timezone %q; falling back to UTC: %v", zone, err)
-		zone = "UTC"
-		location = time.UTC
-	}
+	zone, location := resolveUsageZone(cfg.UsageTimezone)
 	cfg.UsageTimezone = zone
 	cfg.usageLocation = location
 	if _, err := normalizeModelPrices(cfg.Models); err != nil {
@@ -185,6 +176,21 @@ func normalizeConfig(cfg *Config) error {
 		return err
 	}
 	return uniqueSecrets(cfg.Keys)
+}
+
+// resolveUsageZone maps the configured usage_timezone to the zone the ledger
+// uses: the default when empty, UTC when it does not load.
+func resolveUsageZone(configured string) (string, *time.Location) {
+	zone := strings.TrimSpace(configured)
+	if zone == "" {
+		zone = DefaultConfig().UsageTimezone
+	}
+	location, err := time.LoadLocation(zone)
+	if err != nil {
+		log.Printf("cpa-key-policy: invalid usage_timezone %q; falling back to UTC: %v", zone, err)
+		return "UTC", time.UTC
+	}
+	return zone, location
 }
 
 // normalizeKeys trims and validates keys in place: ids unique and non-empty,

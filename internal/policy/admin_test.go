@@ -329,12 +329,23 @@ func TestReconfigureDoesNotResurrectKeysMissingFromState(t *testing.T) {
 	if err := SaveState(store.StatePath(), state.DatasetID, state.Keys[:1], state.Models); err != nil {
 		t.Fatal(err)
 	}
-	// Seeds are ignored once a state file exists.
-	if err := store.Configure(Config{Enabled: true, StateFile: store.StatePath(), UsageTimezone: "Asia/Shanghai", Keys: []KeyConfig{testKey(t, "seed", "cpa_seed")}}); err != nil {
+	seeded := Config{Enabled: true, StateFile: store.StatePath(), UsageTimezone: "Asia/Shanghai", Keys: []KeyConfig{testKey(t, "seed", "cpa_seed")}}
+	// The same block again keeps the dataset in memory: nothing is reloaded
+	// and nothing is seeded.
+	if err := store.Configure(seeded); err != nil {
 		t.Fatal(err)
 	}
-	if keys := store.Keys(); len(keys) != 1 || keys[0].ID != "on-disk" || store.FindByAPIKey("cpa_revoked") != nil || store.FindByAPIKey("cpa_seed") != nil {
-		t.Fatalf("keys after reconfigure = %+v", keys)
+	if store.FindByAPIKey("cpa_revoked") == nil || store.FindByAPIKey("cpa_seed") != nil {
+		t.Fatalf("keys after reconfigure = %+v", store.Keys())
+	}
+	// A restart loads the file, and seeds are ignored once a state file exists.
+	reopened := NewStore()
+	reopened.SetClock(clock.Now)
+	if err := reopened.Configure(seeded); err != nil {
+		t.Fatal(err)
+	}
+	if keys := reopened.Keys(); len(keys) != 1 || keys[0].ID != "on-disk" || reopened.FindByAPIKey("cpa_revoked") != nil || reopened.FindByAPIKey("cpa_seed") != nil {
+		t.Fatalf("keys after restart = %+v", keys)
 	}
 }
 
@@ -373,8 +384,12 @@ func TestKeyHelpers(t *testing.T) {
 	if got := PreviewKey("cpa_abcdefghijklmnopqrstuvwxyz"); got != "cpa_abc...vwxyz" {
 		t.Fatalf("preview = %q", got)
 	}
-	if got := PreviewKey("short"); got != "short" {
+	// A short key would show most of itself through the 7+5 preview.
+	if got := PreviewKey("short"); got != "..." {
 		t.Fatalf("short preview = %q", got)
+	}
+	if got := PreviewKey("abcdefghijklmnop"); got != "abc...op" {
+		t.Fatalf("mid-length preview = %q", got)
 	}
 	for name, tc := range map[string]struct {
 		headers http.Header
@@ -421,6 +436,8 @@ func TestAdmissionStageFollowsRouteAndKeyLocation(t *testing.T) {
 		"claude messages":                {"POST", "/v1/messages", headers, nil, true},
 		"codex responses":                {"POST", "/backend-api/codex/responses", headers, nil, true},
 		"gemini generate":                {"POST", "/v1beta/models/gemini-2.5-pro:generateContent", headers, nil, true},
+		"speech":                         {"POST", "/v1/audio/speech", headers, nil, true},
+		"xai tts":                        {"POST", "/v1/tts", headers, nil, true},
 		"video retrieval":                {"GET", "/v1/videos/vid_1", headers, nil, true},
 		"gemini generate with query key": {"POST", "/v1beta/models/gemini-2.5-pro:generateContent", nil, query, false},
 		"realtime is not intercepted":    {"POST", "/v1/realtime/calls", headers, nil, false},
@@ -437,6 +454,15 @@ func TestAdmissionStageFollowsRouteAndKeyLocation(t *testing.T) {
 		} else if tc.deferred && !again.Allowed {
 			t.Errorf("%s: authentication counted a deferred request: %+v", name, again)
 		}
+	}
+	// CPA v8.0.18+ intercepts speech too: one RPM per request, and the
+	// interceptor's refusal reaches the client as 429 rather than 401.
+	store.ResetRPM("k")
+	if admission := admitRequest(store, "POST", "/v1/audio/speech", headers, nil); !admission.Allowed {
+		t.Fatalf("first speech request = %+v", admission)
+	}
+	if admission := admitRequest(store, "POST", "/v1/audio/speech", headers, nil); admission.Allowed || !admission.Deferred || admission.Reason != "rpm_exceeded" {
+		t.Fatalf("second speech request = %+v, want rpm_exceeded in the interceptor", admission)
 	}
 	// A WebSocket handshake checks quota only; the per-turn RPM is left to the
 	// interceptor, so repeated handshakes are not rate limited here.

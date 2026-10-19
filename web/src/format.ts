@@ -9,6 +9,12 @@ export function formatUSD(value: number): string {
   return (magnitude > 0 && magnitude < 0.01 ? usdSubCent : usd2).format(amount);
 }
 
+// A balance in the upstream's own unit with at most four decimals, so a
+// remainder such as 12.298799999999986 reads 12.2988.
+export function formatAmount(value: number): string {
+  return Number.isFinite(value) ? String(Number(value.toFixed(4))) : "—";
+}
+
 export function formatCount(value: number): string {
   if (!Number.isFinite(value) || value <= 0) return "0";
   return Math.round(value).toLocaleString("en-US");
@@ -19,4 +25,45 @@ export function formatHitRate(cacheReadTokens: number, inputTokens: number): str
   const total = cacheReadTokens + inputTokens;
   if (total <= 0) return "—";
   return Math.round((cacheReadTokens / total) * 100) + "%";
+}
+
+// Go encodes an unset time as year 1; that and anything unparsable is null.
+export function timeValue(value?: string | null): number | null {
+  if (!value) return null;
+  const ms = Date.parse(value);
+  return Number.isFinite(ms) && new Date(ms).getUTCFullYear() > 1970 ? ms : null;
+}
+
+export function formatDateTime(value?: string | null): string {
+  const ms = timeValue(value);
+  return ms === null ? "" : new Date(ms).toLocaleString();
+}
+
+// A share in [0, 1] as a percentage: one decimal below 10%, none above.
+export function formatPercent(ratio: number): string {
+  if (!Number.isFinite(ratio)) return "—";
+  const percent = ratio * 100;
+  return (percent > 0 && percent < 10 ? percent.toFixed(1).replace(/\.0$/, "") : Math.round(percent).toString()) + "%";
+}
+
+// Milliseconds as "850 ms" or "2.3 s"; 0 means not measured.
+export function formatMillis(ms: number): string {
+  if (!(ms > 0)) return "—";
+  if (ms < 1000) return `${Math.round(ms)} ms`;
+  return `${(ms / 1000).toFixed(ms < 10_000 ? 1 : 0)} s`;
+}
+
+// Microseconds as "40 µs", "1.2 ms" or "1.5 s".
+export function formatMicros(us: number): string {
+  if (!Number.isFinite(us) || us < 0) return "—";
+  if (us < 1000) return `${Math.round(us)} µs`;
+  if (us < 1_000_000) return `${(us / 1000).toFixed(us < 10_000 ? 1 : 0)} ms`;
+  return `${(us / 1_000_000).toFixed(1)} s`;
+}
+
+export function formatBytes(bytes: number): string {
+  if (!(bytes > 0)) return "0 B";
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 }

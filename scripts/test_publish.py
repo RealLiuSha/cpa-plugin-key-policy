@@ -76,12 +76,18 @@ class PublishTests(unittest.TestCase):
             directory, target = self.fixture(root)
             check = checker(target)
             events = []
+            plugins = Path(target["state_path"]).parent
+            written_at_stop = [plugins / "cpa-key-policy-quality.json", plugins / publish.HANDOFF_FILE]
 
             def command(args, **kwargs):
                 if Path(args[0]).name == "migration-check":
                     events.append("config" if "--config" in args else "check")
                     return check(args)
                 events.append(" ".join(args[:2]))
+                if args[:2] == ["docker", "stop"]:
+                    # Shutdown saves the detection history even when no test ever ran.
+                    for path in written_at_stop:
+                        path.write_text("{}")
                 return b""
 
             with contextlib.ExitStack() as stack:
@@ -99,7 +105,10 @@ class PublishTests(unittest.TestCase):
             # Start-up verification expects the merged row count, not the format 6 model count.
             self.assertEqual(verify.call_args[0][0]["models"], 1)
             self.assertEqual(Path(target["config_path"]).read_bytes(), changed)
-            plugins = Path(target["state_path"]).parent
+            manifest = publish.read_json(Path(status["backup"]) / "manifest.json")
+            sources = {item["source"] for item in manifest["files"]}
+            self.assertTrue({str(path) for path in written_at_stop} <= sources)
+            self.assertTrue(all(path.is_file() for path in written_at_stop))
             self.assertEqual(publish.read_json(target["state_path"])["version"], 7)
             self.assertEqual(publish.read_json(target["usage_path"])["version"], 7)
             self.assertTrue((plugins / publish.HISTORY_FILE).is_file())
@@ -151,6 +160,24 @@ class PublishTests(unittest.TestCase):
             "artifact_hashes": {name: publish.sha((directory / name).read_bytes()) for name in (library, "migration-check")},
         })
         return directory, target
+
+    def test_override_page_is_not_compared_with_the_embedded_one(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory, target = self.fixture(Path(temporary))
+            check = checker(target)
+
+            def command(args, **kwargs):
+                return check(args) if Path(args[0]).name == "migration-check" else b""
+
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(patch.object(publish, "inspect_target", return_value=target))
+                stack.enter_context(patch.object(publish, "command", side_effect=command))
+                stack.enter_context(patch.object(publish, "docker_inspect", return_value={"State": {"Running": False}}))
+                stack.enter_context(patch.object(publish, "verify_runtime", return_value={"ui_sha256": "operator page", "ui_source": "override"}))
+                publish.deploy_worker(directory)
+            status = publish.read_json(directory / "status.json")
+            self.assertEqual(status["phase"], "succeeded")
+            self.assertEqual(status["verification"]["ui_source"], "override")
 
     def test_failed_conversion_restarts_old_version_without_touching_data(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -206,6 +233,7 @@ class PublishTests(unittest.TestCase):
                 publish.deploy_worker(directory)
             status = publish.read_json(directory / "status.json")
             self.assertEqual(status["phase"], "needs_attention")
+            self.assertIn("新版启动已尝试", status["detail"])
             restore.assert_not_called()
             self.assertEqual(Path(target["usage_path"]).read_bytes(), new_usage)
             self.assertIn(b'version: "0.7.0"', Path(target["config_path"]).read_bytes())
@@ -251,17 +279,54 @@ class PublishTests(unittest.TestCase):
                     (directory / "cpa-key-policy-v0.7.0.so").unlink()
                 return b""
 
+            def verify(expected, version, plugin_path):
+                # The restored old version serves the rows of the restored format 6 state.
+                served = len(publish.read_json(expected["state_path"])["models"])
+                publish.require(served == expected["models"], "模型数量发生变化")
+                return {"ui_sha256": "page"}
+
             with contextlib.ExitStack() as stack:
                 stack.enter_context(patch.object(publish, "inspect_target", return_value=target))
                 stack.enter_context(patch.object(publish, "command", side_effect=command))
                 stack.enter_context(patch.object(publish, "docker_inspect", return_value={"State": {"Running": False}}))
-                stack.enter_context(patch.object(publish, "verify_runtime"))
+                verified = stack.enter_context(patch.object(publish, "verify_runtime", side_effect=verify))
                 publish.deploy_worker(directory)
             status = publish.read_json(directory / "status.json")
+            verified.assert_called_once()
             self.assertEqual(status["phase"], "restored")
             self.assertEqual(status["detail"], "新版尚未启动，原版本和停机时的账本已从备份恢复")
             self.assertEqual({path.name: path.read_bytes() for path in plugins.iterdir() if path.is_file()}, original)
             self.assertEqual(Path(target["config_path"]).read_bytes(), CONFIG)
+
+    def test_stop_timeout_says_nothing_was_changed_and_never_starts(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory, target = self.fixture(Path(temporary))
+            plugins = Path(target["state_path"]).parent
+            original = {path: path.read_bytes() for path in plugins.rglob("*") if path.is_file()}
+            events = []
+
+            def command(args, **kwargs):
+                if Path(args[0]).name == "migration-check":
+                    return b'{"result":"passed"}'
+                events.append(args[:2])
+                if args[:2] == ["docker", "stop"]:
+                    raise publish.PublishError("docker 执行超时；不能据此认定远端操作未执行")
+                return b""
+
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(patch.object(publish, "inspect_target", return_value=target))
+                stack.enter_context(patch.object(publish, "command", side_effect=command))
+                restore = stack.enter_context(patch.object(publish, "restore_before_start"))
+                publish.deploy_worker(directory)
+            status = publish.read_json(directory / "status.json")
+            self.assertEqual(status["phase"], "needs_attention")
+            self.assertIn("停机未完成", status["detail"])
+            self.assertIn("docker kill", status["detail"])
+            self.assertEqual(events, [["docker", "stop"]])
+            restore.assert_not_called()
+            self.assertNotIn("backup", status)
+            self.assertEqual(Path(target["config_path"]).read_bytes(), CONFIG)
+            self.assertEqual({path: path.read_bytes() for path in plugins.rglob("*") if path.is_file()}, original)
 
     def test_paired_data_accepts_formats_6_and_7_and_requires_the_referenced_history(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -295,6 +360,22 @@ class PublishTests(unittest.TestCase):
             for path in [state, *expected, root / "unrelated.json", root / "state.json.bak"]:
                 path.write_bytes(b"{}")
             self.assertEqual(sorted(publish.ledger_files(state)), sorted(str(path) for path in expected))
+
+    def test_module_files_cover_every_module_file_and_an_unreplayed_journal(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state = root / "state.json"
+            # The names the plugin writes (internal/plugin/modules.go, internal/policy/handoff.go).
+            expected = [root / ("cpa-key-policy-" + name) for name in
+                        ("adapters.json", "search.json", "channels.json", "channel-stats.json",
+                         "quality.json", "handoff.jsonl")]
+            # A replayed journal is already in the ledger; other names are not the plugin's.
+            for path in [state, *expected, root / (publish.HANDOFF_FILE + ".applied-20261019T000000Z"),
+                         root / "cpa-key-policy-other.json", root / "unrelated.json"]:
+                path.write_bytes(b"{}")
+            self.assertEqual(sorted(publish.module_files(state)), sorted(str(path) for path in expected))
+            (root / publish.HANDOFF_FILE).unlink()
+            self.assertNotIn(str(root / publish.HANDOFF_FILE), publish.module_files(state))
 
 
 if __name__ == "__main__":

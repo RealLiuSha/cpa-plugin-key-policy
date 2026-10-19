@@ -8,11 +8,13 @@ import (
 
 const (
 	ABIVersion uint32 = 1
-	// SchemaVersion is the lifecycle contract this plugin speaks, echoed back to the
-	// host at plugin.register so it knows how to talk to us. Staying at 2 is
-	// deliberate: schema 3 only omits OriginalRequest/RequestBody on payload stream
-	// chunks, and this plugin registers no stream chunk interceptor.
-	SchemaVersion uint32 = 2
+	// SchemaVersion is the highest lifecycle contract this plugin speaks. At
+	// plugin.register it answers the lower of this and the host's version.
+	// Schema 6 makes CPA pass management responses through as they are; below
+	// it the host HTML-escapes every JSON string, so a quote in a note or an
+	// upstream error reaches the UI as &#34;. Schemas 3 to 5 only change stream
+	// chunk interceptors, which this plugin does not register.
+	SchemaVersion uint32 = 6
 	// MinHostSchemaVersion is the oldest host lifecycle contract this plugin can work
 	// with. The host advertises its own ceiling, so anything at or above this is fine;
 	// requiring an exact match would make every host upgrade disable the plugin.
@@ -20,6 +22,9 @@ const (
 
 	MethodPluginRegister    = "plugin.register"
 	MethodPluginReconfigure = "plugin.reconfigure"
+	// MethodPluginQuiesce precedes a hot replacement: the host is about to
+	// load a newer instance and will stop sending calls here once it is in.
+	MethodPluginQuiesce = "plugin.quiesce"
 
 	MethodFrontendAuthIdentifier   = "frontend_auth.identifier"
 	MethodFrontendAuthAuthenticate = "frontend_auth.authenticate"
@@ -31,6 +36,11 @@ const (
 	MethodRequestInterceptBefore = "request.intercept_before"
 	MethodRequestInterceptAfter  = "request.intercept_after"
 
+	// MethodModelRoute runs before provider resolution for every model
+	// request once the plugin registers model_router; only alpha search
+	// requests are answered.
+	MethodModelRoute = "model.route"
+
 	// MethodUsageHandle delivers a finalized usage record (tokens already parsed
 	// by CPA) after a request completes, for streaming and non-streaming
 	// responses alike. It is the only billing entry point.
@@ -41,9 +51,13 @@ const (
 )
 
 const (
-	PluginID   = "cpa-key-policy"
-	PluginName = "cpa-key-policy"
-	Version    = "0.15.0"
+	// PluginID is the host-local identity: the library file name, the
+	// plugins.configs key and every management and resource path. It stays
+	// cpa-key-policy so callers and data files keep working.
+	PluginID = "cpa-key-policy"
+	// PluginName is what the CPA panel shows for the plugin and its menu.
+	PluginName = "萝卜"
+	Version    = "0.20.0"
 )
 
 type Envelope struct {
@@ -92,9 +106,13 @@ type ConfigField struct {
 type Capabilities struct {
 	FrontendAuthProvider          bool `json:"frontend_auth_provider"`
 	FrontendAuthProviderExclusive bool `json:"frontend_auth_provider_exclusive,omitempty"`
-	RequestInterceptor            bool `json:"request_interceptor"`
-	UsagePlugin                   bool `json:"usage_plugin"`
-	ManagementAPI                 bool `json:"management_api"`
+	// ModelRouter is declared only while alpha search routing is switched
+	// on: once any plugin is a router, every model request crosses into it
+	// with its full body.
+	ModelRouter        bool `json:"model_router,omitempty"`
+	RequestInterceptor bool `json:"request_interceptor"`
+	UsagePlugin        bool `json:"usage_plugin"`
+	ManagementAPI      bool `json:"management_api"`
 }
 
 type IdentifierResponse struct {
@@ -132,7 +150,10 @@ type RequestInterceptRequest struct {
 // RequestInterceptResponse mirrors pluginapi.RequestInterceptResponse. An empty
 // response leaves the request unchanged. ResponseBody must stay []byte: the
 // host decodes it as base64 and lets the request through when it cannot.
+// A non-empty Body replaces the request body of this attempt only; it is in
+// the client's format, since the executor translates it afterwards.
 type RequestInterceptResponse struct {
+	Body            []byte      `json:"Body,omitempty"`
 	Terminate       bool        `json:"Terminate,omitempty"`
 	StatusCode      int         `json:"StatusCode,omitempty"`
 	ResponseHeaders http.Header `json:"ResponseHeaders,omitempty"`
@@ -140,14 +161,26 @@ type RequestInterceptResponse struct {
 }
 
 // UsageHandleRequest is the part of CPA's pluginapi.UsageRecord this plugin
-// bills on. The host's Generate flag is deliberately not read: a client that
-// sends generate=false still has its input processed upstream. Latency and
-// TTFT arrive as int64 nanoseconds and are not needed.
+// bills on and builds channel statistics from. CPA sends one record per
+// upstream attempt. The host's Generate flag is deliberately not read: a
+// client that sends generate=false still has its input processed upstream.
 type UsageHandleRequest struct {
 	// TraceID identifies the inbound HTTP request (8-character hex).
 	TraceID      string `json:"TraceID"`
 	Provider     string `json:"Provider"`
+	BaseURL      string `json:"BaseURL"`
 	ExecutorType string `json:"ExecutorType"`
+	// AuthID and AuthIndex identify the credential the attempt ran on.
+	AuthID    string `json:"AuthID"`
+	AuthIndex string `json:"AuthIndex"`
+	// RequestedAt is a time.Time on the wire (RFC 3339), read as text and
+	// parsed by the handler: a time.Time field that fails to decode stops
+	// the whole record, a text field only leaves itself empty.
+	RequestedAt string `json:"RequestedAt"`
+	// Latency and TTFT are time.Duration values, nanoseconds on the wire.
+	Latency int64        `json:"Latency"`
+	TTFT    int64        `json:"TTFT"`
+	Failure UsageFailure `json:"Failure"`
 	// Model is the upstream model id the request ran on.
 	Model string `json:"Model"`
 	// This host field carries the model name the client requested. Its name is
@@ -157,6 +190,20 @@ type UsageHandleRequest struct {
 	APIKey string      `json:"APIKey"`
 	Failed bool        `json:"Failed"`
 	Detail UsageDetail `json:"Detail"`
+}
+
+// UsageFailure mirrors pluginapi.UsageFailure.
+type UsageFailure struct {
+	StatusCode int    `json:"StatusCode"`
+	Body       string `json:"Body"`
+}
+
+// ModelRouteRequest is the part of pluginapi.ModelRouteRequest the alpha
+// search router reads; all of it precedes the request body on the wire.
+type ModelRouteRequest struct {
+	SourceFormat   string      `json:"SourceFormat"`
+	RequestedModel string      `json:"RequestedModel"`
+	Headers        http.Header `json:"Headers"`
 }
 
 // UsageDetail mirrors CPA's usage token breakdown.
@@ -203,6 +250,9 @@ type ManagementRequest struct {
 	Headers http.Header `json:"Headers"`
 	Query   url.Values  `json:"Query"`
 	Body    []byte      `json:"Body"`
+	// HostCallbackID ties a host callback made for this request to the
+	// management HTTP request's context, so a client that goes away cancels it.
+	HostCallbackID string `json:"host_callback_id,omitempty"`
 }
 
 type ManagementResponse struct {
@@ -212,11 +262,14 @@ type ManagementResponse struct {
 }
 
 func OKEnvelope(v any) ([]byte, error) {
-	raw, err := json.Marshal(v)
-	if err != nil {
-		return nil, err
-	}
-	return json.Marshal(Envelope{OK: true, Result: raw})
+	// One pass, with the bytes of Envelope{OK: true, Result: <v marshaled>}:
+	// marshaling v first and then the Envelope would scan the whole result
+	// again as a json.RawMessage, about ten times the first pass for a
+	// rewritten multi-megabyte body.
+	return json.Marshal(struct {
+		OK     bool `json:"ok"`
+		Result any  `json:"result"`
+	}{OK: true, Result: v})
 }
 
 func ErrorEnvelope(code, message string, status int) []byte {

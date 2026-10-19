@@ -3,6 +3,7 @@ import en from "./locales/en.json";
 import ru from "./locales/ru.json";
 import zhCN from "./locales/zh-CN.json";
 import zhTW from "./locales/zh-TW.json";
+import { recordError } from "../quality/helpers";
 import {
   getLocale,
   setLocale,
@@ -52,12 +53,13 @@ describe("translate", () => {
     expect(translate("keys.more")).toBe("更多");
     expect(translate("keys.resetRpm")).toBe("重置 RPM");
     expect(translate("keys.resetKey")).toBe("更换 Key");
-    expect(translate("header.models")).toBe("模型价格");
+    expect(translate("header.models")).toBe("模型与价格");
+    expect(translate("header.title")).toBe("萝卜");
     _resetLocale("en");
     expect(translate("keys.more")).toBe("More");
     expect(translate("keys.resetRpm")).toBe("Reset RPM");
     expect(translate("keys.resetKey")).toBe("Replace Key");
-    expect(translate("header.models")).toBe("Model prices");
+    expect(translate("header.models")).toBe("Models & prices");
     _resetLocale("zh-TW");
     expect(translate("keys.more")).toBe("更多");
     expect(translate("keys.resetKey")).toBe("更換 Key");
@@ -94,15 +96,51 @@ describe("translate", () => {
         "audit.field.billing_multiplier",
         "audit.field.provider",
         "header.stats",
-        "keys.mobile.tabStats",
+        "header.channels",
+        "header.more",
+        "overview.title",
+        "channels.tab.adapters",
+        "adapters.tryConfirm",
+        "search.probeCost",
+        "quality.about",
+        "settings.copyDiagnostics",
         "stats.title",
         "stats.exportTooLarge",
         "stats.keysTruncated",
         "stats.health.title",
+        "settings.handoffState.quiesced",
+        "adapters.toggleOnConfirm",
+        "adapters.tryTimeout",
+        "channels.sharedAuthIndex",
+        "search.leaveMessage",
+        "quality.fingerprint.warningSelf",
       ]) {
         expect(translate(key)).not.toBe(key);
       }
     }
+  });
+
+  it("translates the shared form buttons in Russian", () => {
+    for (const key of ["keyForm.cancel", "keyForm.submitting", "keyForm.submitFailed"]) {
+      _resetLocale("en");
+      const english = translate(key);
+      _resetLocale("ru");
+      expect(translate(key), key).not.toBe(english);
+    }
+  });
+
+  // The plugin records these failures in Simplified Chinese; zh-CN shows them
+  // as recorded and the other locales without Chinese.
+  it("shows the plugin's own detection failures in every locale", () => {
+    const recorded = ["已取消", "HTML 超过 512 KB，未保存", "连续 8 次请求失败，已停止采集：模型 3 分钟内未完成回答，已中断请求", "有效数字不足", "未采集到有效数字序列", "模型响应未完成（incomplete）：null", "模型响应流中断：EOF",
+      "模型响应超过 16 MB，已中断", "连续 8 次请求失败，已停止采集：模型请求异常：runtime error: index out of range [3] with length 3"];
+    _resetLocale("zh-CN");
+    for (const text of recorded) expect(recordError(translate, text)).toBe(text);
+    for (const locale of ["en", "ru"] as const) {
+      _resetLocale(locale);
+      for (const text of recorded) expect(recordError(translate, text), `${locale} ${text}`).not.toMatch(/[\u4e00-\u9fff]/);
+    }
+    expect(recordError(translate, "upstream 502: bad gateway")).toBe("upstream 502: bad gateway");
   });
 
   it("keeps the same non-empty keys and placeholders in every locale", () => {
@@ -126,7 +164,7 @@ describe("translate", () => {
     // key and assert fallback path by requesting a locale that lacks it.
     _resetLocale("en");
     // 'header.title' exists in en, so this is NOT a fallback case — sanity.
-    expect(translate("header.title")).toBe("cpa-key-policy Management");
+    expect(translate("header.title")).toBe("Luobo");
     // A genuinely unknown key returns the key itself (never empty).
     expect(translate("nonexistent.deep.key")).toBe("nonexistent.deep.key");
   });

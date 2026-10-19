@@ -40,6 +40,10 @@ while IFS=: read -r file line content; do
       # necessarily carry the host's own field name as a JSON key.
       [[ "${content}" == *"\"${host_field_title}\":"* ]] || unexpected+="${relative}:${line}:${content}"$'\n'
       ;;
+    internal/quality/data/codex_context.json)
+      # A verbatim capture of the Codex CLI request context (OpenAI's base
+      # instructions and tool descriptions); detection requests send it as is.
+      ;;
     *)
       unexpected+="${relative}:${line}:${content}"$'\n'
       ;;

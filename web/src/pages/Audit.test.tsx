@@ -110,13 +110,9 @@ describe("Audit page", () => {
 
 describe("audit change formatting", () => {
   it("labels every recorded action in all four locales", () => {
-    const actions = [
-      "create_key", "update_key", "rotate_key", "delete_key", "reset_usage", "create_model", "update_model",
-      "delete_model", "import_create_model", "import_update_prices", "migrate_state", "adjust_balance",
-    ];
     for (const locale of ["zh-CN", "zh-TW", "en", "ru"] as const) {
       _resetLocale(locale);
-      for (const action of actions) expect(translate(`audit.action.${action}`), `${locale} ${action}`).not.toBe(`audit.action.${action}`);
+      for (const action of AUDIT_ACTIONS) expect(translate(`audit.action.${action}`), `${locale} ${action}`).not.toBe(`audit.action.${action}`);
       for (const field of ["name", "enabled", "rpm", "provider", "daily_limit_usd", "per_call_usd", "amount_usd", "balance_usd", "note", "quota_mode"]) {
         expect(translate(`audit.field.${field}`), `${locale} ${field}`).not.toBe(`audit.field.${field}`);
       }
@@ -163,5 +159,12 @@ describe("audit change formatting", () => {
     const deleted = event("delete_model", { model: { from: "gpt-5", to: "" }, provider: { from: "codex", to: "" } });
     expect(auditSubject(deleted)).toBe("gpt-5");
     expect(auditChanges(deleted, translate)).toEqual(["Provider qualifier：codex"]);
+  });
+
+  it("names the target of channel and adapter changes", () => {
+    const tried = { ...event("try_adapter", { channel: { from: null, to: "47c2d6c61505edc3" } }), target: "r_9f2c0a1b" };
+    expect(auditSubject(tried)).toBe("r_9f2c0a1b");
+    expect(auditChanges(tried, translate)).toEqual(["Channel：47c2d6c61505edc3"]);
+    expect(auditSubject({ ...event("update_channel", { cost_ratio: { from: 0, to: 0.4 } }), target: "47c2d6c61505edc3" })).toBe("47c2d6c61505edc3");
   });
 });

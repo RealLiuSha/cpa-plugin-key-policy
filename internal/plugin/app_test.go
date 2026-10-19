@@ -1,7 +1,9 @@
 package plugin
 
 import (
+	"bytes"
 	"encoding/json"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -48,7 +50,7 @@ func TestRegistrationDeclaresRequestPathCapabilitiesOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 	decode(t, handle(t, app, MethodPluginReconfigure, raw), &registration)
-	if registration.SchemaVersion != 2 || registration.Metadata.Version != Version || registration.Metadata.GitHubRepository != "https://github.com/RealLiuSha/cpa-plugin-key-policy" {
+	if registration.SchemaVersion != SchemaVersion || registration.Metadata.Version != Version || registration.Metadata.GitHubRepository != "https://github.com/RealLiuSha/cpa-plugin-key-policy" {
 		t.Fatalf("registration metadata = %+v", registration.Metadata)
 	}
 	for _, capability := range []string{"frontend_auth_provider", "request_interceptor", "usage_plugin", "management_api"} {
@@ -56,9 +58,10 @@ func TestRegistrationDeclaresRequestPathCapabilitiesOnly(t *testing.T) {
 			t.Fatalf("capability %s = %s", capability, registration.Capabilities[capability])
 		}
 	}
+	// model_router is declared only while search_enabled is set.
 	for _, removed := range []string{"model_router", "response_interceptor"} {
 		if _, declared := registration.Capabilities[removed]; declared {
-			t.Fatalf("capability %s must no longer be declared: %v", removed, registration.Capabilities)
+			t.Fatalf("capability %s must not be declared: %v", removed, registration.Capabilities)
 		}
 	}
 	var fields []string
@@ -68,23 +71,25 @@ func TestRegistrationDeclaresRequestPathCapabilitiesOnly(t *testing.T) {
 			t.Fatalf("config field %s still describes routing: %q", field.Name, field.Description)
 		}
 	}
-	if strings.Join(fields, ",") != "enabled,state_file,usage_timezone,keys,models" {
+	if strings.Join(fields, ",") != "enabled,state_file,usage_timezone,keys,models,search_enabled,cpa_config_path" {
 		t.Fatalf("config fields = %v", fields)
 	}
 }
 
 func TestRemovedHostMethodsAreUnknown(t *testing.T) {
 	app := newTestApp(t, appOptions{})
-	for _, method := range []string{"model.route", "response.intercept_after"} {
-		raw, err := app.HandleMethod(method, []byte(`{}`))
-		if err != nil {
-			t.Fatal(err)
-		}
-		var env Envelope
-		decode(t, raw, &env)
-		if env.OK || env.Error == nil || env.Error.Code != "unknown_method" || env.Error.HTTPStatus != http.StatusNotFound {
-			t.Fatalf("%s envelope = %+v", method, env)
-		}
+	raw, err := app.HandleMethod("response.intercept_after", []byte(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var env Envelope
+	decode(t, raw, &env)
+	if env.OK || env.Error == nil || env.Error.Code != "unknown_method" || env.Error.HTTPStatus != http.StatusNotFound {
+		t.Fatalf("response.intercept_after envelope = %+v", env)
+	}
+	// model.route leaves every request to CPA while search is off.
+	if route := handle(t, app, MethodModelRoute, map[string]any{"SourceFormat": "codex-alpha-search", "RequestedModel": "claude-x"}); string(route) != `{"Handled":false}` {
+		t.Fatalf("model.route with search off = %s", route)
 	}
 	if raw := handle(t, app, MethodRequestInterceptAfter, map[string]any{"Headers": bearer(testKeyPlain)}); string(raw) != "{}" {
 		t.Fatalf("intercept_after must pass requests through unchanged: %s", raw)
@@ -98,8 +103,18 @@ func TestLifecycleAcceptsNewerHostSchema(t *testing.T) {
 		app := NewApp()
 		statePath := filepath.ToSlash(filepath.Join(t.TempDir(), "state.json"))
 		raw, _ := json.Marshal(LifecycleRequest{ConfigYAML: []byte("enabled: true\nstate_file: \"" + statePath + "\"\n"), SchemaVersion: hostSchema})
-		if _, err := app.HandleMethod(MethodPluginRegister, raw); err != nil {
+		response, err := app.HandleMethod(MethodPluginRegister, raw)
+		if err != nil {
 			t.Fatalf("host schema_version %d was rejected: %v", hostSchema, err)
+		}
+		// The plugin answers the lower version, so an older host keeps its own
+		// contract and a newer one gets raw management responses.
+		var env struct {
+			Result Registration `json:"result"`
+		}
+		decode(t, response, &env)
+		if want := min(hostSchema, SchemaVersion); env.Result.SchemaVersion != want {
+			t.Fatalf("host schema %d answered with %d, want %d", hostSchema, env.Result.SchemaVersion, want)
 		}
 		app.Shutdown()
 	}
@@ -342,7 +357,7 @@ func TestUsageHandleIgnoresFailedUnknownAndMalformedRecords(t *testing.T) {
 }
 
 func TestUsageHandleTransportFieldNames(t *testing.T) {
-	if ABIVersion != 1 || SchemaVersion != 2 {
+	if ABIVersion != 1 || SchemaVersion != 6 {
 		t.Fatalf("ABI/schema versions changed: %d/%d", ABIVersion, SchemaVersion)
 	}
 	raw, err := json.Marshal(UsageHandleRequest{TraceID: "a1b2c3d4", Provider: "codex", ExecutorType: "codexexecutor", Model: "upstream-model", Alias: "public-model", APIKey: "key-id", Detail: UsageDetail{InputTokens: 1}})
@@ -352,12 +367,17 @@ func TestUsageHandleTransportFieldNames(t *testing.T) {
 	var payload map[string]json.RawMessage
 	decode(t, raw, &payload)
 	requestedModelField := string([]byte{65, 108, 105, 97, 115})
-	for _, field := range []string{"TraceID", "Provider", "ExecutorType", "Model", requestedModelField, "APIKey", "Failed", "Detail"} {
+	// Billing reads the first eight; channel statistics read the attempt's
+	// credential, timing and failure fields, which handleUsage lists again
+	// when it decodes the billing fields alone.
+	fields := []string{"TraceID", "Provider", "ExecutorType", "Model", requestedModelField, "APIKey", "Failed", "Detail",
+		"BaseURL", "AuthID", "AuthIndex", "RequestedAt", "Latency", "TTFT", "Failure"}
+	for _, field := range fields {
 		if _, exists := payload[field]; !exists {
 			t.Fatalf("transport snapshot missing %q: %s", field, raw)
 		}
 	}
-	if len(payload) != 8 || string(payload[requestedModelField]) != `"public-model"` {
+	if len(payload) != len(fields) || string(payload[requestedModelField]) != `"public-model"` {
 		t.Fatalf("transport snapshot = %s", raw)
 	}
 }
@@ -469,8 +489,8 @@ func TestManagementServesResourceUI(t *testing.T) {
 	for _, resource := range registration.Resources {
 		if resource.Path == "/index.html" {
 			found = true
-			if resource.Menu != "密钥策略" {
-				t.Fatalf("Menu = %q, want 密钥策略", resource.Menu)
+			if resource.Menu != PluginName || PluginName != "萝卜" {
+				t.Fatalf("Menu = %q, want 萝卜", resource.Menu)
 			}
 		}
 	}
@@ -497,12 +517,64 @@ func TestManagementServesResourceUI(t *testing.T) {
 	}
 }
 
+// A panic answers an error naming the method and the value, which CPA
+// shows for interceptors, and is logged with its stack: CPA logs nothing for
+// a failed authentication.
+// A panic answers with an error naming the method and the value; its stack
+// is logged at most once a minute per method, a single line otherwise.
 func TestSafePluginCallRecoversPanic(t *testing.T) {
-	response, err := safePluginCall(func() ([]byte, error) {
-		panic("boom")
-	})
-	if err == nil || response != nil {
-		t.Fatalf("safePluginCall response=%q error=%v", response, err)
+	var logged bytes.Buffer
+	log.SetOutput(&logged)
+	defer log.SetOutput(os.Stderr)
+	panicLogs.mu.Lock()
+	delete(panicLogs.last, "test.panic") // an earlier run in this process
+	panicLogs.mu.Unlock()
+	for _, withStack := range []bool{true, false} {
+		logged.Reset()
+		response, err := safePluginCall("test.panic", func() ([]byte, error) {
+			panic("boom")
+		})
+		if err == nil || response != nil || !strings.Contains(err.Error(), "test.panic") || !strings.Contains(err.Error(), "boom") {
+			t.Fatalf("safePluginCall response=%q error=%v", response, err)
+		}
+		if !strings.Contains(logged.String(), "test.panic panicked: boom") || strings.Contains(logged.String(), "goroutine") != withStack {
+			t.Fatalf("panic log (stack expected: %v) = %q", withStack, logged.String())
+		}
+	}
+}
+
+// A line CPA refuses, as it refuses every callback once it has closed the
+// instance before shutdown, goes to stderr rather than nowhere: the refusal
+// is an error envelope with a zero status.
+func TestLogLineTheHostRefusesGoesToStderr(t *testing.T) {
+	var logged bytes.Buffer
+	log.SetOutput(&logged)
+	defer log.SetOutput(os.Stderr)
+	app := NewApp()
+	host := newDetectionHost()
+	app.SetHost(host)
+	app.logf("info", "taken by the host")
+	host.closed.Store(true)
+	app.logf("error", "refused by the host")
+	if got := logged.String(); strings.Contains(got, "taken by the host") || !strings.Contains(got, "refused by the host") {
+		t.Fatalf("stderr = %q", got)
+	}
+}
+
+// OKEnvelope writes in one pass the bytes the two-pass encoding wrote.
+func TestOKEnvelopeKeepsTheEnvelopeBytes(t *testing.T) {
+	for _, value := range []any{
+		struct{}{}, nil, RequestInterceptResponse{}, RequestInterceptResponse{Body: []byte("<&>\u2028")},
+		jsonResponse(http.StatusOK, map[string]any{"note": "<b>\u2029", "n": 1.5e300}), json.RawMessage(`{ "a" : [1, 2] }`), "plain", []string(nil),
+	} {
+		raw, err := json.Marshal(value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want, _ := json.Marshal(Envelope{OK: true, Result: raw})
+		if got, err := OKEnvelope(value); err != nil || !bytes.Equal(got, want) {
+			t.Errorf("OKEnvelope(%#v) = %s, %v; want %s", value, got, err, want)
+		}
 	}
 }
 

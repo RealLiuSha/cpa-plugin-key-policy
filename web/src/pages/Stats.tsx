@@ -3,9 +3,9 @@ import { Link, useSearchParams } from "react-router-dom";
 import { exportStatsCSV, fetchStats, isRangeTooLarge, type StatsExport } from "../api/stats";
 import { fetchStatus } from "../api/status";
 import { extractApiError } from "../api/error";
-import { MobileTabBar } from "../components/MobileChrome";
 import UnpricedBadge from "../components/UnpricedBadge";
 import UsageChart from "../components/UsageChart";
+import LedgerHealthList from "../components/LedgerHealth";
 import { formatCount, formatHitRate, formatUSD } from "../format";
 import { useT } from "../i18n";
 import { useSearchDraft, type SearchDraft } from "../search";
@@ -16,11 +16,6 @@ import type { LedgerHealth, StatsKey, StatsModel, StatsReport, StatsTotals } fro
 const STATS_RANGES = [1, 7, 30, 90] as const;
 type StatsRange = (typeof STATS_RANGES)[number];
 const DEFAULT_STATS_RANGE: StatsRange = 1;
-
-const HEALTH_COUNTERS = [
-  "flush_failures", "skipped_failed", "ignored_unknown_key", "ignored_no_model", "ignored_empty_usage",
-  "clamped_tokens", "invalid_usage", "unmetered_per_call", "unpriced_calls",
-] as const satisfies readonly (keyof LedgerHealth)[];
 
 function saveFile({ blob, filename }: StatsExport) {
   const url = URL.createObjectURL(blob);
@@ -246,29 +241,7 @@ function HealthPanel() {
   if (state === null) content = <div className="muted">{t("stats.loading")}</div>;
   else if (state.error) content = <div className="error">{state.error}</div>;
   else if (!health) content = <div className="muted">{t("stats.health.unavailable")}</div>;
-  else content = (
-    <>
-      <p className="muted stats-health-hint">{t("stats.health.hint")}</p>
-      <dl className="stats-health-list">
-        <div>
-          <dt>{t("stats.health.lastFlushAt")}</dt>
-          <dd>{health.last_flush_at ? new Date(health.last_flush_at).toLocaleString() : t("stats.health.never")}</dd>
-        </div>
-        {flushError && (
-          <div className="stats-health-error" data-testid="stats-flush-error">
-            <dt>{t("stats.health.lastFlushError")}</dt>
-            <dd className="mono">{flushError}</dd>
-          </div>
-        )}
-        {HEALTH_COUNTERS.map((field) => (
-          <div key={field} className={health[field] > 0 ? "" : "zero"} data-field={field}>
-            <dt>{t(`stats.health.field.${field}`)}</dt>
-            <dd className="mono">{formatCount(health[field])}</dd>
-          </div>
-        ))}
-      </dl>
-    </>
-  );
+  else content = <LedgerHealthList health={health} />;
   return (
     <details className={"card stats-health" + (flushError ? " has-error" : "")} data-testid="stats-health">
       <summary>
@@ -373,7 +346,6 @@ export default function Stats() {
         </>
       )}
       <HealthPanel />
-      <MobileTabBar active="stats" />
     </div>
   );
 }

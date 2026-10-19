@@ -1,6 +1,6 @@
 # cpa-key-policy
 
-`cpa-key-policy` 是 CLIProxyAPI 插件，用于签发下游 Key、按上游模型定价并按倍率计费、记录用量，并执行 RPM 与美元限额。额度耗尽和 RPM 超限返回 HTTP 429；任何启用的 Key 都能使用 CPA 提供的所有模型；没有价格的模型按 $0 计费并被标记，直到补上价格。本次发布面向 Linux x64，运行基线为 Debian 12 / glibc 2.36 或更新版本，数据格式为 v7；升级流程见 [RELEASE.md](RELEASE.md)。
+`cpa-key-policy` 是 CLIProxyAPI 插件，在 CPA 管理面板里显示为「萝卜」。它签发下游 Key、按上游模型定价并按倍率计费、记录用量，并执行 RPM 与美元限额；另外按渠道（CPA 凭据）统计成功率、延迟和成本，按渠道改写请求体，查询上游余额，可接管 Codex 联网搜索（alpha search）的选路，还能用糖果、指纹、ModelTrace 和鹈鹕测试检测凭据背后的模型是否被降智或替换。插件 ID、配置键和所有管理路径仍是 `cpa-key-policy`。额度耗尽和 RPM 超限返回 HTTP 429；任何启用的 Key 都能使用 CPA 提供的所有模型；没有价格的模型按 $0 计费并被标记，直到补上价格。本次发布面向 Linux x64，运行基线为 Debian 12 / glibc 2.36 或更新版本，数据格式为 v7；升级流程见 [RELEASE.md](RELEASE.md)。
 
 ## 模型价格
 
@@ -18,6 +18,8 @@
 enabled: true
 state_file: cpa-key-policy-state.json
 usage_timezone: Asia/Shanghai
+search_enabled: false
+cpa_config_path: config.yaml
 
 models:
   - name: gpt-5.6
@@ -39,7 +41,16 @@ keys:
     monthly_limit_usd: 150
 ```
 
-首次启动会用 YAML 初始化 Key 和价格行，并创建带相同 `dataset_id` 的 state 与 usage 文件。之后 Key 和价格以 state 为唯一真相源；YAML 只控制 `enabled`、`state_file` 和 `usage_timezone`。旧版本的设置（`target_model`、`targets`、`dispatch`、`free`、`group`、`classify_rules`、`keys[].models`、`keys[].allow_models_endpoint`、`keys[].limits_changed_at`）属于未知字段，会让注册失败；切换前用 `cpa-key-policy-check --config` 检查配置。首次启动时两个种子 Key 共用同一密钥会被拒绝。启动时严格拒绝不受支持的文件版本、缺失配对、dataset 不一致、时区不一致的用量文件，以及水位（`through`）晚于 `usage_timezone` 当天的 history 文件。
+插件自己的两个键：
+
+- `search_enabled`（默认 false）：为 true 时插件向 CPA 注册模型路由器，接管 `POST /v1/alpha/search` 的选路；路由设置在「搜索」页编辑。关闭时不注册路由器，普通请求不多一次穿越。
+- `cpa_config_path`（默认 `config.yaml`，相对 CPA 的工作目录）：只读，用于查询上游余额时按 auth_index 找到上游 key，以及检测时按 CPA 给的 ID 列出配置里的 API key；key 只在进程内使用，不会写进任何文件、日志或接口响应。
+
+首次启动会用 YAML 初始化 Key 和价格行，并创建带相同 `dataset_id` 的 state 与 usage 文件。之后 Key 和价格以 state 为唯一真相源；YAML 只控制 `enabled`、`state_file`、`usage_timezone` 和上面两个键。CPA 每次配置生效都会重发配置；配置块没有变化时插件什么都不做，不重读数据文件，所以插件运行期间直接改数据文件不会生效，需要重启。例外是在这个 CPA 进程里跑过、交出数据目录之后又收到注册的同一份插件（`store.version` 切回它，或停用期间跑过别的版本后再启用，CPA 都复用进程里还在的那份插件）：它从文件重新加载并回放交接日志，不用内存里的旧数据接着服务；文件加载不了就注册失败。CPA 丢弃这次加载、回滚到被替换的实例时，那个实例照常服务，每条记录只计一次，也能再发起检测。
+
+注册时未知的顶层键只记一条警告（「设置」页可见），不会让插件注册失败；已经加载数据之后，无法应用的配置会被拒绝并保留上一次有效的配置，同样显示在「设置」页；改了 `usage_timezone` 时立即拒绝，不重读数据文件。首次启动就无法加载数据时仍然注册失败。`cpa-key-policy-check --config` 保持严格：旧版本的设置（`target_model`、`targets`、`dispatch`、`free`、`group`、`classify_rules`、`keys[].models`、`keys[].allow_models_endpoint`、`keys[].limits_changed_at`）和其他未知键都会被它拒绝，切换前用它检查配置。
+
+渠道、适配规则和搜索设置各自存一个文件，和 state 同目录：`cpa-key-policy-adapters.json`、`cpa-key-policy-search.json`、`cpa-key-policy-channels.json`、`cpa-key-policy-channel-stats.json`，检测历史存在 `cpa-key-policy-quality.json`。它们不属于 v7 数据集，回退到旧版本时保留即可，旧版本不会读取。渠道统计每 5 分钟落盘一次，关闭和热替换时精确落盘，崩溃最多丢 5 分钟统计，不丢计费。`scripts/publish.py` 备份这些文件，连同还没被回放的交接日志。但 0.16.0 及更早版本严格解析配置块，回退前要从 `plugins.configs.cpa-key-policy` 删掉 `search_enabled` 和 `cpa_config_path`，否则注册失败，Key 全部 401。这些版本也不回放交接日志，回退到它们要重启 CPA，不能在运行中的 CPA 里只改 `store.version` 热切换（规则见 [RELEASE.md](RELEASE.md)）。首次启动时两个种子 Key 共用同一密钥会被拒绝。启动时严格拒绝不受支持的文件版本、缺失配对、dataset 不一致、时区不一致的用量文件，以及水位（`through`）晚于 `usage_timezone` 当天的 history 文件。
 
 ## 用量与限额
 
@@ -49,9 +60,9 @@ keys:
 - `cpa-key-policy-usage.json`（紧凑 JSON）：所有 Key 的额度周期、余额 Key 的 `balance`（`balance_nano`、`net_credited_nano` 和记住的请求号），以及晚于 `history_through` 的日子。有脏数据时每 15 秒整文件重写。
 - `cpa-key-policy-history.json`（紧凑 JSON）：保留期内 `through` 及之前已收盘的日子。每天第一次跨日的落盘会重写它，保留期淘汰日子时也会重写；除此之外已收盘的日子不再改写。1000 个 Key 时约 100–300 ms，只阻塞 flusher 协程，不持账本锁。
 
-快照在账本锁内完成，序列化在锁外；写入失败保留脏标记、下个周期重试，并在 `/status` 的 `health.last_flush_error` 可见。插件卸载时做最后一次完整落盘，先写 history。live 文件引用了 history 日期而 history 文件缺失、`dataset_id` 不一致、时区不同或计数为负时拒绝启动，不会静默修复账本。时钟回拨后日期落在已收盘日子的记录，记到第一个未收盘的日子，已收盘的历史永不改写。删除 Key 会立即清掉它的周期和 RPM 窗口并写 live 文件（写入失败会记日志，交给 flusher 重试）；历史保留到过期，统计里标记为已删除。
+快照在账本锁内完成，序列化在锁外；写入失败保留脏标记、下个周期重试，并在 `/status` 的 `health.last_flush_error` 可见。一直写不进去时概览页也会警告（`GET /overview` 的 `warnings` 里多一行 `usage ledger not saved …`），CPA 日志在第一次写失败和恢复时各记一行，其间的失败只写 stderr。插件卸载时做最后一次完整落盘，先写 history；已经不持有数据目录的实例（例如被热替换下来的）什么都不写。CPA 先关插件再停用量队列，停机时还在队列里的最后几条用量记录到不了插件，不会计费。live 文件引用了 history 日期而 history 文件缺失、`dataset_id` 不一致、时区不同或计数为负时拒绝启动，不会静默修复账本。时钟回拨后日期落在已收盘日子的记录，记到第一个未收盘的日子，已收盘的历史永不改写。删除 Key 会立即清掉它的周期和 RPM 窗口并写 live 文件（写入失败会记日志，交给 flusher 重试）；历史保留到过期，统计里标记为已删除。
 
-每个 Key 在 `cycles` 下有独立的日、7 天、30 天额度周期。日额度在 `usage_timezone`（默认 `Asia/Shanghai`）的每天 00:00 重置。7 天、30 天周期是从 Key 创建日起算的固定自然日周期：首期到期为创建日加 7/30 天的 00:00；自动重置从原到期日推进，停机、空闲、重启不改变节奏；手动重置只恢复选中周期，下次到期为操作当天加 1/7/30 天的 00:00，其他周期和历史保持不变。修改限额、停用/启用或更换密钥不重置额度。手动重置在账本锁内写 live 文件，让文件恰好是一次完整的切片（1000 个 Key 约 10–25 ms）；这是有意的取舍，重置耗时超过 50 ms 时再复核。
+每个 Key 在 `cycles` 下有独立的日、7 天、30 天额度周期。日额度在 `usage_timezone`（默认 `Asia/Shanghai`）的每天 00:00 重置。在 DST 从午夜开始的时区（例如 America/Santiago、Africa/Cairo），切换当天没有 00:00，那天以及落在那天的 7 天、30 天到期从当天第一个有效时刻 01:00 开始；其余日子仍是 00:00，Asia/Shanghai、UTC 这类没有这种日子的时区不受影响。旧版本可能把这个边界算到前一天 23:00，它们在这类时区写下的用量文件启动时会被拒绝，要先修正周期。7 天、30 天周期是从 Key 创建日起算的固定自然日周期：首期到期为创建日加 7/30 天的 00:00；自动重置从原到期日推进，停机、空闲、重启不改变节奏；手动重置只恢复选中周期，下次到期为操作当天加 1/7/30 天的 00:00，其他周期和历史保持不变。修改限额、停用/启用或更换密钥不重置额度。手动重置在账本锁内写 live 文件，让文件恰好是一次完整的切片（1000 个 Key 约 10–25 ms）；这是有意的取舍，重置耗时超过 50 ms 时再复核。
 
 每个 Key 有一种额度方式 `quota_mode`。默认的 `cycle` 受上面的日、7 天、30 天额度限制；`balance` 是预付余额：没有周期额度，唯一的限制是管理员通过 `POST /keys/balance` 调整的余额（`amount_usd` 为正表示充值，为负表示扣减）。余额 Key 每次计费都在登记周期的同一把锁内从余额扣除，余额小于等于 0 时拒绝请求；计费发生在调用结束后，余额用完时仍在进行的调用可能让余额略低于 0。每次调整都在答复前写入 live 文件，并记一条 `adjust_balance` 审计事件（金额、调整前后余额、备注、请求号）；扣费与账本其他数据一样每 15 秒落盘，进程崩溃最多丢失最后 15 秒的扣费。带 `request_id` 的调整重试时返回第一次的结果（`duplicate: true`），不会重复入账；每个 Key 保留最近 64 个请求号，同一请求号换了金额返回 409 `request_id_conflict`。切换为 `balance` 会清空周期额度，给余额 Key 设置周期额度会被拒绝；切回 `cycle` 时余额保留但不扣减，再切回 `balance` 时继续使用。删除 Key 会一并删除余额，`delete_key` 审计事件会写明金额。余额 Key 的周期照常累计，用于用量页和统计。
 
@@ -60,6 +71,7 @@ keys:
 计费只发生一次：CPA 在调用结束后把用量记录交给插件时。
 
 - `Failed` 为真的记录一律不计费。这包括客户端中途取消、被 CPA 记为 499 的流：它们带的部分 token 也不扣费。
+- 记录里计费不读的字段（`BaseURL`、`AuthID`、`AuthIndex`、`RequestedAt`、`Latency`、`TTFT`、`Failure`）换了类型时照常计费，只丢那个字段；计费读的字段（含 `Detail`）换了类型时这条不计费。两种情况每分钟最多记一条日志。
 - Key 先按 ID、再按明文哈希匹配；不要求 Key 仍处于启用状态，因为请求开始时已经授权。
 - 模型取上游 `Model`，为空时才用请求里的名称。桶键一律是小写的模型 ID，按模型汇总不会因上游上报的大小写不同而拆开。
 - 负的 token 数按 0 处理。输入、输出、思考、缓存读、缓存写任一超过 2^31 时整条记录拒绝（`invalid_usage`）；`total_tokens` 和 `cached_tokens` 不参与计费，超限只置 0、不拒绝。做过上述任一修正的记录计一次 `clamped_tokens`。
@@ -74,13 +86,13 @@ keys:
 | 情况 | 判定位置 | 客户端看到 |
 | --- | --- | --- |
 | 未知 Key、停用 Key、插件被禁用 | 鉴权 | 401（CPA 通用答复） |
-| 图片 / 视频生成路由上 Key 只放在 query 参数里 | 鉴权 | 401 |
+| 图片 / 视频生成路由上，或 WebSocket 握手（`GET /v1/responses`、`GET /backend-api/codex/responses`）时，Key 只放在 query 参数里 | 鉴权 | 401 |
 | RPM 超限 | 请求拦截器 | 429 `rate_limit_exceeded`，`Retry-After` 为当前一分钟窗口的剩余秒数 |
 | 预付余额用完（余额 Key） | 请求拦截器 | 429 `insufficient_quota`，包括 Responses API；不带 `Retry-After`，余额不会自动恢复 |
 | 日、7 天或 30 天额度用尽 | 请求拦截器 | 429 `insufficient_quota`，`Retry-After` 为所有已用尽周期中最晚的重置时间；Responses API 的 `type` 为 `usage_limit_reached` 并带 `resets_at`（Unix 秒），Codex 据此显示重置时间，`code` 仍是 `insufficient_quota` |
 | 模型列表（`/v1/models`、`/openai/v1/models`、`/v1beta/models`） | 鉴权 | 启用的 Key 始终放行，不计 RPM 和额度 |
 
-准入先查 RPM，再查额度，拒绝时点名重置最晚的那个周期。CPA 会把鉴权阶段的任何拒绝都变成 401，而请求拦截器可以在访问上游之前以任意状态码终止请求（CPA v7.2.103 起）。当 Key 放在请求头里、且路由是 CPA 会拦截并给出 HTTP 答复的接口时，额度和 RPM 交给拦截器判定，这些接口包括 chat/completions、completions、responses、messages、count_tokens、images、videos（生成与结果查询）、`/v1beta/models/*`、interactions 和 codex responses。其余请求仍在鉴权阶段判定，保持 401：Key 放在 query 参数里的请求，realtime、live、alpha/search 路由，以及 `/v1/responses` 的 WebSocket 握手（WebSocket 上被拒的一轮只会断开连接，所以握手时检查额度，RPM 按每一轮计数）。只在 query 里带 Key 的媒体生成请求会被直接拒绝：拦截器看不到 query，而按次计费依赖拦截器记下的 TraceID。
+准入先查 RPM，再查额度，拒绝时点名重置最晚的那个周期。CPA 会把鉴权阶段的任何拒绝都变成 401，而请求拦截器可以在访问上游之前以任意状态码终止请求（CPA v7.2.103 起）。当 Key 放在请求头里、且路由是 CPA 会拦截并给出 HTTP 答复的接口时，额度和 RPM 交给拦截器判定，这些接口包括 chat/completions、completions、responses、messages、count_tokens、images、videos（生成与结果查询）、语音合成（`/v1/audio/speech`、`/v1/tts`，CPA v8.0.18 起才有）、`/v1beta/models/*`、interactions 和 codex responses。其余请求仍在鉴权阶段判定，保持 401：Key 放在 query 参数里的请求，realtime、live、alpha/search 路由，以及 `/v1/responses`、`/backend-api/codex/responses` 的 WebSocket 握手（WebSocket 上被拒的一轮只会断开连接，所以 Key 在请求头时握手检查额度，RPM 由拦截器按每一轮计数）。只在 query 里带 Key 的媒体生成请求会被直接拒绝：拦截器看不到 query，而按次计费依赖拦截器记下的 TraceID。只在 query 里带 Key 的 WebSocket 握手同样直接拒绝：每一轮由拦截器准入，它拿到的是握手的请求头、没有 query，这种 Key 只会在握手时查一次。浏览器里的 WebSocket 设不了请求头，会被拒；Codex 把 Key 放在请求头里。
 
 429 的错误体跟随调用协议：OpenAI 形状 `{"error":{"message","type","code"}}`，Claude 形状 `{"type":"error","error":{"type":"rate_limit_error","message"}}`，Gemini 形状 `{"error":{"code":429,"message","status":"RESOURCE_EXHAUSTED"}}`。消息里写明用尽的额度和按 `usage_timezone` 计算的重置时间。查询已生成的视频结果不受额度限制。
 
@@ -88,7 +100,7 @@ CPA 会跳过返回错误的请求拦截器，所以插件出故障时那一个�
 
 ## 管理 API 与 Web UI
 
-管理面包含 Key、模型价格、统计和审计四个入口。嵌入 CPA 管理面板时只显示分区标签；单独打开时额外显示地址和退出按钮。管理 API 基础路径：
+面板里只有一个「萝卜」菜单，页面有概览、密钥、渠道、模型与价格、统计、搜索、检测、审计、设置。嵌入 CPA 管理面板时只显示分区标签；单独打开时额外显示地址和退出按钮。页面带 ETag，按弱比较校验（`W/"…"` 和 `*` 也算命中），面板每次切换菜单重新加载时只做一次 304 校验。接受 gzip 的客户端拿到压缩一次的副本，ETag 是 `"<sha>-gz"`；所有答复都带 `Vary: Accept-Encoding`，「设置」页显示的是原文页的 SHA，前置代理清掉 `Accept-Encoding` 时拿到原文。数据目录下的 `cpa-key-policy-ui/index.html` 存在时，插件用它替代内置页面，更新界面不需要更换插件文件。管理 API 基础路径：
 
 ```text
 /v0/management/plugins/cpa-key-policy
@@ -109,16 +121,41 @@ CPA 会跳过返回错误的请求拦截器，所以插件出故障时那一个�
 | `POST /models/import` | 为上游模型创建 $0 价格行；已存在的行直接跳过，不覆盖 |
 | `POST /models/pricing-preview` | 获取选中模型的 Models.dev 价格 |
 | `POST /models/import-prices` | 预览或应用已有价格行的价格 |
-| `GET /audit` | 读取追加式管理审计，新的在前；`key_id`、`action` 按 Key 和动作筛选，`limit`（1–1000，默认 100）按筛选后的条数计 |
+| `GET /audit` | 读取追加式管理审计，新的在前；`key_id`、`action` 按 Key 和动作筛选，`limit`（1–1000，默认 100）按筛选后的条数计。凑满 `limit` 条后不再读更旧的备份。读不出的行跳过并只记一次日志（一个文件最新的若干行里不超过 8 条坏行时结果条数不变），超过 1 MiB 的行照常读出。崩溃或磁盘写满留下的半行，下次追加前先补上换行，下一条事件不会跟着它一起丢。筛选只认插件自己写出的紧凑 JSON，手工编辑过的行可能筛不出来 |
 | `GET /status` | 运行状态与账本健康计数 |
+| `GET /overview` | 今日请求、计费、上游成本与毛利，需要关注的 Key 和渠道，模块状态，最近变更，以及警告（配置警告；账本写不进磁盘时另有一行） |
+| `GET /channels` | 按 auth_index 的渠道统计（24 小时、今日）、元数据、余额和规则数，以及 `groups`（按 auth_index 给出 config.yaml 里 API key 所在的分组名）；界面再与 CPA 的凭据列表合并，没有自己名字的配置 Key 用分组名显示 |
+| `GET /channels/detail` | 一个渠道 7 天的小时序列和最近 20 条错误（`auth_index`） |
+| `PATCH /channels` | 修改渠道显示名、供应商、备注、进价倍率（上游价 = 标价 × 倍率）、余额来源（`sub2api` 或 `openai_billing`）与告警阈值。`openai_billing` 读 new-api、one-api 的计费接口；读数是站点的显示单位（USD、CNY 或原始额度），接口不说明单位，所以不带单位，告警阈值也按这个单位比较。Key 是无限额度时 new-api 返回的上限恰好是 100000000，读不到账户余额，萝卜报错而不显示数字。审计事件 `update_channel` 只列改动了的字段，什么都没改不记 |
+| `POST /channels/balance/refresh` | 立即查询一个渠道的上游余额 |
+| `GET/POST/DELETE /adapters` | 按渠道的请求改写规则：`edits_image_field`（图片编辑的 `images[].image_url` 改成 `image`）、`set_field`、`delete_field` |
+| `POST /adapters/preview` | 用示例请求体预览规则的效果，不发送任何请求 |
+| `POST /adapters/try` | 套用规则后经 CPA 真实发送一次，固定到这个渠道；会产生上游费用并计入渠道冷却，不计下游账单。规则路径要含 `/v1/images/edits`、`/v1/images/generations`、`/v1/responses`、`/backend-api/codex/responses`、`/v1/chat/completions`、`/v1/messages` 之一，否则 400 `unsupported_path`。config.yaml 里的 API key 按推算出的凭据 ID 固定，没走过流量也能试；其他渠道要先有一次真实请求（否则 409 `channel_not_seen`）。页面最多等 5 分钟；管理请求结束（超时、编辑了示例请求体或离开表单）时 CPA 取消上游调用 |
+| `GET/PUT /search` | alpha search 的目标模型、保留模型、渠道顺序与模板、强制不健康、可选探测，以及各渠道实时状态 |
+| `POST /search/import` | 从 alpha-search-model 插件的配置块导入搜索设置 |
+| `GET /quality` | CPA 凭据及其检测进度、各项测试最近 20 次记录（糖果记录不带回答）和测试参数 |
+| `POST /quality/run`、`POST /quality/cancel` | 对凭据发起或停止糖果、指纹、ModelTrace、鹈鹕测试；会消耗凭据额度 |
+| `GET /quality/record`、`DELETE /quality/results` | 读取一条完整记录（糖果回答、指纹比对、ModelTrace 样本、鹈鹕 HTML；糖果记录的 `id` 是 `GET /quality` 里它的 `time` 原样字符串）；清空一项或全部记录 |
+| `POST/GET /quality/inspection` | 按名称或邮箱匹配凭据发起巡检，读取每个凭据是否降智的结论 |
+| `GET /settings` | 模块状态、各钩子耗时（次数和最大值从启动起累计，p50/p99 取最近 512 次）、配置警告、数据文件、界面来源、数据目录归属（`ownership.handoff`：平时 `idle`，热替换交出后 `quiesced`，回滚后没取回目录时 `read_only`）与健康计数 |
 
-`GET /keys` 每项含 `id, name, enabled, key_preview, rpm, daily_limit_usd, weekly_limit_usd, monthly_limit_usd, quota_mode, usage, created_at, updated_at`；`POST /keys` 与 `PATCH /keys` 接收 `quota_mode`（`cycle` 或 `balance`），切换为 `balance` 的 PATCH 会清空它没有设置的周期额度。`POST /keys/balance` 返回 `{id, amount_usd, balance_before_usd, balance_usd, net_credited_usd, duplicate}`；金额为 0 或超出 ±1,000,000、备注超过 200 字返回 400 `invalid_amount`，周期 Key 返回 409 `not_balance_mode`，Key 不存在返回 404。`POST /keys` 与 `PATCH /keys` 拒绝未知字段，但接收并忽略旧版本曾有的 `models` 和 `allow_models_endpoint`，现有写入方无需改动。创建、更新、轮换时若密钥已被其他 Key 使用，返回 409 `duplicate_key`。`DELETE /models` 删除不存在的价格行返回 404 `not_found`。管理写入的 state 文件落盘失败时返回 500 `persist_failed`，运行中的策略保持不变。
+`GET /keys` 每项含 `id, name, enabled, key_preview, rpm, daily_limit_usd, weekly_limit_usd, monthly_limit_usd, quota_mode, usage, created_at, updated_at`。`key_preview` 对 24 个字符及以上的 Key 保留前 7 后 5 个字符，更短的保留前 3 后 2，8 个字符及以下只显示 `...`；它在新建、轮换和改 Key 时写入，之前写下的预览保持原样。`POST /keys` 与 `PATCH /keys` 接收 `quota_mode`（`cycle` 或 `balance`），切换为 `balance` 的 PATCH 会清空它没有设置的周期额度。`POST /keys/balance` 返回 `{id, amount_usd, balance_before_usd, balance_usd, net_credited_usd, duplicate}`；金额为 0 或超出 ±1,000,000、备注超过 200 字返回 400 `invalid_amount`，周期 Key 返回 409 `not_balance_mode`，Key 不存在返回 404。`POST /keys` 与 `PATCH /keys` 拒绝未知字段，但接收并忽略旧版本曾有的 `models` 和 `allow_models_endpoint`，现有写入方无需改动。创建、更新、轮换时若密钥已被其他 Key 使用，返回 409 `duplicate_key`。`DELETE /models` 删除不存在的价格行返回 404 `not_found`。管理写入的 state 文件落盘失败时返回 500 `persist_failed`，运行中的策略保持不变。
 
 `GET /keys/usage` 列出 Key 当前周期里出现过的模型，带 `billing_mode`、`billing_multiplier`、`priced` 和 `daily` / `weekly` / `monthly` 窗口。`GET /stats` 按扣费降序最多返回 200 个 Key，超出时带 `keys_truncated` 和 `keys_total`，并列出 `unpriced_models`。CSV 的列为 `date,key_id,key_name,deleted,model,calls,unpriced_calls,input_tokens,cache_read_tokens,cache_write_tokens,output_tokens,charged_usd`，金额按精确小数输出，以 `=`、`+`、`-`、`@` 开头的单元格前置单引号。超出范围返回 413 `range_too_large`。
 
 重置接口兼容原 `{id, window}` 请求。新页面额外提交 `expected: {started_at, reset_after_manual_at}`；账本会在同一个锁内核对用户看到的周期和拟定日期。跨日或其他管理员已经重置时返回 `409 quota_changed`，页面刷新预览并等待再次确认，不自动重试写操作。
 
 价格导入不会创建价格行；它把 token 价格应用到模型 ID 匹配的所有行（不看 provider 限定），并保留倍率。
+
+渠道就是 CPA 的一条凭据，用 CPA 的 `auth_index` 标识：配置里的 API key 凭据由类型、base-url 和 key 算出，改 proxy、prefix 或请求头都不变；OAuth 凭据用凭据文件的 `auth_index`。渠道统计只来自 CPA 的用量记录：每次上游尝试一条，失败后换渠道重试的那次也算，所以不需要任何探测请求。Codex 调用 `image_generation` 工具时，同一次尝试会多一条成功记录（同一凭据、同一 TraceID 和请求时间、图片模型）：它的 token 和成本照加，但不算又一次尝试，也不加延迟样本。没有 TraceID 或请求时间的记录一律算一次尝试。客户端在上游答复之前取消（包括非流式请求的任何取消）时，CPA 记一条状态 499 的失败记录；它说明不了上游的情况，渠道统计忽略它。流开始之后的取消没有用量记录，alpha search 也没有。按次计费模型的标价成本只给被按次扣费的那条生成请求计一次 `per_call_usd`，它的其他记录不计。没有用 `PATCH /channels` 设过信息的渠道，闲置满 7 天后释放它的统计。余额查询走 CPA 给该凭据用的代理：Key 自己的 `proxy-url`，没有就用全局的（`requests.proxy-url`，或顶层 `proxy-url`）；都没写时继承环境的 `HTTP(S)_PROXY`，`direct` 或 `none` 直连。`proxy-url` 不是有效的 http、https、socks5、socks5h 地址时余额显示错误，CPA 自己只记日志、按默认方式连接。余额查询只用 HTTP/1.1，到代理和到余额站点都是（CPA 在 https 代理这一跳也强制 HTTP/1.1），只接受 HTTP/2 的站点会失败。CPA 不对配置里的 API key 凭据开放冷却状态，渠道页显示的是配置里的状态（如 `excluded-models: ["*"]`）和最近的失败率。
+
+改写规则在 CPA 选定凭据之后、执行器转换请求之前运行（`request.intercept_after`），只作用于这一次尝试，写回的是客户端格式；只有规则命中的请求才会解码请求体。CPA 自己的 payload 规则既不能按凭据匹配，也不能搬移字段，这类上游差异只能在这里处理。
+
+检测从 cpa-codex-candy-eval 重构迁移而来，不再需要另装那个插件。凭据有两个来源：CPA 认证管理器里的认证文件，以及 `cpa_config_path` 指向的 config.yaml 里的 API key（只显示掩码和分组名）。CPA 给插件的凭据列表不含配置里的 API key，插件按 CPA 的规则从 config.yaml 推算它们的凭据 ID；配置读不出来时页面会提示，认证文件照常可测。每个请求经 CPA 固定发往所选凭据，CPA 负责协议转换。糖果、ModelTrace 和鹈鹕测试的每次请求都以新会话的完整 Codex CLI 上下文发出，输入约 1.4 万 Token；指纹测试快速、标准、严格模式每个凭据分别发 60、200、400 次短请求。这些请求是真实的上游调用，会计入渠道统计的尝试次数，但不计任何下游 Key 的账；发起测试、巡检和清空记录都写审计（`run_quality`、`start_inspection`、`clear_quality`，目标是测试名）。同一凭据同时只跑一项测试；每个凭据的每项测试保留最近 20 次、且在 90 天内的记录。糖果和鹈鹕测试在所有凭据间共用 16 个并发名额（测试参数里的 `max_parallel`）；单个模型流超过 16 MB 会被中断并记为错误，不重试；调用 CPA 时出的故障只让这一个请求失败。历史在测试记下结果后最多 5 秒落盘，关闭、热替换和清空时立即写，崩溃最多丢这 5 秒。历史文件读不出来时暂停保存，页面会提示；清空全部记录（`DELETE /quality/results?test=all`）会把它改名为 `<文件>.corrupt-<UTC 时间>`，然后恢复保存。数据目录里有 candy-eval 的 `cpa-codex-candy-eval-state.json` 而还没有 `cpa-key-policy-quality.json` 时，首次启动只读导入它的历史；这个文件读不出来时只是不导入。热替换时正在运行的测试会被取消，插件最多等 15 秒：CPA 还在建立的请求打断不了（`execute_stream` 返回之后模型流才能关闭），单次请求的超时也管不到这段等待；之后还没结束的测试自己关流，不保存记录。关闭插件时 CPA 在调用插件之前就拒绝了它的所有回调（包括关流），被取消的测试要等上游再发数据才能结束；最后一次账本落盘和渠道统计在这之前写完。巡检接口与 candy-eval 的 `/inspection` 字段名相同；candy-eval 的 `inspection.py` 用的是 `/state` 和 `/run`，需改三处：`PLUGIN` 改为 `/plugins/cpa-key-policy/quality`，`state()` 改为 `api("GET", PLUGIN)`，`/run` 请求体加 `"test": "candy"`。include/exclude 模式除邮箱和名称外也匹配分组名。指纹归一化没有做 Unicode NFC 组合（不为此引入 golang.org/x/text），这是与 candy-eval 唯一的计算差异，模型回答通常本来就是 NFC。
+
+## 第三方组件
+
+检测功能移植自 [cpa-codex-candy-eval](https://github.com/haowang02/cpa-plugin-codex-candy-eval)（MIT，Copyright (c) 2026 Hao Wang），许可证见 `internal/quality/LICENSE`；ModelTrace 的归因方法与候选库来自 [ModelTrace](https://github.com/xqy2006/ModelTrace)（MIT），许可证见 `internal/quality/data/modeltrace/LICENSE`。
 
 ## 构建与验证
 
@@ -165,4 +202,6 @@ go run ./cmd/cpa-key-policy-check --state /path/to/cpa-key-policy-state.json --t
 - 配置和 state 只保存 Key 哈希；生成的明文 Key 仅返回一次。
 - state、usage 和 history 可能包含敏感运行信息，必须限制为所有者可读。
 - 管理审计记录语义化变更，绝不记录密钥或哈希；审计追加失败会记录日志，但不会回滚已成功的状态变更。
-- 凭证选择和 Token 解析保持 CPA 原有语义；插件不注册模型路由器，也不注册响应拦截器。
+- 凭证选择和 Token 解析保持 CPA 原有语义；只有 `search_enabled: true` 时插件才注册模型路由器，并且只回答 alpha search 请求；插件不注册响应拦截器。
+- 请求体只在插件调用期间借用宿主的内存读取，解码时跳过 base64 的请求体，因此几十 MB 的 Codex 请求也只多出宿主侧的复制开销。
+- 热替换前 CPA 会发 `plugin.quiesce`：插件落盘一次，此后只把计费记录和渠道统计的尝试追加到交接日志 `cpa-key-policy-handoff.jsonl`（新实例回放，两者逐条交接），不再写其他数据文件，直到 CPA 回滚替换时重新发配置。回放的记录按它被计费的那天入账（那天已收盘就记到第一个未收盘的日子），只计入当时已经开始的额度周期。quiesce 最多等 15 秒让运行中的检测结束，这期间管理写操作都在等。回滚后取不回数据目录的实例保持只读：管理写操作返回 503 `upgrading`，文案说明原因，要等锁空出来、CPA 再次应用配置。

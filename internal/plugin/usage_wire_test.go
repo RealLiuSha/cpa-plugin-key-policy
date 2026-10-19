@@ -2,6 +2,7 @@ package plugin
 
 import (
 	"encoding/json"
+	"maps"
 	"net/http"
 	"net/url"
 	"strings"
@@ -140,5 +141,36 @@ func TestPerCallBillingFollowsAdmittedTraceID(t *testing.T) {
 	// Polling a result is admitted without a quota check and billed nothing.
 	if response := interceptBefore(t, app, "trace-poll", "openai", headers, "/v1/videos/:request_id"); response.Terminate {
 		t.Fatalf("result polling terminated: %+v", response)
+	}
+}
+
+// A field whose wire type changed in a later CPA is left zero: the record is
+// still billed and counted, unless billing reads that field. encoding/json
+// names only the first such field, so one that billing reads is caught after
+// another that it does not.
+func TestUsageHandleSurvivesAChangedFieldType(t *testing.T) {
+	app := newTestApp(t, appOptions{Clock: testClock(t)})
+	var record map[string]json.RawMessage
+	decode(t, hostUsageRecord(t), &record)
+	send := func(changes map[string]string) {
+		t.Helper()
+		changed := maps.Clone(record)
+		for field, value := range changes {
+			changed[field] = json.RawMessage(value)
+		}
+		raw, err := json.Marshal(changed)
+		if err != nil {
+			t.Fatal(err)
+		}
+		handle(t, app, MethodUsageHandle, raw)
+	}
+	send(map[string]string{"Latency": `"1s"`})
+	send(map[string]string{"BaseURL": `1`, "AuthID": `1`, "AuthIndex": `1`, "RequestedAt": `123`, "Latency": `"1s"`, "TTFT": `"1s"`, "Failure": `"500"`})
+	send(map[string]string{"Detail": `"none"`})
+	// json.Marshal sorts the keys: each first field precedes the second.
+	send(map[string]string{"AuthIndex": `1`, "Failed": `"yes"`})
+	send(map[string]string{"BaseURL": `1`, "Detail": `{"InputTokens":"200000","OutputTokens":100000}`})
+	if models := keyUsageModels(t, app); len(models) != 1 || models[0].Daily.CallCount != 2 || !nearly(models[0].Daily.TotalUSD, 0.60) {
+		t.Fatalf("billed models = %+v, want two records at $0.30", models)
 	}
 }

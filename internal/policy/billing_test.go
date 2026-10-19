@@ -252,8 +252,9 @@ func TestRecordUsageResultsAndHealth(t *testing.T) {
 	if got := store.RecordUsage(tokenEvent("team", "openai", "gpt-5.6", UsageDetail{InputTokens: 1_000_000})); got != UsageIgnoredDisabled {
 		t.Fatalf("disabled plugin result = %q", got)
 	}
-	// Reconfiguring flushed the ledger; the decline counters must not move.
-	if got := store.Health(); got.LastFlushAt == "" || (func() HealthSnapshot { got.LastFlushAt = ""; return got })() != want {
+	// Switching the plugin off keeps the dataset in memory; the decline
+	// counters must not move.
+	if got := store.Health(); (func() HealthSnapshot { got.LastFlushAt = ""; return got })() != want {
 		t.Fatalf("disabled plugin touched health counters: %+v", got)
 	}
 }
@@ -278,8 +279,16 @@ func TestPerCallBillsOnlyAdmittedGenerations(t *testing.T) {
 	// The generation's usage record carries whatever tokens the upstream
 	// reported; per-call billing records the call and the fixed charge only.
 	generation := UsageEvent{TraceID: "trace-1", Provider: "xai", Model: "grok-imagine-video", APIKey: "img", Detail: UsageDetail{InputTokens: 77, OutputTokens: 5}}
+	// The channel's list cost mirrors the charge: the record billed per call
+	// costs one call, priced before billing takes its trace.
+	if cost, ok := store.ListCost(generation); cost != USDToNano(1) || !ok {
+		t.Fatalf("list cost of the generation = %d %v, want one call", cost, ok)
+	}
 	if got := store.RecordUsage(generation); got != UsageRecorded {
 		t.Fatalf("generation record = %q", got)
+	}
+	if cost, ok := store.ListCost(generation); cost != 0 || ok {
+		t.Fatalf("list cost of a record whose trace was billed = %d %v", cost, ok)
 	}
 	if got := store.RecordUsage(generation); got != UsageUnmeteredPerCall {
 		t.Fatalf("second record with the same trace = %q, want unmetered", got)
@@ -293,6 +302,9 @@ func TestPerCallBillsOnlyAdmittedGenerations(t *testing.T) {
 	polling := UsageEvent{TraceID: "trace-poll", Provider: "xai", Model: "grok-imagine-video", APIKey: "img"}
 	if denial := store.AdmitIntercepted(headers, "/v1/videos/:request_id", "trace-poll"); denial != nil {
 		t.Fatalf("polling admission = %+v", denial)
+	}
+	if cost, ok := store.ListCost(polling); cost != 0 || ok {
+		t.Fatalf("list cost of polling = %d %v", cost, ok)
 	}
 	if got := store.RecordUsage(polling); got != UsageUnmeteredPerCall {
 		t.Fatalf("polling record = %q, want unmetered", got)

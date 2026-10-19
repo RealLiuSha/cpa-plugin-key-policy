@@ -246,11 +246,14 @@ export interface AuditChange {
   to: unknown;
 }
 
+// target names what a change outside the key store applied to, such as a
+// channel's auth_index or an adapter rule id.
 export interface AuditEvent {
   ts: string;
   actor: string;
   action: string;
   key_id?: string;
+  target?: string;
   changes?: Record<string, AuditChange>;
 }
 
@@ -330,4 +333,262 @@ export interface ModelImportRow {
 export interface ModelImportResult {
   created: ModelImportRow[];
   skipped: ModelImportRow[];
+}
+
+// ===== Channels: the plugin's own data about each CPA credential =====
+
+// One window of a channel's upstream attempts, built from CPA usage records.
+// Latencies are in milliseconds; costs are at list price and, when the
+// channel has a cost ratio, at upstream price.
+export interface ChannelSummary {
+  attempts: number;
+  failures: number;
+  success_rate: number;
+  status_codes?: Record<string, number>;
+  latency_p50_ms: number;
+  latency_p95_ms: number;
+  ttft_p50_ms: number;
+  ttft_p95_ms: number;
+  input_tokens: number;
+  output_tokens: number;
+  list_cost_usd: number;
+  upstream_cost_usd: number;
+  last_at?: string;
+}
+
+// "" means the channel has no balance source.
+export type BalanceKind = "" | "sub2api" | "openai_billing";
+
+export interface ChannelBalanceSource {
+  kind?: BalanceKind;
+  threshold_usd?: number;
+}
+
+// What the operator records about a channel. cost_ratio 0 means the upstream
+// price is unknown.
+export interface ChannelMeta {
+  auth_index: string;
+  display_name?: string;
+  vendor?: string;
+  note?: string;
+  cost_ratio?: number;
+  balance?: ChannelBalanceSource;
+  updated_at?: string;
+}
+
+export interface ChannelBalance {
+  remaining: number;
+  unit?: string;
+  at?: string;
+  error?: string;
+  low: boolean;
+}
+
+// auth_id is CPA's stable credential id from the usage records.
+export interface ChannelView {
+  auth_index: string;
+  auth_id?: string;
+  provider?: string;
+  base_url?: string;
+  meta: ChannelMeta;
+  last_24h: ChannelSummary;
+  today: ChannelSummary;
+  balance?: ChannelBalance | null;
+  rules?: number;
+}
+
+export interface ChannelHour {
+  hour: string;
+  attempts: number;
+  failures: number;
+  latency_p50_ms: number;
+  list_cost_usd: number;
+}
+
+export interface ChannelError {
+  at: string;
+  status_code: number;
+  model: string;
+  snippet?: string;
+}
+
+export interface ChannelDetail extends ChannelView {
+  last_7d: ChannelSummary;
+  hours: ChannelHour[];
+  recent_errors: ChannelError[];
+}
+
+// PATCH /channels changes only the fields it carries.
+export interface ChannelPatch {
+  auth_index: string;
+  display_name?: string;
+  vendor?: string;
+  note?: string;
+  cost_ratio?: number;
+  balance?: { kind: BalanceKind; threshold_usd: number };
+}
+
+// ===== Adapter rules: per-channel request rewrites =====
+
+// value is the JSON value set_field writes; paths empty means the type's
+// default paths.
+export interface AdapterRule {
+  id: string;
+  channel: string;
+  type: string;
+  paths?: string[];
+  field?: string;
+  value?: unknown;
+  overwrite?: boolean;
+  enabled: boolean;
+  note?: string;
+  updated_at?: string;
+  hits?: { count: number; last_at?: string };
+}
+
+export interface AdapterRuleType {
+  type: string;
+  default_paths: string[];
+  needs_field: boolean;
+  needs_value: boolean;
+}
+
+// ===== Search routing =====
+
+export interface SearchChannel {
+  name: string;
+  // Selection model template; "{model}" is replaced by the requested model.
+  model: string;
+  force_unhealthy: boolean;
+}
+
+// api_key is write-only: GET never returns it and an empty value on PUT keeps
+// the stored key.
+export interface SearchProbe {
+  interval_seconds: number;
+  timeout_seconds: number;
+  model: string;
+  url: string;
+  user_agent: string;
+  idle_seconds: number;
+  api_key?: string;
+}
+
+export interface SearchSettings {
+  target_model: string;
+  keep_models: string[];
+  channels: SearchChannel[];
+  probe: SearchProbe;
+}
+
+export interface SearchChannelStatus {
+  name: string;
+  model: string;
+  healthy: boolean;
+  forced: boolean;
+  routed: number;
+  last_routed_at?: string;
+  last_probe_at?: string;
+  last_probe_error?: string;
+}
+
+export interface SearchStatus {
+  channels: SearchChannelStatus[];
+  routed_total: number;
+  last_search_at?: string;
+  probe_running: boolean;
+  probe_key_stored: boolean;
+}
+
+// enabled is search_enabled in the plugin's YAML; declared is whether the
+// running plugin has registered its router with CPA. They differ while a
+// configuration change is still being applied.
+export interface SearchState {
+  enabled: boolean;
+  declared: boolean;
+  settings: SearchSettings;
+  status: SearchStatus;
+}
+
+// ===== Overview and settings =====
+
+// A module that could not open its data file is missing here; the settings
+// answer's module_errors says why.
+export interface ModuleStates {
+  search: { enabled: boolean; declared: boolean };
+  adapters?: { rules: number; enabled_rules: number };
+  balances?: { tracked: number; low: number };
+  channels?: { tracked: number };
+}
+
+// requests counts billed calls of plugin keys; attempts and failures count
+// every upstream attempt in the channel statistics, CPA's own keys and
+// retries included.
+export interface OverviewToday {
+  requests: number;
+  attempts: number;
+  failures: number;
+  costed_channels: number;
+  uncosted_channels: number;
+  billed_usd: number;
+  list_cost_usd: number;
+  upstream_cost_usd: number;
+  margin_usd: number;
+}
+
+export interface OverviewKeyAttention {
+  id: string;
+  name: string;
+  status: KeyStatus;
+  blocked_reason?: string;
+}
+
+export type ChannelAttentionReason = "failure_rate" | "balance_low" | "balance_error";
+
+// value is the 24-hour failure rate (0–1) for failure_rate and the remaining
+// balance for balance_low.
+export interface OverviewChannelAttention {
+  auth_index: string;
+  display_name?: string;
+  reason: ChannelAttentionReason;
+  value?: number;
+}
+
+export interface OverviewResponse {
+  today: OverviewToday;
+  keys: { total: number; enabled: number; limited: number; warning: number; attention: OverviewKeyAttention[] };
+  channels: { total: number; attention: OverviewChannelAttention[] };
+  modules: ModuleStates;
+  warnings: string[];
+  recent_changes: AuditEvent[];
+}
+
+export interface HookTiming {
+  method: string;
+  count: number;
+  p50_us: number;
+  p99_us: number;
+  max_us: number;
+}
+
+export interface DataFile {
+  name: string;
+  path: string;
+  size: number;
+  modified?: string;
+  missing?: boolean;
+}
+
+export interface SettingsResponse {
+  version: string;
+  plugin_id: string;
+  display_name: string;
+  modules: ModuleStates;
+  module_errors: Record<string, string>;
+  hooks: HookTiming[];
+  config_warnings: string[];
+  files: DataFile[];
+  ui: { source: string; sha256: string };
+  ownership: { owner: boolean; handoff: string };
+  health?: LedgerHealth;
 }

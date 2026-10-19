@@ -6,13 +6,9 @@ import type { AuditEvent } from "../types";
 import { formatUSD } from "../format";
 import { formatSignedUSD } from "../components/BalanceHistory";
 import { useT } from "../i18n";
+import { labelOr } from "../labels";
 
 type Translate = (key: string, variables?: Record<string, string | number>) => string;
-
-function labelOr(t: Translate, key: string, fallback: string): string {
-  const label = t(key);
-  return label === key ? fallback : label;
-}
 
 function formatValue(value: unknown): string {
   if (value === null || value === undefined || value === "") return "";
@@ -23,10 +19,12 @@ function formatValue(value: unknown): string {
   return String(value);
 }
 
-// The subject is the key, or for model events the price row: the model and,
-// when the event names it without changing it, the provider qualifier.
+// The subject is the key, the target of a channel, adapter or search change,
+// or for model events the price row: the model and, when the event names it
+// without changing it, the provider qualifier.
 export function auditSubject(event: AuditEvent): string {
   if (event.key_id) return event.key_id;
+  if (event.target) return event.target;
   const model = event.changes?.model;
   const name = formatValue(model?.to || model?.from) || "—";
   const provider = event.changes?.provider;
@@ -85,7 +83,26 @@ export function auditChanges(event: AuditEvent, t: Translate): string[] {
 export const AUDIT_ACTIONS = [
   "create_key", "update_key", "rotate_key", "delete_key", "reset_usage", "adjust_balance",
   "create_model", "update_model", "delete_model", "import_create_model", "import_update_prices", "migrate_state",
+  "update_channel", "upsert_adapter", "delete_adapter", "try_adapter", "update_search", "import_search",
+  "run_quality", "start_inspection", "clear_quality",
 ] as const;
+
+// One event as a card: what was done, to what, when, and the changed fields.
+export function AuditEventCard({ event }: { event: AuditEvent }) {
+  const t = useT();
+  const changes = auditChanges(event, t);
+  return (
+    <article className="card audit-item">
+      <div className="audit-head">
+        <strong>{labelOr(t, `audit.action.${event.action}`, event.action)}</strong>
+        <span className="mono">{auditSubject(event)}</span>
+        <time className="muted" dateTime={event.ts}>{new Date(event.ts).toLocaleString()}</time>
+      </div>
+      {changes.length > 0 && <ul className="audit-changes">{changes.map((change) => <li key={change}>{change}</li>)}</ul>}
+    </article>
+  );
+}
+
 // "Load more" asks again for the newest events with a larger limit; the
 // server allows at most 1000.
 export const AUDIT_LIMITS = [100, 500, 1000] as const;
@@ -178,19 +195,7 @@ export default function Audit() {
         <>
           <div className="audit-summary muted">{t("audit.shown", { count: events.length })}</div>
           <div className="audit-list">
-            {events.map((event, index) => {
-              const changes = auditChanges(event, t);
-              return (
-                <article className="card audit-item" key={`${event.ts}-${event.action}-${index}`}>
-                  <div className="audit-head">
-                    <strong>{labelOr(t, `audit.action.${event.action}`, event.action)}</strong>
-                    <span className="mono">{auditSubject(event)}</span>
-                    <time className="muted" dateTime={event.ts}>{new Date(event.ts).toLocaleString()}</time>
-                  </div>
-                  {changes.length > 0 && <ul className="audit-changes">{changes.map((change) => <li key={change}>{change}</li>)}</ul>}
-                </article>
-              );
-            })}
+            {events.map((event, index) => <AuditEventCard key={`${event.ts}-${event.action}-${index}`} event={event} />)}
           </div>
           {mayHaveMore && (result!.limit < AUDIT_LIMITS[AUDIT_LIMITS.length - 1] ? (
             <button type="button" className="btn audit-more" disabled={loading} onClick={() => loadMore(result!.limit)}>{t(loading ? "audit.loading" : "audit.loadMore")}</button>

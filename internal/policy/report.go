@@ -1,6 +1,9 @@
 package policy
 
-import "sort"
+import (
+	"sort"
+	"time"
+)
 
 func (s *Store) Status() map[string]any {
 	s.mu.RLock()
@@ -25,6 +28,13 @@ func (s *Store) Health() HealthSnapshot {
 func (s *Store) Timezone() string {
 	_, ledger := s.runtimeComponents()
 	return ledger.timezone
+}
+
+// Location is the usage timezone's location, the day boundary of every
+// natural-day bucket.
+func (s *Store) Location() *time.Location {
+	_, ledger := s.runtimeComponents()
+	return ledger.location
 }
 
 // PriceRows lists the price table with each row's priced flag.

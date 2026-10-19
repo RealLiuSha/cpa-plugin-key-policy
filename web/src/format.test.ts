@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { formatCount, formatHitRate, formatUSD } from "./format";
+import { formatAmount, formatCount, formatHitRate, formatUSD } from "./format";
 
 describe("formatUSD", () => {
   it("shows two decimals for zero and amounts of a cent or more", () => {
@@ -26,6 +26,12 @@ describe("count and hit-rate formatting", () => {
   it("groups integers and shows 0 for empty counters", () => {
     expect(formatCount(1234567)).toBe("1,234,567");
     expect(formatCount(0)).toBe("0");
+  });
+
+  it("shows a balance remainder with at most four decimals", () => {
+    expect(formatAmount(100 - 8770.12 / 100)).toBe("12.2988");
+    expect(formatAmount(5)).toBe("5");
+    expect(formatAmount(Number.NaN)).toBe("—");
   });
 
   it("reports the cached share of input and avoids 0/0", () => {

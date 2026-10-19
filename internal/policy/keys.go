@@ -44,10 +44,16 @@ func MatchHash(key, hash string) bool {
 	return subtle.ConstantTimeCompare([]byte(got), []byte(hash)) == 1
 }
 
+// PreviewKey shows the ends of a key. Read-only callers of GET /keys store the
+// preview, so a key too short for a 7+5 preview to hide most of it shows at
+// most 5 characters.
 func PreviewKey(key string) string {
 	key = strings.TrimSpace(key)
-	if len(key) <= 12 {
-		return key
+	switch {
+	case len(key) <= 8:
+		return "..."
+	case len(key) < 24:
+		return key[:3] + "..." + key[len(key)-2:]
 	}
 	return fmt.Sprintf("%s...%s", key[:7], key[len(key)-5:])
 }

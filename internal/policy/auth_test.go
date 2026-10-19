@@ -157,6 +157,43 @@ func TestDenialNamesThePeriodThatResetsLast(t *testing.T) {
 	}
 }
 
+// Each turn of a Responses WebSocket is admitted by the interceptor, which
+// gets the handshake headers and no query, so the handshake refuses a key
+// that is only in the query: it would be checked once and never again.
+func TestWebSocketHandshakeRequiresAHeaderKey(t *testing.T) {
+	loc := mustShanghai(t)
+	clock := newTestClock(time.Date(2026, 10, 10, 9, 0, 0, 0, loc))
+	key := testKey(t, "k", "cpa_k")
+	key.DailyLimitUSD = 1
+	store := newStore(t, clock, []KeyConfig{key}, []ModelPrice{tokenPrice("fast", "", 1, 0)})
+	query := map[string][]string{"key": {"cpa_k"}}
+	for _, tc := range []struct {
+		method, path string
+		headers      http.Header
+		query        map[string][]string
+	}{
+		{"GET", "/v1/responses", nil, query},
+		{"get", "/backend-api/codex/responses/", nil, query},
+		{"GET", "/v1/responses", http.Header{"Authorization": {"Basic Zm9v"}}, map[string][]string{"api_key": {"cpa_k"}}},
+	} {
+		if decision := store.Authenticate(tc.method, tc.path, tc.headers, tc.query); decision.Allowed || !decision.Known || decision.Reason != "websocket_requires_header_key" {
+			t.Fatalf("%s %s with a query key = %+v", tc.method, tc.path, decision)
+		}
+	}
+	// An HTTP request on the same route is admitted once, at authentication.
+	if decision := store.Authenticate("POST", "/v1/responses", nil, query); !decision.Allowed || decision.Deferred {
+		t.Fatalf("POST with a query key = %+v", decision)
+	}
+	headers := bearer("cpa_k")
+	if decision := store.Authenticate("GET", "/v1/responses", headers, nil); !decision.Allowed || decision.Deferred {
+		t.Fatalf("header-key handshake = %+v", decision)
+	}
+	store.RecordUsage(tokenEvent("k", "codex", "fast", UsageDetail{InputTokens: 1_200_000}))
+	if decision := store.Authenticate("GET", "/backend-api/codex/responses", headers, nil); decision.Allowed || decision.Reason != "daily_exceeded" {
+		t.Fatalf("header-key handshake over quota = %+v", decision)
+	}
+}
+
 func TestDisabledPluginAuthenticatesNothing(t *testing.T) {
 	loc := mustShanghai(t)
 	clock := newTestClock(time.Date(2026, 10, 10, 9, 0, 0, 0, loc))
@@ -209,5 +246,29 @@ func TestCyclesAdvanceFromTheirDeadlinesAfterLongDowntime(t *testing.T) {
 	}
 	if stats := reloaded.Stats(90); stats.Totals.Calls != 0 || len(stats.Keys) != 0 {
 		t.Fatalf("stats after downtime = %+v", stats)
+	}
+}
+
+// Read-only callers of GET /keys keep key_preview, so a short caller-chosen
+// key is masked down to at most 5 characters; generated keys keep 7+5.
+func TestPreviewKeyNeverGivesAShortKeyAway(t *testing.T) {
+	for key, want := range map[string]string{
+		"sk-abc12":                    "...",
+		"sk-abc123":                   "sk-...23",
+		"abcdefghijklm":               "abc...lm",
+		"abcdefghijklmnopqrstuvw":     "abc...vw",
+		"abcdefghijklmnopqrstuvwx":    "abcdefg...tuvwx",
+		" cpa_abcdefghijklmnopqrstu ": "cpa_abc...qrstu",
+	} {
+		if got := PreviewKey(key); got != want {
+			t.Errorf("PreviewKey(%q) = %q, want %q", key, got, want)
+		}
+	}
+	plain, err := GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := PreviewKey(plain); got != plain[:7]+"..."+plain[len(plain)-5:] {
+		t.Fatalf("generated key preview = %q", got)
 	}
 }

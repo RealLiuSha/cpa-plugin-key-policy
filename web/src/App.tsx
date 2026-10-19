@@ -11,6 +11,14 @@ import Models from "./pages/Models";
 import ModelForm from "./pages/ModelForm";
 import Audit from "./pages/Audit";
 import Stats from "./pages/Stats";
+import Overview from "./pages/Overview";
+import Channels from "./pages/Channels";
+import Search from "./pages/Search";
+import Quality from "./pages/Quality";
+import Settings from "./pages/Settings";
+import { useLeaveGuard } from "./components/LeaveGuard";
+import { MobileTabBar } from "./components/MobileChrome";
+import { NAV_ITEMS, navSection } from "./navigation";
 
 function useAuthTick() {
   const [, setTick] = useState(0);
@@ -34,38 +42,42 @@ function TopNav() {
   const t = useT();
   const nav = useNavigate();
   const loc = useLocation();
+  const guard = useLeaveGuard();
   const s = getSession();
   if (!s) return null;
-  // Active state: highlight the nav item matching the current path prefix.
-  const onKeys = loc.pathname === "/keys" || loc.pathname.startsWith("/keys/");
-  const onNew = loc.pathname === "/keys/new" || loc.pathname.startsWith("/keys/new/");
-  const onStats = loc.pathname === "/stats";
-  const onModels = loc.pathname === "/models" || loc.pathname.startsWith("/models/");
-  const onAudit = loc.pathname === "/audit";
+  const active = navSection(loc.pathname);
   const embedded = isEmbedded();
   return (
-    <div className={"topnav" + (embedded ? " embedded" : "")}>
-      <div className="topnav-inner">
-        {!embedded && (
-          <div className="topnav-brand">
-            <span className="tn-title">{t("header.title")}</span>
-            <span className="tn-sub">{s.baseUrl}</span>
-          </div>
-        )}
-        <div className="topnav-actions">
-          <Link to="/keys" className={"tn-link" + (onKeys && !onNew ? " active" : "")}>{t("header.keyList")}</Link>
-          <Link to="/keys/new" className={"tn-link" + (onNew ? " active" : "")}>{t("header.newKey")}</Link>
-          <Link to="/stats" className={"tn-link" + (onStats ? " active" : "")}>{t("header.stats")}</Link>
-          <Link to="/models" className={"tn-link" + (onModels ? " active" : "")}>{t("header.models")}</Link>
-          <Link to="/audit" className={"tn-link" + (onAudit ? " active" : "")}>{t("header.audit")}</Link>
+    <>
+      <div className={"topnav" + (embedded ? " embedded" : "")}>
+        <div className="topnav-inner">
           {!embedded && (
-            <button className="btn sm" onClick={() => { clearSession(); nav("/login"); }}>
-              {t("header.logout")}
-            </button>
+            <div className="topnav-brand">
+              <span className="tn-title">{t("header.title")}</span>
+              <span className="tn-sub">{s.baseUrl}</span>
+            </div>
           )}
+          <nav className="topnav-actions" aria-label={t("header.navLabel")}>
+            {NAV_ITEMS.map((item) => (
+              <Link key={item.id} to={item.path} className={"tn-link" + (active === item.id ? " active" : "")} aria-current={active === item.id ? "page" : undefined}
+                onClick={(event) => {
+                  // A modified click opens the section elsewhere and keeps this page.
+                  if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+                  if (guard.asks(item.path)) event.preventDefault();
+                }}>
+                {t(`header.${item.id}`)}
+              </Link>
+            ))}
+            {!embedded && (
+              <button className="btn sm" onClick={() => { clearSession(); nav("/login"); }}>
+                {t("header.logout")}
+              </button>
+            )}
+          </nav>
         </div>
       </div>
-    </div>
+      {guard.dialog}
+    </>
   );
 }
 
@@ -73,6 +85,8 @@ function Shell() {
   const authed = useAuthTick();
   const [bootstrapped, setBootstrapped] = useState(false);
   const t = useT();
+  // The tab title follows the product name in the current language.
+  useEffect(() => { document.title = t("header.title"); });
 
   // When not yet authenticated, try once to reuse the panel's saved
   // management key (same-origin iframe embed). Only runs when not authed and
@@ -104,6 +118,7 @@ function Shell() {
     <div className="app">
       <TopNav />
       <Routes>
+        <Route path="/overview" element={<Overview />} />
         <Route path="/keys" element={<KeyList />} />
         <Route path="/keys/new" element={<KeyNew />} />
         <Route path="/keys/:id/edit" element={<KeyEdit />} />
@@ -111,10 +126,15 @@ function Shell() {
         <Route path="/models" element={<Models />} />
         <Route path="/models/new" element={<ModelForm key="new" mode="new" />} />
         <Route path="/models/edit" element={<ModelForm key="edit" mode="edit" />} />
+        <Route path="/channels" element={<Channels />} />
         <Route path="/stats" element={<Stats />} />
+        <Route path="/search" element={<Search />} />
+        <Route path="/quality" element={<Quality />} />
         <Route path="/audit" element={<Audit />} />
-        <Route path="*" element={<Navigate to="/keys" replace />} />
+        <Route path="/settings" element={<Settings />} />
+        <Route path="*" element={<Navigate to="/overview" replace />} />
       </Routes>
+      <MobileTabBar />
     </div>
   );
 }

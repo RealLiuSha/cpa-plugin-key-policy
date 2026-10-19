@@ -12,7 +12,6 @@ import { extractApiError } from "../api/error";
 import { formatCount, formatHitRate, formatUSD } from "../format";
 import type { KeyHistoryResponse, KeyUsageResponse, ModelUsageEntry, UsageBucket, UsageHistoryDay, UsageWindow } from "../types";
 import { useT } from "../i18n";
-import { MobileTabBar } from "../components/MobileChrome";
 
 // Window switch for the per-model breakdown table: each model row has its own
 // daily, 7-day and 30-day quota periods; the selected period applies to all rows.
@@ -404,12 +403,6 @@ export default function KeyUsage() {
           })}
         </div>
       </div>
-
-      <MobileTabBar
-        active="usage"
-        showUsage
-        usagePath={`/keys/${encodeURIComponent(data.key_id)}/usage`}
-      />
     </div>
   );
 }

@@ -207,22 +207,34 @@ func TestLiveWriteFailureIsReportedAndRetried(t *testing.T) {
 		t.Fatal(err)
 	}
 	store.RecordUsage(tokenEvent("a", "codex", "fast", UsageDetail{InputTokens: 1_000_000}))
-	for i := 1; i <= 2; i++ {
-		if err := store.FlushUsage(); err == nil {
-			t.Fatal("flush into a directory placeholder succeeded")
-		}
+	// The first failure and the recovery reach the plugin's log once each,
+	// not every interval, and whichever flush sees them: a flusher started
+	// again after a rolled-back replacement does not report the failure
+	// again, and a recovery seen by the quiesce or shutdown cut is reported.
+	var logged []string
+	store.SetLogf(func(level, message string) { logged = append(logged, level+" "+message) })
+	for i := 1; i <= 3; i++ {
+		flusher := &usageFlusher{store: store}
+		flusher.flush()
 		if health := store.Health(); health.FlushFailures != int64(i) || !strings.Contains(health.LastFlushError, "live usage") || health.LastFlushAt != "" {
 			t.Fatalf("health after failure %d = %+v", i, health)
 		}
 	}
+	if len(logged) != 1 || !strings.HasPrefix(logged[0], "error cpa-key-policy: usage ledger cannot be saved") || !strings.Contains(logged[0], "live usage") {
+		t.Fatalf("logged while failing = %q", logged)
+	}
 	if err := os.Remove(livePath); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.FlushUsage(); err != nil {
-		t.Fatalf("retry after the path was freed: %v", err)
+	if err := store.stopUsageFlusher(); err != nil {
+		t.Fatal(err)
 	}
-	if health := store.Health(); health.FlushFailures != 2 || health.LastFlushError != "" || health.LastFlushAt == "" {
+	if health := store.Health(); health.FlushFailures != 3 || health.LastFlushError != "" || health.LastFlushAt == "" {
 		t.Fatalf("health after recovery = %+v", health)
+	}
+	(&usageFlusher{store: store}).flush()
+	if len(logged) != 2 || logged[1] != "info cpa-key-policy: usage ledger saved again" {
+		t.Fatalf("logged after recovery = %q", logged)
 	}
 	reloaded := reopenStore(t, clock, store.StatePath())
 	if summary := reloaded.UsageSummaryFor(keyByID(t, reloaded, "a")); summary.DailyUSD != 1 {
@@ -260,7 +272,10 @@ func TestConfigureRemovesOnlyStaleOwnTempFiles(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := store.Configure(Config{Enabled: true, StateFile: store.StatePath(), UsageTimezone: "Asia/Shanghai"}); err != nil {
+	// Temp files are swept when the dataset is loaded, which a restart does.
+	reopened := NewStore()
+	reopened.SetClock(clock.Now)
+	if err := reopened.Configure(Config{Enabled: true, StateFile: store.StatePath(), UsageTimezone: "Asia/Shanghai"}); err != nil {
 		t.Fatal(err)
 	}
 	for _, path := range stale {
@@ -273,4 +288,34 @@ func TestConfigureRemovesOnlyStaleOwnTempFiles(t *testing.T) {
 			t.Errorf("unrelated or recent temp removed: %s", path)
 		}
 	}
+}
+
+// A loaded dataset keeps its usage timezone: another one is refused without
+// reloading the files, which would hold authentication and billing up on
+// every config apply only to fail the same way.
+func TestConfigureRefusesAnotherTimezoneWithoutReloading(t *testing.T) {
+	loc := mustShanghai(t)
+	clock := newTestClock(time.Date(2026, 10, 10, 9, 0, 0, 0, loc))
+	store := newStore(t, clock, []KeyConfig{testKey(t, "k", "cpa_k")}, nil)
+	statePath := store.StatePath()
+	store.lifecycleMu.RLock() // what a request under way holds
+	done := make(chan error, 1)
+	go func() {
+		done <- store.Configure(Config{Enabled: false, StateFile: statePath, UsageTimezone: "UTC"})
+	}()
+	var err error
+	select {
+	case err = <-done:
+		store.lifecycleMu.RUnlock()
+	case <-time.After(5 * time.Second):
+		store.lifecycleMu.RUnlock()
+		t.Fatalf("a rejected timezone waited for requests under way: %v", <-done)
+	}
+	if err == nil || !strings.Contains(err.Error(), `usage ledger uses quota timezone "Asia/Shanghai"`) {
+		t.Fatalf("configure with another timezone = %v", err)
+	}
+	if store.StatePath() != statePath || !store.Enabled() || store.Timezone() != "Asia/Shanghai" {
+		t.Fatalf("rejected configuration changed the store: path=%q enabled=%v zone=%q", store.StatePath(), store.Enabled(), store.Timezone())
+	}
+	_ = store.Shutdown()
 }

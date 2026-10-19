@@ -2,6 +2,7 @@
 // Rationale: the secret-key is CPA's total management credential; we don't want
 // it lying around in storage. Refreshing/closing the tab resets to the login page.
 
+import { translate } from "../i18n";
 import { readPanelAuth } from "./panelAuth";
 import type { StatusResponse } from "../types";
 
@@ -54,11 +55,23 @@ function emit(): void {
   for (const fn of listeners) fn();
 }
 
+// CPA answered its empty 404: it is not serving the plugin's routes right
+// now, e.g. between the instances of a hot replacement. It says nothing
+// about the management key.
+export class PluginUnavailableError extends Error {
+  constructor() {
+    super(translate("session.pluginUnavailable"));
+  }
+}
+
 // Attempt to restore a session from the official panel's saved management key
 // (only available when this UI is loaded as a same-origin iframe inside the
 // panel AND the user checked "remember password" there). On success the
-// session is set and true is returned; on any failure the session is cleared
-// and false is returned so the caller falls back to the login page.
+// session is set and true is returned. While CPA is not serving the plugin
+// the session is kept, so the pages show that and their retry; a rejected
+// key comes back as 401/403 there and clears it. On any other failure the
+// session is cleared and false is returned so the caller falls back to the
+// login page.
 export async function bootstrapFromPanel(): Promise<boolean> {
   const auth = readPanelAuth();
   if (!auth) return false;
@@ -66,7 +79,8 @@ export async function bootstrapFromPanel(): Promise<boolean> {
   try {
     await verifySession(fetch);
     return true;
-  } catch {
+  } catch (error) {
+    if (error instanceof PluginUnavailableError) return true;
     clearSession();
     return false;
   }
@@ -82,6 +96,7 @@ export async function verifySession(
   const res = await fetchImpl(s.baseUrl + "/v0/management/plugins/cpa-key-policy/status", {
     headers: { Authorization: "Bearer " + s.secretKey },
   });
+  if (res.status === 404 && (await res.text()) === "") throw new PluginUnavailableError();
   if (!res.ok) {
     throw new Error("management key rejected (" + res.status + ")");
   }

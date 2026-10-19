@@ -74,9 +74,9 @@ type StatsReport struct {
 	UnpricedModels []UnpricedModel `json:"unpriced_models"`
 }
 
-// Stats aggregates the last days (1..90, default 30) across all keys. The
-// aggregation runs under the ledger lock with per-day, per-model and
-// per-key accumulators only.
+// Stats aggregates the last days (1..90, default 30) across all keys with
+// per-day, per-model and per-key accumulators only. The aggregation runs
+// outside the ledger lock (see visitRange).
 func (s *Store) Stats(days int) StatsReport {
 	days = clampDays(days)
 	s.mu.RLock()

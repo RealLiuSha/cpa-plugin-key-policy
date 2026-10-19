@@ -128,7 +128,7 @@ func (l *usageLedger) dateKey(at time.Time) string {
 }
 
 func (l *usageLedger) dateKeyOffset(at time.Time, days int) string {
-	return l.startOfDay(at).AddDate(0, 0, days).Format(dateLayout)
+	return dayStart(at, days, l.location).Format(dateLayout)
 }
 
 // shiftDate moves a yyyy-mm-dd date key by days; an empty key stays empty.
@@ -627,20 +627,45 @@ func clampDays(count int) int {
 	return count
 }
 
-// visitRange calls visit for every bucket dated within [from, to] while the
-// lock is held; visit must not block or take other locks.
+// visitRange calls visit for every bucket dated within [from, to] after the
+// lock is released, so a long scan does not hold up admission and billing.
+// Closed days' model maps are shared, as a history write shares them (see
+// usageLedger); open days are copied under the lock.
 func (l *usageLedger) visitRange(from, to string, visit func(id, date, model string, bucket Bucket)) {
+	type dayModels struct {
+		id, date string
+		models   map[string]Bucket
+	}
+	span := UsageRetentionDays + 1
+	if first, err := time.Parse(dateLayout, from); err == nil {
+		if last, err := time.Parse(dateLayout, to); err == nil {
+			span = max(0, min(span, int(last.Sub(first)/(24*time.Hour))+1))
+		}
+	}
 	l.mu.Lock()
-	defer l.mu.Unlock()
 	l.evictExpiredLocked(l.now())
+	// Sized for the most days each key can have in range, so a 90-day scan
+	// over a thousand keys does not regrow the slice while holding the lock.
+	size := 0
+	for _, usage := range l.entries {
+		size += min(len(usage.Days), span)
+	}
+	days := make([]dayModels, 0, size)
 	for id, usage := range l.entries {
 		for date, models := range usage.Days {
 			if date < from || date > to {
 				continue
 			}
-			for model, bucket := range models {
-				visit(id, date, model, bucket)
+			if date > l.closedThrough {
+				models = maps.Clone(models)
 			}
+			days = append(days, dayModels{id: id, date: date, models: models})
+		}
+	}
+	l.mu.Unlock()
+	for _, day := range days {
+		for model, bucket := range day.models {
+			visit(day.id, day.date, model, bucket)
 		}
 	}
 }

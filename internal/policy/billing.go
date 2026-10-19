@@ -1,6 +1,7 @@
 package policy
 
 import (
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -126,7 +127,46 @@ func (s *Store) RecordUsage(event UsageEvent) UsageResult {
 		health.unpricedCalls.Add(1)
 	}
 	ledger.record(key.ID, model, bucket, key.BalanceMode())
+	s.journalUsage(key.ID, model, bucket, key.BalanceMode())
 	return UsageRecorded
+}
+
+// ListCost prices one usage record at list price: the matching token price
+// row without its billing multiplier, or one call of a per-call row for the
+// record RecordUsage bills per call. Channel statistics use it to estimate
+// what an upstream charged; it never touches the ledger. It must run before
+// RecordUsage, which takes the media trace that marks that record. Failed,
+// unpriced and invalid records and other per-call records have no list cost.
+func (s *Store) ListCost(event UsageEvent) (Nano, bool) {
+	if event.Failed {
+		return 0, false
+	}
+	model := strings.TrimSpace(event.Model)
+	if model == "" {
+		model = strings.TrimSpace(event.RequestedModel)
+	}
+	if model == "" {
+		return 0, false
+	}
+	detail, _, invalid := sanitizeDetail(event.Detail)
+	if invalid {
+		return 0, false
+	}
+	s.mu.RLock()
+	prices, traces := s.prices, s.mediaTraces
+	s.mu.RUnlock()
+	price, found := prices.lookup(event.Provider, model)
+	if !found || !price.Priced() {
+		return 0, false
+	}
+	if price.BillingMode == "per_call" {
+		if event.TraceID == "" || !traces.contains(event.TraceID) {
+			return 0, false
+		}
+		return USDToNano(price.PerCallUSD), true
+	}
+	price.BillingMultiplier = 1
+	return billTokens(price, tokenSemanticsFor(event.Provider, event.ExecutorType), detail).ChargedNano, true
 }
 
 // sanitizeDetail is the only boundary for upstream token counts: negatives
@@ -283,6 +323,43 @@ func (m *mediaTraceSet) remember(id string) {
 	}
 	m.index[id] = now
 	m.order = append(m.order, mediaTrace{id: id, at: now})
+}
+
+// rememberAt adds a generation admitted at another time, by the instance
+// that handed its ledger over.
+func (m *mediaTraceSet) rememberAt(id string, at time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.trimLocked(m.now())
+	if _, exists := m.index[id]; exists || at.Before(m.now().Add(-mediaTraceTTL)) {
+		return
+	}
+	m.index[id] = at
+	m.order = append(m.order, mediaTrace{id: id, at: at})
+	slices.SortStableFunc(m.order, func(x, y mediaTrace) int { return x.at.Compare(y.at) })
+}
+
+// live lists the generations still awaiting their usage record.
+func (m *mediaTraceSet) live() []mediaTrace {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.trimLocked(m.now())
+	out := make([]mediaTrace, 0, len(m.index))
+	for _, trace := range m.order {
+		if at, live := m.index[trace.id]; live && at.Equal(trace.at) {
+			out = append(out, trace)
+		}
+	}
+	return out
+}
+
+// contains reports whether the trace id is known and fresh, keeping it.
+func (m *mediaTraceSet) contains(id string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.trimLocked(m.now())
+	_, exists := m.index[id]
+	return exists
 }
 
 // take consumes the trace id and reports whether it was known and fresh.
