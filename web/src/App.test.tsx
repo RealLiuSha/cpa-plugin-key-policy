@@ -26,6 +26,7 @@ vi.mock("./pages/ModelForm", () => page("model-form"));
 vi.mock("./pages/Stats", () => page("stats"));
 vi.mock("./pages/Search", () => page("search"));
 vi.mock("./pages/Quality", () => page("quality"));
+vi.mock("./pages/Inspection", () => page("inspection"));
 vi.mock("./pages/Audit", () => page("audit"));
 vi.mock("./pages/Settings", () => page("settings"));
 
@@ -51,7 +52,7 @@ afterEach(() => {
 
 const text = (selector: string) => [...document.querySelectorAll(selector)].map((node) => node.textContent);
 const shown = () => container.querySelector('[data-testid="page"]')?.textContent;
-const SECTIONS = ["overview", "keys", "channels", "models", "stats", "search", "quality", "audit", "settings"];
+const SECTIONS = ["overview", "keys", "channels", "models", "stats", "search", "quality", "inspection", "audit", "settings"];
 
 async function renderAt(path: string) {
   await act(async () => {
@@ -71,6 +72,7 @@ describe("top navigation", () => {
     ["/stats", "stats", "header.stats"],
     ["/search", "search", "header.search"],
     ["/quality", "quality", "header.quality"],
+    ["/inspection", "inspection", "header.inspection"],
     ["/audit", "audit", "header.audit"],
     ["/settings", "settings", "header.settings"],
   ])("%s shows its page and highlights one link", async (path, page, active) => {
@@ -89,7 +91,7 @@ describe("mobile tab bar", () => {
 
     const more = [...container.querySelectorAll<HTMLButtonElement>(".tabbar .tab")].at(-1)!;
     await act(async () => { more.click(); });
-    expect(text(".more-sheet-item")).toEqual(["¤header.models", "⌕header.search", "✓header.quality", "≡header.audit", "⚙header.settings"]);
+    expect(text(".more-sheet-item")).toEqual(["¤header.models", "⌕header.search", "✓header.quality", "◷header.inspection", "≡header.audit", "⚙header.settings"]);
     const search = [...document.querySelectorAll<HTMLButtonElement>(".more-sheet-item")].find((item) => item.textContent?.includes("header.search"))!;
     await act(async () => { search.click(); });
     expect(container.querySelector('[data-testid="location"]')?.textContent).toBe("/search");

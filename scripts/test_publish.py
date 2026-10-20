@@ -368,7 +368,7 @@ class PublishTests(unittest.TestCase):
             # The names the plugin writes (internal/plugin/modules.go, internal/policy/handoff.go).
             expected = [root / ("cpa-key-policy-" + name) for name in
                         ("adapters.json", "search.json", "channels.json", "channel-stats.json",
-                         "quality.json", "handoff.jsonl")]
+                         "quality.json", "inspection.json", "handoff.jsonl")]
             # A replayed journal is already in the ledger; other names are not the plugin's.
             for path in [state, *expected, root / (publish.HANDOFF_FILE + ".applied-20261019T000000Z"),
                          root / "cpa-key-policy-other.json", root / "unrelated.json"]:

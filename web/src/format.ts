@@ -9,12 +9,6 @@ export function formatUSD(value: number): string {
   return (magnitude > 0 && magnitude < 0.01 ? usdSubCent : usd2).format(amount);
 }
 
-// A balance in the upstream's own unit with at most four decimals, so a
-// remainder such as 12.298799999999986 reads 12.2988.
-export function formatAmount(value: number): string {
-  return Number.isFinite(value) ? String(Number(value.toFixed(4))) : "—";
-}
-
 export function formatCount(value: number): string {
   if (!Number.isFinite(value) || value <= 0) return "0";
   return Math.round(value).toLocaleString("en-US");

@@ -21,7 +21,7 @@ export function modelNewPath(name = ""): string {
   return name ? `/models/new?${new URLSearchParams({ name })}` : "/models/new";
 }
 
-export type NavSection = "overview" | "keys" | "channels" | "models" | "stats" | "search" | "quality" | "audit" | "settings";
+export type NavSection = "overview" | "keys" | "channels" | "models" | "stats" | "search" | "quality" | "inspection" | "audit" | "settings";
 
 export interface NavItem {
   id: NavSection;
@@ -41,6 +41,7 @@ export const NAV_ITEMS: readonly NavItem[] = [
   { id: "stats", path: "/stats", icon: "$", primary: true },
   { id: "search", path: "/search", icon: "⌕", primary: false },
   { id: "quality", path: "/quality", icon: "✓", primary: false },
+  { id: "inspection", path: "/inspection", icon: "◷", primary: false },
   { id: "audit", path: "/audit", icon: "≡", primary: false },
   { id: "settings", path: "/settings", icon: "⚙", primary: false },
 ];

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"cpa-key-policy/internal/policy/audit"
@@ -101,28 +102,44 @@ func (a *App) handleQuality(req ManagementRequest, route string) ManagementRespo
 		}
 		a.store.RecordChange("clear_quality", test, nil)
 		return jsonResponse(http.StatusOK, map[string]bool{"cleared": true})
-	case req.Method == http.MethodPost && route == "/inspection":
-		var inspect quality.InspectionRequest
-		if err := json.Unmarshal(req.Body, &inspect); err != nil {
+	case req.Method == http.MethodGet && route == "/inspection":
+		return jsonResponse(http.StatusOK, service.Inspection(inspectionDays(req.Query.Get("days"))))
+	case req.Method == http.MethodPut && route == "/inspection":
+		var settings quality.InspectionSettings
+		if err := json.Unmarshal(req.Body, &settings); err != nil {
 			return jsonError(http.StatusBadRequest, "invalid_json", err.Error())
 		}
-		summary, err := service.Inspect(inspect)
+		previous, stored, err := service.SetInspection(settings)
 		if err != nil {
 			return qualityError(err)
 		}
-		a.store.RecordChange("start_inspection", inspect.Test, map[string]audit.Change{
-			"started": {To: summary.Started}, "include": {To: inspect.Include}, "exclude": {To: inspect.Exclude},
-		})
-		return jsonResponse(http.StatusOK, summary)
-	case req.Method == http.MethodGet && route == "/inspection":
-		view, err := service.Inspection(req.Query.Get("test"))
+		a.store.RecordChange("update_inspection", "inspection", map[string]audit.Change{"settings": {From: previous, To: stored}})
+		return jsonResponse(http.StatusOK, map[string]any{"settings": stored})
+	case req.Method == http.MethodPost && route == "/inspection":
+		if err := service.StartInspection(); err != nil {
+			return qualityError(err)
+		}
+		a.store.RecordChange("start_inspection", "inspection", nil)
+		return jsonResponse(http.StatusOK, map[string]bool{"started": true})
+	case req.Method == http.MethodGet && route == "/inspection/answers":
+		q := req.Query
+		item, err := service.InspectionAnswers(q.Get("round"), q.Get("auth_index"), q.Get("model"), q.Get("effort"))
 		if err != nil {
 			return qualityError(err)
 		}
-		return jsonResponse(http.StatusOK, view)
+		return jsonResponse(http.StatusOK, item)
 	default:
 		return jsonError(http.StatusNotFound, "not_found", "unknown management route")
 	}
+}
+
+// inspectionDays is how many days of results the inspection page asks for:
+// a week unless it names 1-90.
+func inspectionDays(value string) int {
+	if days, err := strconv.Atoi(value); err == nil && days >= 1 && days <= 90 {
+		return days
+	}
+	return 7
 }
 
 // qualityAuditIDs is the most credential ids an audit line lists; a larger
@@ -151,6 +168,8 @@ func qualityError(err error) ManagementResponse {
 		return upgrading()
 	case errors.Is(err, quality.ErrInvalid):
 		return jsonError(http.StatusBadRequest, "invalid_request", err.Error())
+	case errors.Is(err, quality.ErrBusy):
+		return jsonError(http.StatusConflict, "inspection_running", err.Error())
 	case errors.Is(err, quality.ErrNotFound):
 		return jsonError(http.StatusNotFound, "not_found", err.Error())
 	case errors.Is(err, quality.ErrHost):
@@ -171,7 +190,9 @@ func qualityRoutes(base string) []ManagementRoute {
 		{Method: http.MethodPost, Path: base + "/cancel", Description: "Stop a running detection test."},
 		{Method: http.MethodGet, Path: base + "/record", Description: "One candy, fingerprint, ModelTrace or pelican record in full."},
 		{Method: http.MethodDelete, Path: base + "/results", Description: "Clear the history of one detection test or of all."},
-		{Method: http.MethodPost, Path: base + "/inspection", Description: "Start a scheduled inspection on credentials selected by name patterns."},
-		{Method: http.MethodGet, Path: base + "/inspection", Description: "The latest inspection of a test and each credential's verdict."},
+		{Method: http.MethodGet, Path: base + "/inspection", Description: "The daily inspection's schedule and each channel's results by day."},
+		{Method: http.MethodPut, Path: base + "/inspection", Description: "Replace the daily inspection's schedule and channel groups."},
+		{Method: http.MethodPost, Path: base + "/inspection", Description: "Start an inspection round now (spends the channels' quota)."},
+		{Method: http.MethodGet, Path: base + "/inspection/answers", Description: "One channel's answers in an inspection round."},
 	}
 }

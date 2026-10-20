@@ -20,7 +20,6 @@
   padding: 6px 14px; background: var(--muted-bg); border-bottom: 1px solid var(--border); font-size: 13px;
 }
 .quality-list-head .check-row { min-height: 36px; }
-.quality-type { width: auto; min-width: 180px; padding: 6px 10px; font-size: 13px; }
 .quality-empty { margin: 14px; }
 .quality-rows { list-style: none; margin: 0; padding: 0; }
 .quality-row { border-bottom: 1px solid var(--border); }
@@ -103,7 +102,7 @@
   .quality-row-main > :not(.quality-select) { grid-column: 2; }
   .quality-row-main > .quality-actions { grid-column: 2; }
   .quality-history { padding-left: 14px; }
-  .quality-type { flex: 1 1 180px; }
+  .quality-list-head .channel-filter, .quality-list-head .channel-filter select { flex: 1 1 180px; }
   .quality-ranking li { grid-template-columns: 22px minmax(0, 1fr) 52px; }
   .quality-ranking .quality-bar { grid-column: 2 / -1; grid-row: 2; }
 }

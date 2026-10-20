@@ -13,7 +13,8 @@
     "quality": "检测",
     "settings": "设置",
     "more": "更多",
-    "navLabel": "萝卜导航"
+    "navLabel": "萝卜导航",
+    "inspection": "巡检"
   },
   "login": {
     "subTitle": "登录到 CLIProxyAPI",
@@ -188,14 +189,16 @@
       "migrate_state": "升级数据格式",
       "adjust_balance": "调整余额",
       "update_channel": "修改渠道",
+      "delete_channel": "删除渠道",
       "upsert_adapter": "保存适配规则",
       "delete_adapter": "删除适配规则",
       "try_adapter": "真实发送适配规则",
       "update_search": "修改搜索设置",
       "import_search": "导入搜索设置",
       "run_quality": "运行检测",
-      "start_inspection": "开始定时巡检",
-      "clear_quality": "清除检测记录"
+      "start_inspection": "开始巡检",
+      "clear_quality": "清除检测记录",
+      "update_inspection": "修改巡检设置"
     },
     "field": {
       "daily_limit_usd": "日额度",
@@ -535,31 +538,25 @@
     "kpi": {
       "requests": "请求数",
       "failures": "失败尝试",
-      "billed": "实扣金额",
-      "upstreamCost": "上游成本",
-      "margin": "毛利"
+      "billed": "实扣金额"
     },
-    "costHidden": "没有渠道设置进价倍率，上游成本和毛利不显示。可在渠道详情的“成本与余额”中设置倍率。",
-    "costPartial": "{{count}} 个今天有流量的渠道没有设置进价倍率，它们的上游成本按 0 计，毛利会偏高。",
     "keysTitle": "需要处理的 Key",
     "keysSummary": "共 {{total}} 个 Key：{{enabled}} 个启用，{{limited}} 个额度耗尽，{{warning}} 个即将耗尽。",
     "keysClear": "没有额度耗尽或即将耗尽的 Key。",
     "allKeys": "查看全部 Key",
     "channelsTitle": "需要处理的渠道",
     "channelsSummary": "萝卜记录了 {{total}} 个渠道。",
-    "channelsClear": "没有失败率偏高或余额异常的渠道。",
+    "channelsClear": "没有失败率偏高或巡检异常的渠道。",
     "allChannels": "查看全部渠道",
     "channelReason": {
       "failure_rate": "24 小时失败率 {{rate}}",
-      "balance_low": "余额偏低：剩余 {{amount}}",
-      "balance_low_plain": "余额低于提醒阈值",
-      "balance_error": "余额查询失败"
+      "degraded": "巡检降智 {{model}} {{correct}}/{{answered}}",
+      "suspect": "巡检存疑 {{model}} {{correct}}/{{answered}}"
     },
     "modulesTitle": "模块状态",
     "toSettings": "前往设置",
     "moduleSearch": "搜索路由",
     "moduleAdapters": "适配规则",
-    "moduleBalances": "余额监控",
     "moduleUnavailable": "数据文件打不开，详见设置页",
     "searchState": {
       "on": "已开启",
@@ -567,7 +564,6 @@
       "applying": "正在生效"
     },
     "adapterCount": "{{rules}} 条，启用 {{enabled}} 条",
-    "balanceCount": "{{tracked}} 个渠道，{{low}} 个偏低",
     "warningsTitle": "警告",
     "warningsClear": "没有需要处理的警告。",
     "changesTitle": "最近变更",
@@ -592,9 +588,8 @@
       "success": "24 小时成功率",
       "latency": "延迟 p50",
       "ttft": "首字 p50",
-      "upstreamToday": "今日上游成本",
       "rules": "规则",
-      "balance": "余额"
+      "models": "模型"
     },
     "origin": {
       "config": "API Key",
@@ -614,13 +609,10 @@
     "retryAt": "{{time}} 后重试",
     "failurePill": "失败 {{rate}}",
     "failuresTitle": "近 24 小时 {{attempts}} 次请求中失败 {{failures}} 次",
-    "balanceError": "查询失败",
-    "balanceAt": "查询于 {{time}}",
     "tabsLabel": "渠道详情",
     "tab": {
       "overview": "概览",
       "adapters": "适配规则",
-      "cost": "成本与余额",
       "notes": "备注"
     },
     "tabUnsaved": "{{tab}}（有未保存的修改）",
@@ -662,8 +654,7 @@
       "latency": "延迟 p50 / p95",
       "ttft": "首字 p50 / p95",
       "tokens": "输入 / 输出 Token",
-      "listCost": "按标价计的成本",
-      "upstreamCost": "上游成本"
+      "listCost": "按标价计的成本"
     },
     "hoursTitle": "每小时请求（红色为失败）",
     "hoursEmpty": "最近没有请求。",
@@ -683,29 +674,6 @@
       "errors": "最近的错误（时间 · 状态码 · 模型 · 摘要）：",
       "noErrors": "无"
     },
-    "cost": {
-      "ratio": "进价倍率",
-      "ratioHint": "上游价 = 标价 × 倍率，取值 0～10；0 表示不知道上游价，不计算上游成本。",
-      "ratioInvalid": "倍率要在 0 到 10 之间。",
-      "source": "余额来源",
-      "kind": {
-        "none": "不查询余额",
-        "sub2api": "Sub2API（/v1/usage）",
-        "openai_billing": "OpenAI 计费接口（new-api、one-api）"
-      },
-      "kindHint": {
-        "none": "不查询这个渠道的上游余额。",
-        "sub2api": "用这个渠道的 Key 读取上游的 /v1/usage。",
-        "openai_billing": "用这个渠道的 Key 读取上游的 /v1/dashboard/billing 接口，单位是上游站点的显示货币。"
-      },
-      "threshold": "提醒阈值",
-      "thresholdHint": "余额低于这个数时在概览中提醒。",
-      "thresholdInvalid": "阈值不能为负数。",
-      "current": "当前余额",
-      "refresh": "立即查询",
-      "refreshFailed": "查询余额失败",
-      "noSource": "保存余额来源后可以查询余额。"
-    },
     "notes": {
       "name": "显示名称",
       "nameHint": "留空时使用 CPA 中的名称或 auth_index。",
@@ -715,7 +683,28 @@
     },
     "save": "保存",
     "saved": "已保存。",
-    "saveFailed": "保存失败"
+    "saveFailed": "保存失败",
+    "delete": {
+      "button": "删除渠道",
+      "hint": "CPA 的配置里已经没有这个渠道，可以删掉萝卜为它保留的统计、备注和适配规则。",
+      "title": "删除这个渠道？",
+      "message": "会删除萝卜为这个渠道记录的统计、备注和绑定的适配规则，无法撤销。",
+      "confirm": "删除",
+      "cancel": "取消",
+      "failed": "删除渠道失败"
+    },
+    "filter": {
+      "type": "渠道类型",
+      "allTypes": "全部类型",
+      "model": "模型",
+      "allModels": "全部模型",
+      "loadingModels": "正在读取模型…",
+      "modelOption": "{{model}}（{{count}}）",
+      "auth_files": "认证文件 · {{provider}}",
+      "ai_providers": "API Key · {{provider}}"
+    },
+    "countFiltered": "显示 {{shown}} / {{total}} 个渠道",
+    "filteredEmpty": "没有符合筛选条件的渠道。"
   },
   "adapters": {
     "description": "在请求发往这个渠道之前改写请求体，只影响发往这个渠道的那一次尝试。",
@@ -955,12 +944,6 @@
     "listLabel": "凭据",
     "selectAll": "全选可测试的凭据",
     "select": "选择 {{name}}",
-    "filter": {
-      "label": "凭据类型",
-      "all": "全部凭据",
-      "auth_files": "认证文件 · {{provider}}",
-      "ai_providers": "AI 提供商 · {{provider}}"
-    },
     "source": {
       "auth_files": "认证文件",
       "ai_providers": "AI 提供商"
@@ -1211,5 +1194,85 @@
     },
     "notOwner": "这个实例不是数据目录的所有者：管理写操作会被拒绝，数据由新实例负责。",
     "readOnly": "热替换被回滚后，这个实例没能重新拿回数据目录（可能另一个实例还持有它的锁）：管理写操作会被拒绝。锁释放后，CPA 下一次应用配置时会自动恢复；也可以重启 CPA。"
+  },
+  "inspection": {
+    "title": "巡检",
+    "description": "每天在固定时间用糖果题考一遍选中的渠道，按模型分组，看哪个渠道降智。每次巡检都是真实的上游请求，消耗渠道额度，但不计任何 Key 的账。",
+    "loadFailed": "加载巡检失败",
+    "saveFailed": "保存巡检设置失败",
+    "startFailed": "启动巡检失败",
+    "alreadyRunning": "已有一轮巡检正在进行。",
+    "started": "已开始一轮巡检，进度会自动刷新。",
+    "storageError": "巡检数据未保存：{{error}}",
+    "runNow": "立即巡检",
+    "scheduleTitle": "定时巡检",
+    "enabled": "每天自动巡检",
+    "runningProgress": "巡检中：{{done}} / {{total}} 个渠道",
+    "nextAt": "下次巡检 {{time}}",
+    "off": "定时巡检未开启",
+    "times": "巡检时间（{{timezone}}）",
+    "timeLabel": "第 {{index}} 个巡检时间",
+    "removeTime": "删除 {{time}}",
+    "addTime": "+ 添加时间",
+    "runs": "每个渠道每次答题数",
+    "cost": "按当前巡检组，每天约 {{questions}} 次请求，约 {{tokens}} 输入 Token",
+    "reset": "撤销",
+    "saveSchedule": "保存设置",
+    "scheduleSaved": "巡检设置已保存。",
+    "groupsTitle": "巡检组",
+    "daysLabel": "显示天数",
+    "days": "{{count}} 天",
+    "addGroup": "新增巡检组",
+    "noGroups": "还没有巡检组。新增一个：选模型，勾选提供该模型的渠道。",
+    "groupSaved": "巡检组已保存。",
+    "groupRemoved": "巡检组已删除。",
+    "removeTitle": "删除巡检组？",
+    "removeMessage": "不再巡检 {{model}} 这一组渠道，已有的巡检结果保留。",
+    "remove": "删除",
+    "edit": "编辑",
+    "confirmTitle": "立即巡检",
+    "confirmMessage": "将向所有巡检组的渠道发出 {{questions}} 次糖果题请求（约 {{tokens}} 输入 Token），消耗渠道额度。",
+    "channelCount": "{{count}} 个渠道",
+    "fresh": "{{count}} 个新渠道也提供 {{model}}：{{names}}",
+    "freshAdd": "加入巡检",
+    "freshIgnore": "忽略",
+    "channel": "渠道",
+    "today": "今天",
+    "verdict": {
+      "ok": "正常",
+      "suspect": "存疑",
+      "degraded": "降智",
+      "failed": "失败",
+      "skipped": "跳过"
+    },
+    "skipped": {
+      "missing": "CPA 中已没有这个渠道",
+      "disabled": "渠道已停用",
+      "unavailable": "渠道冷却中"
+    },
+    "cell": {
+      "title": "{{name}} · {{date}}",
+      "close": "关闭",
+      "total": "当天答对 {{correct}} / {{answered}}，失败 {{failed}} 次",
+      "round": "答对 {{correct}} / {{answered}}",
+      "failed": "失败 {{count}} 次",
+      "scheduled": "定时",
+      "manual": "手动",
+      "showWrong": "查看 {{count}} 个答错的回答",
+      "answersGone": "答错的回答只保留 14 天，已经清理。",
+      "answersFailed": "读取回答失败"
+    },
+    "editor": {
+      "newTitle": "新增巡检组",
+      "editTitle": "编辑巡检组",
+      "chooseModel": "先选择要巡检的模型。",
+      "chooseChannels": "至少勾选一个渠道。",
+      "duplicate": "{{model}}（{{effort}}）已经有一个巡检组。",
+      "hint": "提供所选模型的渠道默认全部勾选；没勾的会被记住，以后只提示新出现的渠道。",
+      "noChannels": "没有符合筛选条件且提供该模型的渠道。",
+      "notServing": "不再提供该模型",
+      "count": "已选 {{checked}} / {{total}}",
+      "save": "保存"
+    }
   }
 }

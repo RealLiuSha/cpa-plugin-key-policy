@@ -5,10 +5,10 @@ import type { ChannelSummary, ChannelView } from "./types";
 
 const summary = (attempts = 0, failures = 0): ChannelSummary => ({
   attempts, failures, success_rate: attempts ? 1 - failures / attempts : 0, latency_p50_ms: 0, latency_p95_ms: 0,
-  ttft_p50_ms: 0, ttft_p95_ms: 0, input_tokens: 0, output_tokens: 0, list_cost_usd: 0, upstream_cost_usd: 0,
+  ttft_p50_ms: 0, ttft_p95_ms: 0, input_tokens: 0, output_tokens: 0, list_cost_usd: 0,
 });
 const view = (authIndex: string, overrides: Partial<ChannelView> = {}): ChannelView => ({
-  auth_index: authIndex, meta: { auth_index: authIndex }, last_24h: summary(10, 1), today: summary(), balance: null, rules: 0, ...overrides,
+  auth_index: authIndex, meta: { auth_index: authIndex }, last_24h: summary(10, 1), today: summary(), rules: 0, ...overrides,
 });
 const key = (overrides: Partial<CpaConfigCredential>): CpaConfigCredential => ({
   kind: "codex", provider: "codex", name: "", authIndex: "", baseUrl: "https://inferhub.net/v1", models: ["gpt-6.1-sol"],

@@ -25,14 +25,15 @@ const (
 	channelsFile     = "cpa-key-policy-channels.json"
 	channelStatsFile = "cpa-key-policy-channel-stats.json"
 	qualityFile      = "cpa-key-policy-quality.json"
+	inspectionFile   = "cpa-key-policy-inspection.json"
 
 	// Channel statistics are also written exactly at close and quiesce, so a
 	// crash loses at most this much of them, never billing.
-	statsFlushInterval   = 5 * time.Minute
-	firstBalanceDelay    = time.Minute
-	balanceInterval      = 30 * time.Minute
-	balanceRefreshBudget = 5 * time.Minute
-	cpaConfigCacheTTL    = time.Minute
+	statsFlushInterval = 5 * time.Minute
+	// The inspection schedule is checked this often, so a round starts at
+	// most this late.
+	inspectionTickInterval = time.Minute
+	cpaConfigCacheTTL      = time.Minute
 )
 
 // qualityHandOffLimit bounds how long quiesce waits for detection tests CPA
@@ -74,13 +75,12 @@ func (a *App) openModules(dir string) *moduleSet {
 		set.errors["search"] = err.Error()
 	}
 	if set.channels, err = channel.NewRegistry(channel.Options{
-		MetaPath:    filepath.Join(dir, channelsFile),
-		StatsPath:   filepath.Join(dir, channelStatsFile),
-		Location:    a.store.Location(),
-		CanWrite:    a.canWrite,
-		Now:         time.Now,
-		Logf:        a.logf,
-		Credentials: a.cpaCredentials.lookup,
+		MetaPath:  filepath.Join(dir, channelsFile),
+		StatsPath: filepath.Join(dir, channelStatsFile),
+		Location:  a.store.Location(),
+		CanWrite:  a.canWrite,
+		Now:       time.Now,
+		Logf:      a.logf,
 	}); err != nil {
 		set.channels = nil
 		set.errors["channels"] = err.Error()
@@ -90,6 +90,8 @@ func (a *App) openModules(dir string) *moduleSet {
 	set.quality = quality.Open(quality.Options{
 		Path:              filepath.Join(dir, qualityFile),
 		Legacy:            filepath.Join(dir, qualityLegacyFile),
+		InspectionPath:    filepath.Join(dir, inspectionFile),
+		Location:          a.store.Location(),
 		Host:              qualityHost{a},
 		ConfigCredentials: a.cpaCredentials.qualityCredentials,
 		CanWrite:          func() bool { return !set.detached.Load() && a.canWrite() },
@@ -192,8 +194,8 @@ func (a *App) canWrite() bool {
 	return !a.quiesced.Load() && a.ownsData.Load()
 }
 
-// background runs the periodic module work: statistics flushes and balance
-// refreshes. One loop exists per App; whoever starts it stops it.
+// background runs the periodic module work: statistics flushes and the
+// inspection schedule. One loop exists per App; whoever starts it stops it.
 type background struct {
 	cancel context.CancelFunc
 	done   chan struct{}
@@ -228,12 +230,18 @@ func (a *App) stopBackground() {
 func (a *App) runBackground(ctx context.Context) {
 	stats := time.NewTicker(statsFlushInterval)
 	defer stats.Stop()
-	balances := time.NewTimer(firstBalanceDelay)
-	defer balances.Stop()
+	inspection := time.NewTicker(inspectionTickInterval)
+	defer inspection.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case <-inspection.C:
+			a.safely("inspection schedule", func() {
+				if set := a.modules.Load(); set != nil && set.quality != nil {
+					set.quality.Tick()
+				}
+			})
 		case <-stats.C:
 			a.safely("channel statistics flush", func() {
 				if set := a.modules.Load(); set != nil && set.channels != nil {
@@ -242,15 +250,6 @@ func (a *App) runBackground(ctx context.Context) {
 					}
 				}
 			})
-		case <-balances.C:
-			a.safely("balance refresh", func() {
-				if set := a.modules.Load(); set != nil && set.channels != nil {
-					refresh, cancel := context.WithTimeout(ctx, balanceRefreshBudget)
-					defer cancel()
-					set.channels.RefreshBalances(refresh)
-				}
-			})
-			balances.Reset(balanceInterval)
 		}
 	}
 }
@@ -302,8 +301,8 @@ func (a *App) logf(level, message string) {
 	}
 }
 
-// cpaConfigCache reads the API keys of CPA's config.yaml for balance queries
-// and detection tests, at most once a minute. The upstream keys it holds stay
+// cpaConfigCache reads the API keys of CPA's config.yaml for detection tests,
+// adapter rule tries and group names, at most once a minute. The upstream keys it holds stay
 // in this process.
 type cpaConfigCache struct {
 	mu       sync.Mutex
@@ -324,18 +323,20 @@ func (c *cpaConfigCache) lookup(authIndex string) (channel.Credential, bool) {
 }
 
 // groups names each config API key's group in CPA's config.yaml by
-// auth_index; CPA's own key lists flatten the groups and drop their names.
-func (c *cpaConfigCache) groups() map[string]string {
+// auth_index, and gives its credential ID: CPA's own key lists flatten the
+// groups and drop their names, and look a credential's models up by ID.
+func (c *cpaConfigCache) groups() (groups, ids map[string]string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.refreshLocked()
-	out := make(map[string]string, len(c.byIndex))
+	groups, ids = make(map[string]string, len(c.byIndex)), make(map[string]string, len(c.byIndex))
 	for index, credential := range c.byIndex {
 		if credential.Group != "" {
-			out[index] = credential.Group
+			groups[index] = credential.Group
 		}
+		ids[index] = credential.ID
 	}
-	return out
+	return groups, ids
 }
 
 // qualityCredentials lists the config's API keys for the detection tests,

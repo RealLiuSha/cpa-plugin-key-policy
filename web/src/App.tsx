@@ -15,6 +15,7 @@ import Overview from "./pages/Overview";
 import Channels from "./pages/Channels";
 import Search from "./pages/Search";
 import Quality from "./pages/Quality";
+import Inspection from "./pages/Inspection";
 import Settings from "./pages/Settings";
 import { useLeaveGuard } from "./components/LeaveGuard";
 import { MobileTabBar } from "./components/MobileChrome";
@@ -130,6 +131,7 @@ function Shell() {
         <Route path="/stats" element={<Stats />} />
         <Route path="/search" element={<Search />} />
         <Route path="/quality" element={<Quality />} />
+        <Route path="/inspection" element={<Inspection />} />
         <Route path="/audit" element={<Audit />} />
         <Route path="/settings" element={<Settings />} />
         <Route path="*" element={<Navigate to="/overview" replace />} />

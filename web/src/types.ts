@@ -352,36 +352,16 @@ export interface ChannelSummary {
   input_tokens: number;
   output_tokens: number;
   list_cost_usd: number;
-  upstream_cost_usd: number;
   last_at?: string;
 }
 
-// "" means the channel has no balance source.
-export type BalanceKind = "" | "sub2api" | "openai_billing";
-
-export interface ChannelBalanceSource {
-  kind?: BalanceKind;
-  threshold_usd?: number;
-}
-
-// What the operator records about a channel. cost_ratio 0 means the upstream
-// price is unknown.
+// What the operator records about a channel.
 export interface ChannelMeta {
   auth_index: string;
   display_name?: string;
   vendor?: string;
   note?: string;
-  cost_ratio?: number;
-  balance?: ChannelBalanceSource;
   updated_at?: string;
-}
-
-export interface ChannelBalance {
-  remaining: number;
-  unit?: string;
-  at?: string;
-  error?: string;
-  low: boolean;
 }
 
 // auth_id is CPA's stable credential id from the usage records.
@@ -393,7 +373,6 @@ export interface ChannelView {
   meta: ChannelMeta;
   last_24h: ChannelSummary;
   today: ChannelSummary;
-  balance?: ChannelBalance | null;
   rules?: number;
 }
 
@@ -424,8 +403,6 @@ export interface ChannelPatch {
   display_name?: string;
   vendor?: string;
   note?: string;
-  cost_ratio?: number;
-  balance?: { kind: BalanceKind; threshold_usd: number };
 }
 
 // ===== Adapter rules: per-channel request rewrites =====
@@ -517,7 +494,6 @@ export interface SearchState {
 export interface ModuleStates {
   search: { enabled: boolean; declared: boolean };
   adapters?: { rules: number; enabled_rules: number };
-  balances?: { tracked: number; low: number };
   channels?: { tracked: number };
 }
 
@@ -528,12 +504,8 @@ export interface OverviewToday {
   requests: number;
   attempts: number;
   failures: number;
-  costed_channels: number;
-  uncosted_channels: number;
   billed_usd: number;
   list_cost_usd: number;
-  upstream_cost_usd: number;
-  margin_usd: number;
 }
 
 export interface OverviewKeyAttention {
@@ -543,15 +515,20 @@ export interface OverviewKeyAttention {
   blocked_reason?: string;
 }
 
-export type ChannelAttentionReason = "failure_rate" | "balance_low" | "balance_error";
+// failure_rate: value is the 24-hour failure rate (0–1). degraded and
+// suspect are the verdicts of the last 24 hours of inspection rounds, with
+// the model asked and the answers.
+export type ChannelAttentionReason = "failure_rate" | "degraded" | "suspect";
 
-// value is the 24-hour failure rate (0–1) for failure_rate and the remaining
-// balance for balance_low.
 export interface OverviewChannelAttention {
   auth_index: string;
   display_name?: string;
   reason: ChannelAttentionReason;
   value?: number;
+  model?: string;
+  effort?: string;
+  answered?: number;
+  correct?: number;
 }
 
 export interface OverviewResponse {

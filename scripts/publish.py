@@ -374,7 +374,8 @@ def paired_data(state_path, usage_path):
 
 
 MODULE_FILES = (PLUGIN + "-adapters.json", PLUGIN + "-search.json",
-                PLUGIN + "-channels.json", PLUGIN + "-channel-stats.json", PLUGIN + "-quality.json")
+                PLUGIN + "-channels.json", PLUGIN + "-channel-stats.json", PLUGIN + "-quality.json",
+                PLUGIN + "-inspection.json")
 # Written by an instance handing off in a hot replacement; the next instance replays it
 # and renames it to .applied-<time>, so only a journal nobody replayed has this name.
 HANDOFF_FILE = PLUGIN + "-handoff.jsonl"
@@ -382,9 +383,10 @@ HANDOFF_FILE = PLUGIN + "-handoff.jsonl"
 
 def module_files(state_path):
     """Module files kept next to the state file, for backup: adapter rules, alpha
-    search settings, channel metadata and statistics, detection history, and a hot
-    replacement journal not replayed yet. Releases before them ignore the module
-    files, but a journal must be restored together with the ledger it belongs to."""
+    search settings, channel metadata and statistics, detection history, the daily
+    inspection, and a hot replacement journal not replayed yet. Releases before them
+    ignore the module files, but a journal must be restored together with the ledger
+    it belongs to."""
     state = Path(state_path)
     return [str(state.with_name(name)) for name in (*MODULE_FILES, HANDOFF_FILE) if state.with_name(name).is_file()]
 

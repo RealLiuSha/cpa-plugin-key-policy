@@ -16,8 +16,8 @@ plugins:
       # The plugin's own settings, both optional. search_enabled registers a
       # model router for Codex alpha search (routing is set on the Search
       # page). cpa_config_path is CPA's config.yaml, relative to CPA's working
-      # directory; balance queries and detection read the config's API keys
-      # from it. Releases 0.16.0 and earlier reject both keys.
+      # directory; detection and adapter rule tries read the config's API
+      # keys from it. Releases 0.16.0 and earlier reject both keys.
       # search_enabled: false
       # cpa_config_path: "config.yaml"
 

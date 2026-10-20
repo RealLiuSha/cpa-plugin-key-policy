@@ -6,7 +6,7 @@ import { fromAuthFiles, fromKeyList, fromOpenAICompatibility, fromPlugins } from
 
 const SECRET = "sk-upstream-secret-value";
 const summary: ChannelSummary = {
-  attempts: 0, failures: 0, success_rate: 0, latency_p50_ms: 0, latency_p95_ms: 0, ttft_p50_ms: 0, ttft_p95_ms: 0, input_tokens: 0, output_tokens: 0, list_cost_usd: 0, upstream_cost_usd: 0,
+  attempts: 0, failures: 0, success_rate: 0, latency_p50_ms: 0, latency_p95_ms: 0, ttft_p50_ms: 0, ttft_p95_ms: 0, input_tokens: 0, output_tokens: 0, list_cost_usd: 0,
 };
 
 describe("CPA response projections", () => {
@@ -42,7 +42,7 @@ describe("CPA response projections", () => {
     const rows = mergeChannels({
       config: meta,
       authFiles: [],
-      channels: [{ auth_index: "0123456789abcdef", provider: "meta", meta: { auth_index: "0123456789abcdef" }, last_24h: summary, today: summary, balance: null, rules: 0 }],
+      channels: [{ auth_index: "0123456789abcdef", provider: "meta", meta: { auth_index: "0123456789abcdef" }, last_24h: summary, today: summary, rules: 0 }],
       cpaListed: true,
     });
     expect(rows).toHaveLength(1);

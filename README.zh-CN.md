@@ -1,6 +1,6 @@
 # cpa-key-policy
 
-`cpa-key-policy` 是 CLIProxyAPI 插件，在 CPA 管理面板里显示为「萝卜」。它签发下游 Key、按上游模型定价并按倍率计费、记录用量，并执行 RPM 与美元限额；另外按渠道（CPA 凭据）统计成功率、延迟和成本，按渠道改写请求体，查询上游余额，可接管 Codex 联网搜索（alpha search）的选路，还能用糖果、指纹、ModelTrace 和鹈鹕测试检测凭据背后的模型是否被降智或替换。插件 ID、配置键和所有管理路径仍是 `cpa-key-policy`。额度耗尽和 RPM 超限返回 HTTP 429；任何启用的 Key 都能使用 CPA 提供的所有模型；没有价格的模型按 $0 计费并被标记，直到补上价格。本次发布面向 Linux x64，运行基线为 Debian 12 / glibc 2.36 或更新版本，数据格式为 v7；升级流程见 [RELEASE.md](RELEASE.md)。
+`cpa-key-policy` 是 CLIProxyAPI 插件，在 CPA 管理面板里显示为「萝卜」。它签发下游 Key、按上游模型定价并按倍率计费、记录用量，并执行 RPM 与美元限额；另外按渠道（CPA 凭据）统计成功率、延迟和按标价计的消耗，按渠道改写请求体，可接管 Codex 联网搜索（alpha search）的选路，还能用糖果、指纹、ModelTrace 和鹈鹕测试检测凭据背后的模型是否被降智或替换。插件 ID、配置键和所有管理路径仍是 `cpa-key-policy`。额度耗尽和 RPM 超限返回 HTTP 429；任何启用的 Key 都能使用 CPA 提供的所有模型；没有价格的模型按 $0 计费并被标记，直到补上价格。本次发布面向 Linux x64，运行基线为 Debian 12 / glibc 2.36 或更新版本，数据格式为 v7；升级流程见 [RELEASE.md](RELEASE.md)。
 
 ## 模型价格
 
@@ -44,13 +44,13 @@ keys:
 插件自己的两个键：
 
 - `search_enabled`（默认 false）：为 true 时插件向 CPA 注册模型路由器，接管 `POST /v1/alpha/search` 的选路；路由设置在「搜索」页编辑。关闭时不注册路由器，普通请求不多一次穿越。
-- `cpa_config_path`（默认 `config.yaml`，相对 CPA 的工作目录）：只读，用于查询上游余额时按 auth_index 找到上游 key，以及检测时按 CPA 给的 ID 列出配置里的 API key；key 只在进程内使用，不会写进任何文件、日志或接口响应。
+- `cpa_config_path`（默认 `config.yaml`，相对 CPA 的工作目录）：只读，用于检测时按 CPA 给的 ID 列出配置里的 API key、适配规则「试一次」、渠道页显示分组名，以及判断渠道能否删除；key 只在进程内使用，不会写进任何文件、日志或接口响应。
 
 首次启动会用 YAML 初始化 Key 和价格行，并创建带相同 `dataset_id` 的 state 与 usage 文件。之后 Key 和价格以 state 为唯一真相源；YAML 只控制 `enabled`、`state_file`、`usage_timezone` 和上面两个键。CPA 每次配置生效都会重发配置；配置块没有变化时插件什么都不做，不重读数据文件，所以插件运行期间直接改数据文件不会生效，需要重启。例外是在这个 CPA 进程里跑过、交出数据目录之后又收到注册的同一份插件（`store.version` 切回它，或停用期间跑过别的版本后再启用，CPA 都复用进程里还在的那份插件）：它从文件重新加载并回放交接日志，不用内存里的旧数据接着服务；文件加载不了就注册失败。CPA 丢弃这次加载、回滚到被替换的实例时，那个实例照常服务，每条记录只计一次，也能再发起检测。
 
 注册时未知的顶层键只记一条警告（「设置」页可见），不会让插件注册失败；已经加载数据之后，无法应用的配置会被拒绝并保留上一次有效的配置，同样显示在「设置」页；改了 `usage_timezone` 时立即拒绝，不重读数据文件。首次启动就无法加载数据时仍然注册失败。`cpa-key-policy-check --config` 保持严格：旧版本的设置（`target_model`、`targets`、`dispatch`、`free`、`group`、`classify_rules`、`keys[].models`、`keys[].allow_models_endpoint`、`keys[].limits_changed_at`）和其他未知键都会被它拒绝，切换前用它检查配置。
 
-渠道、适配规则和搜索设置各自存一个文件，和 state 同目录：`cpa-key-policy-adapters.json`、`cpa-key-policy-search.json`、`cpa-key-policy-channels.json`、`cpa-key-policy-channel-stats.json`，检测历史存在 `cpa-key-policy-quality.json`。它们不属于 v7 数据集，回退到旧版本时保留即可，旧版本不会读取。渠道统计每 5 分钟落盘一次，关闭和热替换时精确落盘，崩溃最多丢 5 分钟统计，不丢计费。`scripts/publish.py` 备份这些文件，连同还没被回放的交接日志。但 0.16.0 及更早版本严格解析配置块，回退前要从 `plugins.configs.cpa-key-policy` 删掉 `search_enabled` 和 `cpa_config_path`，否则注册失败，Key 全部 401。这些版本也不回放交接日志，回退到它们要重启 CPA，不能在运行中的 CPA 里只改 `store.version` 热切换（规则见 [RELEASE.md](RELEASE.md)）。首次启动时两个种子 Key 共用同一密钥会被拒绝。启动时严格拒绝不受支持的文件版本、缺失配对、dataset 不一致、时区不一致的用量文件，以及水位（`through`）晚于 `usage_timezone` 当天的 history 文件。
+渠道、适配规则和搜索设置各自存一个文件，和 state 同目录：`cpa-key-policy-adapters.json`、`cpa-key-policy-search.json`、`cpa-key-policy-channels.json`、`cpa-key-policy-channel-stats.json`，检测历史存在 `cpa-key-policy-quality.json`，每日巡检的设置和结果存在 `cpa-key-policy-inspection.json`。它们不属于 v7 数据集，回退到旧版本时保留即可，旧版本不会读取。渠道统计每 5 分钟落盘一次，关闭和热替换时精确落盘，崩溃最多丢 5 分钟统计，不丢计费。`scripts/publish.py` 备份这些文件，连同还没被回放的交接日志。但 0.16.0 及更早版本严格解析配置块，回退前要从 `plugins.configs.cpa-key-policy` 删掉 `search_enabled` 和 `cpa_config_path`，否则注册失败，Key 全部 401。这些版本也不回放交接日志，回退到它们要重启 CPA，不能在运行中的 CPA 里只改 `store.version` 热切换（规则见 [RELEASE.md](RELEASE.md)）。首次启动时两个种子 Key 共用同一密钥会被拒绝。启动时严格拒绝不受支持的文件版本、缺失配对、dataset 不一致、时区不一致的用量文件，以及水位（`through`）晚于 `usage_timezone` 当天的 history 文件。
 
 ## 用量与限额
 
@@ -123,11 +123,11 @@ CPA 会跳过返回错误的请求拦截器，所以插件出故障时那一个�
 | `POST /models/import-prices` | 预览或应用已有价格行的价格 |
 | `GET /audit` | 读取追加式管理审计，新的在前；`key_id`、`action` 按 Key 和动作筛选，`limit`（1–1000，默认 100）按筛选后的条数计。凑满 `limit` 条后不再读更旧的备份。读不出的行跳过并只记一次日志（一个文件最新的若干行里不超过 8 条坏行时结果条数不变），超过 1 MiB 的行照常读出。崩溃或磁盘写满留下的半行，下次追加前先补上换行，下一条事件不会跟着它一起丢。筛选只认插件自己写出的紧凑 JSON，手工编辑过的行可能筛不出来 |
 | `GET /status` | 运行状态与账本健康计数 |
-| `GET /overview` | 今日请求、计费、上游成本与毛利，需要关注的 Key 和渠道，模块状态，最近变更，以及警告（配置警告；账本写不进磁盘时另有一行） |
-| `GET /channels` | 按 auth_index 的渠道统计（24 小时、今日）、元数据、余额和规则数，以及 `groups`（按 auth_index 给出 config.yaml 里 API key 所在的分组名）；界面再与 CPA 的凭据列表合并，没有自己名字的配置 Key 用分组名显示 |
+| `GET /overview` | 今日请求、计费和按标价计的消耗，需要关注的 Key 和渠道，模块状态，最近变更，以及警告（配置警告；账本写不进磁盘时另有一行） |
+| `GET /channels` | 按 auth_index 的渠道统计（24 小时、今日）、元数据和规则数，以及 `groups`（按 auth_index 给出 config.yaml 里 API key 所在的分组名）和 `ids`（按 auth_index 给出配置 Key 的凭据 ID）；界面再与 CPA 的凭据列表合并，没有自己名字的配置 Key 用分组名显示，并用凭据 ID 向 CPA 的 `/v0/management/auth-files/models` 查每个渠道的模型，按类型和模型筛选 |
 | `GET /channels/detail` | 一个渠道 7 天的小时序列和最近 20 条错误（`auth_index`） |
-| `PATCH /channels` | 修改渠道显示名、供应商、备注、进价倍率（上游价 = 标价 × 倍率）、余额来源（`sub2api` 或 `openai_billing`）与告警阈值。`openai_billing` 读 new-api、one-api 的计费接口；读数是站点的显示单位（USD、CNY 或原始额度），接口不说明单位，所以不带单位，告警阈值也按这个单位比较。Key 是无限额度时 new-api 返回的上限恰好是 100000000，读不到账户余额，萝卜报错而不显示数字。审计事件 `update_channel` 只列改动了的字段，什么都没改不记 |
-| `POST /channels/balance/refresh` | 立即查询一个渠道的上游余额 |
+| `PATCH /channels` | 修改渠道显示名、供应商和备注。审计事件 `update_channel` 只列改动了的字段，什么都没改不记 |
+| `DELETE /channels` | 删除 CPA 的 config.yaml 里已经没有的渠道（`auth_index`）：它的统计、元数据和绑定在它上面的适配规则，审计记 `delete_channel`（每条规则另记 `delete_adapter`）。渠道还在配置里时返回 409 `channel_in_cpa`，因为它下一次请求又会出现；找不到返回 404。只对照 config.yaml 里的 API key：CPA 仍在用的 OAuth 凭据不会被拦，它的统计会随下一次请求重新开始 |
 | `GET/POST/DELETE /adapters` | 按渠道的请求改写规则：`edits_image_field`（图片编辑的 `images[].image_url` 改成 `image`）、`set_field`、`delete_field` |
 | `POST /adapters/preview` | 用示例请求体预览规则的效果，不发送任何请求 |
 | `POST /adapters/try` | 套用规则后经 CPA 真实发送一次，固定到这个渠道；会产生上游费用并计入渠道冷却，不计下游账单。规则路径要含 `/v1/images/edits`、`/v1/images/generations`、`/v1/responses`、`/backend-api/codex/responses`、`/v1/chat/completions`、`/v1/messages` 之一，否则 400 `unsupported_path`。config.yaml 里的 API key 按推算出的凭据 ID 固定，没走过流量也能试；其他渠道要先有一次真实请求（否则 409 `channel_not_seen`）。页面最多等 5 分钟；管理请求结束（超时、编辑了示例请求体或离开表单）时 CPA 取消上游调用 |
@@ -136,7 +136,8 @@ CPA 会跳过返回错误的请求拦截器，所以插件出故障时那一个�
 | `GET /quality` | CPA 凭据及其检测进度、各项测试最近 20 次记录（糖果记录不带回答）和测试参数 |
 | `POST /quality/run`、`POST /quality/cancel` | 对凭据发起或停止糖果、指纹、ModelTrace、鹈鹕测试；会消耗凭据额度 |
 | `GET /quality/record`、`DELETE /quality/results` | 读取一条完整记录（糖果回答、指纹比对、ModelTrace 样本、鹈鹕 HTML；糖果记录的 `id` 是 `GET /quality` 里它的 `time` 原样字符串）；清空一项或全部记录 |
-| `POST/GET /quality/inspection` | 按名称或邮箱匹配凭据发起巡检，读取每个凭据是否降智的结论 |
+| `GET/PUT /quality/inspection` | 读取每日巡检的设置、进行中的一轮、下次时间和最近 `days` 天（默认 7，最多 90）按天汇总的结果；整体替换巡检设置 |
+| `POST /quality/inspection`、`GET /quality/inspection/answers` | 立即开始一轮巡检（已有一轮在跑时 409 `inspection_running`）；读取某轮某个渠道答错的回答（`round`、`auth_index`、`model`、`effort`） |
 | `GET /settings` | 模块状态、各钩子耗时（次数和最大值从启动起累计，p50/p99 取最近 512 次）、配置警告、数据文件、界面来源、数据目录归属（`ownership.handoff`：平时 `idle`，热替换交出后 `quiesced`，回滚后没取回目录时 `read_only`）与健康计数 |
 
 `GET /keys` 每项含 `id, name, enabled, key_preview, rpm, daily_limit_usd, weekly_limit_usd, monthly_limit_usd, quota_mode, usage, created_at, updated_at`。`key_preview` 对 24 个字符及以上的 Key 保留前 7 后 5 个字符，更短的保留前 3 后 2，8 个字符及以下只显示 `...`；它在新建、轮换和改 Key 时写入，之前写下的预览保持原样。`POST /keys` 与 `PATCH /keys` 接收 `quota_mode`（`cycle` 或 `balance`），切换为 `balance` 的 PATCH 会清空它没有设置的周期额度。`POST /keys/balance` 返回 `{id, amount_usd, balance_before_usd, balance_usd, net_credited_usd, duplicate}`；金额为 0 或超出 ±1,000,000、备注超过 200 字返回 400 `invalid_amount`，周期 Key 返回 409 `not_balance_mode`，Key 不存在返回 404。`POST /keys` 与 `PATCH /keys` 拒绝未知字段，但接收并忽略旧版本曾有的 `models` 和 `allow_models_endpoint`，现有写入方无需改动。创建、更新、轮换时若密钥已被其他 Key 使用，返回 409 `duplicate_key`。`DELETE /models` 删除不存在的价格行返回 404 `not_found`。管理写入的 state 文件落盘失败时返回 500 `persist_failed`，运行中的策略保持不变。
@@ -147,13 +148,15 @@ CPA 会跳过返回错误的请求拦截器，所以插件出故障时那一个�
 
 价格导入不会创建价格行；它把 token 价格应用到模型 ID 匹配的所有行（不看 provider 限定），并保留倍率。
 
-渠道就是 CPA 的一条凭据，用 CPA 的 `auth_index` 标识：配置里的 API key 凭据由类型、base-url 和 key 算出，改 proxy、prefix 或请求头都不变；OAuth 凭据用凭据文件的 `auth_index`。渠道统计只来自 CPA 的用量记录：每次上游尝试一条，失败后换渠道重试的那次也算，所以不需要任何探测请求。Codex 调用 `image_generation` 工具时，同一次尝试会多一条成功记录（同一凭据、同一 TraceID 和请求时间、图片模型）：它的 token 和成本照加，但不算又一次尝试，也不加延迟样本。没有 TraceID 或请求时间的记录一律算一次尝试。客户端在上游答复之前取消（包括非流式请求的任何取消）时，CPA 记一条状态 499 的失败记录；它说明不了上游的情况，渠道统计忽略它。流开始之后的取消没有用量记录，alpha search 也没有。按次计费模型的标价成本只给被按次扣费的那条生成请求计一次 `per_call_usd`，它的其他记录不计。没有用 `PATCH /channels` 设过信息的渠道，闲置满 7 天后释放它的统计。余额查询走 CPA 给该凭据用的代理：Key 自己的 `proxy-url`，没有就用全局的（`requests.proxy-url`，或顶层 `proxy-url`）；都没写时继承环境的 `HTTP(S)_PROXY`，`direct` 或 `none` 直连。`proxy-url` 不是有效的 http、https、socks5、socks5h 地址时余额显示错误，CPA 自己只记日志、按默认方式连接。余额查询只用 HTTP/1.1，到代理和到余额站点都是（CPA 在 https 代理这一跳也强制 HTTP/1.1），只接受 HTTP/2 的站点会失败。CPA 不对配置里的 API key 凭据开放冷却状态，渠道页显示的是配置里的状态（如 `excluded-models: ["*"]`）和最近的失败率。
+渠道就是 CPA 的一条凭据，用 CPA 的 `auth_index` 标识：配置里的 API key 凭据由类型、base-url 和 key 算出，改 proxy、prefix 或请求头都不变；OAuth 凭据用凭据文件的 `auth_index`。渠道统计只来自 CPA 的用量记录：每次上游尝试一条，失败后换渠道重试的那次也算，所以不需要任何探测请求。Codex 调用 `image_generation` 工具时，同一次尝试会多一条成功记录（同一凭据、同一 TraceID 和请求时间、图片模型）：它的 token 和成本照加，但不算又一次尝试，也不加延迟样本。没有 TraceID 或请求时间的记录一律算一次尝试。客户端在上游答复之前取消（包括非流式请求的任何取消）时，CPA 记一条状态 499 的失败记录；它说明不了上游的情况，渠道统计忽略它。流开始之后的取消没有用量记录，alpha search 也没有。按次计费模型的标价成本只给被按次扣费的那条生成请求计一次 `per_call_usd`，它的其他记录不计。没有用 `PATCH /channels` 设过信息的渠道，闲置满 7 天后释放它的统计。在渠道页对 CPA 已经没有的渠道点「删除渠道」（`DELETE /channels`）可以立即删掉。0.21.0 及更早版本还给每个渠道存进价倍率和余额来源，这两个字段加载时忽略、下一次写入时去掉，所以回退后需要重新设置。余额查询走 CPA 给该凭据用的代理：Key 自己的 `proxy-url`，没有就用全局的（`requests.proxy-url`，或顶层 `proxy-url`）；都没写时继承环境的 `HTTP(S)_PROXY`，`direct` 或 `none` 直连。`proxy-url` 不是有效的 http、https、socks5、socks5h 地址时余额显示错误，CPA 自己只记日志、按默认方式连接。余额查询只用 HTTP/1.1，到代理和到余额站点都是（CPA 在 https 代理这一跳也强制 HTTP/1.1），只接受 HTTP/2 的站点会失败。CPA 不对配置里的 API key 凭据开放冷却状态，渠道页显示的是配置里的状态（如 `excluded-models: ["*"]`）和最近的失败率。
 
 改写规则在 CPA 选定凭据之后、执行器转换请求之前运行（`request.intercept_after`），只作用于这一次尝试，写回的是客户端格式；只有规则命中的请求才会解码请求体。CPA 自己的 payload 规则既不能按凭据匹配，也不能搬移字段，这类上游差异只能在这里处理。
 
-检测从 cpa-codex-candy-eval 重构迁移而来，不再需要另装那个插件。凭据有两个来源：CPA 认证管理器里的认证文件，以及 `cpa_config_path` 指向的 config.yaml 里的 API key（只显示掩码和分组名）。CPA 给插件的凭据列表不含配置里的 API key，插件按 CPA 的规则从 config.yaml 推算它们的凭据 ID；配置读不出来时页面会提示，认证文件照常可测。每个请求经 CPA 固定发往所选凭据，CPA 负责协议转换。糖果、ModelTrace 和鹈鹕测试的每次请求都以新会话的完整 Codex CLI 上下文发出，输入约 1.4 万 Token；指纹测试快速、标准、严格模式每个凭据分别发 60、200、400 次短请求。这些请求是真实的上游调用，会计入渠道统计的尝试次数，但不计任何下游 Key 的账；发起测试、巡检和清空记录都写审计（`run_quality`、`start_inspection`、`clear_quality`，目标是测试名）。同一凭据同时只跑一项测试；每个凭据的每项测试保留最近 20 次、且在 90 天内的记录。糖果和鹈鹕测试在所有凭据间共用 16 个并发名额（测试参数里的 `max_parallel`）；单个模型流超过 16 MB 会被中断并记为错误，不重试；调用 CPA 时出的故障只让这一个请求失败。历史在测试记下结果后最多 5 秒落盘，关闭、热替换和清空时立即写，崩溃最多丢这 5 秒。历史文件读不出来时暂停保存，页面会提示；清空全部记录（`DELETE /quality/results?test=all`）会把它改名为 `<文件>.corrupt-<UTC 时间>`，然后恢复保存。数据目录里有 candy-eval 的 `cpa-codex-candy-eval-state.json` 而还没有 `cpa-key-policy-quality.json` 时，首次启动只读导入它的历史；这个文件读不出来时只是不导入。热替换时正在运行的测试会被取消，插件最多等 15 秒：CPA 还在建立的请求打断不了（`execute_stream` 返回之后模型流才能关闭），单次请求的超时也管不到这段等待；之后还没结束的测试自己关流，不保存记录。关闭插件时 CPA 在调用插件之前就拒绝了它的所有回调（包括关流），被取消的测试要等上游再发数据才能结束；最后一次账本落盘和渠道统计在这之前写完。巡检接口与 candy-eval 的 `/inspection` 字段名相同；candy-eval 的 `inspection.py` 用的是 `/state` 和 `/run`，需改三处：`PLUGIN` 改为 `/plugins/cpa-key-policy/quality`，`state()` 改为 `api("GET", PLUGIN)`，`/run` 请求体加 `"test": "candy"`。include/exclude 模式除邮箱和名称外也匹配分组名。指纹归一化没有做 Unicode NFC 组合（不为此引入 golang.org/x/text），这是与 candy-eval 唯一的计算差异，模型回答通常本来就是 NFC。
+检测从 cpa-codex-candy-eval 重构迁移而来，不再需要另装那个插件。凭据有两个来源：CPA 认证管理器里的认证文件，以及 `cpa_config_path` 指向的 config.yaml 里的 API key（只显示掩码和分组名）。CPA 给插件的凭据列表不含配置里的 API key，插件按 CPA 的规则从 config.yaml 推算它们的凭据 ID；配置读不出来时页面会提示，认证文件照常可测。每个请求经 CPA 固定发往所选凭据，CPA 负责协议转换。糖果、ModelTrace 和鹈鹕测试的每次请求都以新会话的完整 Codex CLI 上下文发出，输入约 1.4 万 Token；指纹测试快速、标准、严格模式每个凭据分别发 60、200、400 次短请求。这些请求是真实的上游调用，会计入渠道统计的尝试次数，但不计任何下游 Key 的账；发起测试和清空记录都写审计（`run_quality`、`clear_quality`，目标是测试名）。同一凭据同时只跑一项测试；每个凭据的每项测试保留最近 20 次、且在 90 天内的记录。糖果和鹈鹕测试在所有凭据间共用 16 个并发名额（测试参数里的 `max_parallel`）；单个模型流超过 16 MB 会被中断并记为错误，不重试；调用 CPA 时出的故障只让这一个请求失败。历史在测试记下结果后最多 5 秒落盘，关闭、热替换和清空时立即写，崩溃最多丢这 5 秒。历史文件读不出来时暂停保存，页面会提示；清空全部记录（`DELETE /quality/results?test=all`）会把它改名为 `<文件>.corrupt-<UTC 时间>`，然后恢复保存。数据目录里有 candy-eval 的 `cpa-codex-candy-eval-state.json` 而还没有 `cpa-key-policy-quality.json` 时，首次启动只读导入它的历史；这个文件读不出来时只是不导入。热替换时正在运行的测试会被取消，插件最多等 15 秒：CPA 还在建立的请求打断不了（`execute_stream` 返回之后模型流才能关闭），单次请求的超时也管不到这段等待；之后还没结束的测试自己关流，不保存记录。关闭插件时 CPA 在调用插件之前就拒绝了它的所有回调（包括关流），被取消的测试要等上游再发数据才能结束；最后一次账本落盘和渠道统计在这之前写完。指纹归一化没有做 Unicode NFC 组合（不为此引入 golang.org/x/text），这是与 candy-eval 唯一的计算差异，模型回答通常本来就是 NFC。
 
 ## 第三方组件
+
+每日巡检（「巡检」页）在固定时间用糖果题考一遍选中的渠道，不需要外部定时任务。渠道按模型分组：一组是一个模型加推理强度和一批渠道（按 auth_index 记），每个时间点每个渠道连续问「每次答题数」道题，各渠道并行，和手动检测共用 16 个名额；默认每天 08:00、14:00、20:00（插件的 `usage_timezone`），每次 3 题，新装时关闭。一天内的答案按渠道和模型合计：答对至少三分之二为正常，至少三分之一为存疑，更少为降智，一题都没答出来为失败；CPA 里已没有、已停用或冷却中的渠道记为跳过。最近 24 小时降智或存疑的渠道出现在概览的「需要处理的渠道」里。插件每分钟检查一次时间点，只在持有数据目录的实例上跑；某个时间点错过了（停机、热替换取消了正在跑的一轮），之后只补跑当天最近的一个时间点，不补更早的。一轮结束后整体写进 `cpa-key-policy-inspection.json`，结果保留 90 天，答错的回答只保留 14 天；巡检记录不进入手动检测的 20 条历史。文件读不出来时暂停定时，保存一次巡检设置会把它改名为 `<文件>.corrupt-<UTC 时间>` 并恢复。修改设置写审计 `update_inspection`，手动开始一轮写 `start_inspection`，目标都是 `inspection`；定时的轮次不写审计。页面用 CPA 的模型列表（`/v0/management/auth-files/models`，即客户端请求用的模型名，排除的模型和提供商默认模型都已算进去）挑渠道：新增一组时提供该模型的渠道默认全选，没勾的记为忽略，之后只提示新出现的渠道。
 
 检测功能移植自 [cpa-codex-candy-eval](https://github.com/haowang02/cpa-plugin-codex-candy-eval)（MIT，Copyright (c) 2026 Hao Wang），许可证见 `internal/quality/LICENSE`；ModelTrace 的归因方法与候选库来自 [ModelTrace](https://github.com/xqy2006/ModelTrace)（MIT），许可证见 `internal/quality/data/modeltrace/LICENSE`。
 

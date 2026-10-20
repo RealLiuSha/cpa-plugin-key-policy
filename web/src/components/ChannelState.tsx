@@ -1,7 +1,7 @@
 import { failureRate, type ChannelRow, type ChannelState } from "../channelMerge";
-import { formatAmount, formatDateTime, formatPercent } from "../format";
+import { formatDateTime, formatPercent } from "../format";
 import { useT } from "../i18n";
-import type { ChannelBalance, ChannelSummary } from "../types";
+import type { ChannelSummary } from "../types";
 
 const STATE_TONE: Record<ChannelState, string> = {
   active: "ok", configured: "", disabled: "", excluded: "", error: "danger", unavailable: "danger", cooldown: "warn", missing: "warn", unknown: "",
@@ -26,12 +26,4 @@ export function FailurePill({ summary }: { summary?: ChannelSummary }) {
   if (rate === null || !(summary!.failures > 0)) return null;
   const tone = rate >= FAILURE_DANGER ? " danger" : rate >= FAILURE_WARN ? " warn" : "";
   return <span className={"badge" + tone} title={t("channels.failuresTitle", { failures: summary!.failures, attempts: summary!.attempts })}>{t("channels.failurePill", { rate: formatPercent(rate) })}</span>;
-}
-
-export function BalanceValue({ balance }: { balance?: ChannelBalance | null }) {
-  const t = useT();
-  if (!balance) return <span className="muted">—</span>;
-  if (balance.error) return <span className="badge danger" title={balance.error}>{t("channels.balanceError")}</span>;
-  const amount = `${formatAmount(balance.remaining)}${balance.unit ? ` ${balance.unit}` : ""}`;
-  return <span className={balance.low ? "badge warn" : "mono"} title={balance.at ? t("channels.balanceAt", { time: formatDateTime(balance.at) }) : undefined}>{amount}</span>;
 }

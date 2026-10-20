@@ -87,14 +87,6 @@ func isTokenByte(c byte) bool {
 	return strings.IndexByte("+/=_-*.~", c) >= 0
 }
 
-// redactSecret removes every occurrence of a known secret.
-func redactSecret(s, secret string) string {
-	if secret == "" {
-		return s
-	}
-	return strings.ReplaceAll(s, secret, redactedText)
-}
-
 // truncateRunes keeps the first limit characters of s.
 func truncateRunes(s string, limit int) string {
 	count := 0

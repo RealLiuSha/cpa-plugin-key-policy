@@ -1,10 +1,10 @@
 import { apiClient, pluginPath } from "./client";
 import { fetchCpaCredentials, type CpaConfigCredential, type CpaCredentials } from "./cpa";
-import type { ChannelBalance, ChannelDetail, ChannelMeta, ChannelPatch, ChannelSummary, ChannelView } from "../types";
+import type { ChannelDetail, ChannelMeta, ChannelPatch, ChannelSummary, ChannelView } from "../types";
 
 const EMPTY_SUMMARY: ChannelSummary = {
   attempts: 0, failures: 0, success_rate: 0, latency_p50_ms: 0, latency_p95_ms: 0, ttft_p50_ms: 0, ttft_p95_ms: 0,
-  input_tokens: 0, output_tokens: 0, list_cost_usd: 0, upstream_cost_usd: 0,
+  input_tokens: 0, output_tokens: 0, list_cost_usd: 0,
 };
 
 function summary(value?: Partial<ChannelSummary> | null): ChannelSummary {
@@ -17,16 +17,15 @@ function view(value: ChannelView): ChannelView {
     meta: { ...(value.meta ?? {}), auth_index: value.auth_index },
     last_24h: summary(value.last_24h),
     today: summary(value.today),
-    balance: value.balance ?? null,
     rules: value.rules ?? 0,
   };
 }
 
-// The plugin's channels, and the group names of CPA's config keys by
-// auth_index (CPA's own key lists leave them out).
-export async function fetchChannels(): Promise<{ channels: ChannelView[]; groups: Record<string, string> }> {
-  const { data } = await apiClient().get<{ channels: ChannelView[] | null; groups?: Record<string, string> | null }>(pluginPath("/channels"));
-  return { channels: (data.channels ?? []).map(view), groups: data.groups ?? {} };
+// The plugin's channels, and the group names and credential IDs of CPA's
+// config keys by auth_index (CPA's own key lists leave both out).
+export async function fetchChannels(): Promise<{ channels: ChannelView[]; groups: Record<string, string>; ids: Record<string, string> }> {
+  const { data } = await apiClient().get<{ channels: ChannelView[] | null; groups?: Record<string, string> | null; ids?: Record<string, string> | null }>(pluginPath("/channels"));
+  return { channels: (data.channels ?? []).map(view), groups: data.groups ?? {}, ids: data.ids ?? {} };
 }
 
 // Names the config keys CPA lists without a name by their config group; keys
@@ -64,9 +63,10 @@ export async function patchChannel(patch: ChannelPatch): Promise<ChannelMeta> {
   return data.meta;
 }
 
-export async function refreshChannelBalance(authIndex: string): Promise<ChannelBalance> {
-  const { data } = await apiClient().post<{ balance: ChannelBalance }>(pluginPath("/channels/balance/refresh"), { auth_index: authIndex });
-  return data.balance;
+// Forgets a channel CPA's config no longer has: its statistics, notes and
+// adapter rules. The plugin refuses one still in the config (channel_in_cpa).
+export async function deleteChannel(authIndex: string): Promise<void> {
+  await apiClient().delete(pluginPath("/channels"), { params: { auth_index: authIndex } });
 }
 
 // Everything the channel list joins: CPA's credential lists and the plugin's
@@ -75,10 +75,12 @@ export interface ChannelData {
   channels: ChannelView[];
   cpa: CpaCredentials | null;
   cpaError: unknown;
+  // Config keys' credential IDs by auth_index, to look their models up.
+  ids: Record<string, string>;
 }
 
 export async function fetchChannelData(): Promise<ChannelData> {
   const [plugin, cpa] = await Promise.all([fetchChannels(), fetchCpaCredentials().then((value) => ({ value, error: null }), (error: unknown) => ({ value: null, error }))]);
   const credentials = cpa.value ? { ...cpa.value, config: nameByGroup(cpa.value.config, plugin.groups) } : null;
-  return { channels: plugin.channels, cpa: credentials, cpaError: cpa.error };
+  return { channels: plugin.channels, cpa: credentials, cpaError: cpa.error, ids: plugin.ids };
 }

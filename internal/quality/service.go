@@ -18,6 +18,7 @@ var (
 	ErrHost        = errors.New("CPA credential list unavailable")
 	ErrNotFound    = errors.New("record not found")
 	ErrPersist     = errors.New("detection history not saved")
+	ErrBusy        = errors.New("an inspection round is already under way")
 )
 
 // Test names.
@@ -34,7 +35,11 @@ type Options struct {
 	// candy-eval's state file, imported once while Path does not exist.
 	Path   string
 	Legacy string
-	Host   Host
+	// InspectionPath is the inspection's settings and rounds; Location is
+	// the timezone of its times of day, UTC when nil.
+	InspectionPath string
+	Location       *time.Location
+	Host           Host
 	// ConfigCredentials lists the API keys of CPA's config.yaml, which the
 	// auth manager list leaves out, with masked names; nil lists none.
 	ConfigCredentials func() ([]Credential, error)
@@ -64,7 +69,16 @@ type Service struct {
 	fingerprint  map[string]*fingerprintProgress
 	trace        map[string]*traceProgress
 	pelican      map[string]*pelicanProgress
-	inspections  map[string]inspection
+	// The daily inspection: its file, the timezone of its times, what the
+	// file holds or why it could not be read, the round under way and the
+	// last error a scheduled round failed to start with.
+	inspectionPath         string
+	location               *time.Location
+	inspection             inspectionFile
+	inspectionErr          error
+	inspectionStorageError string
+	round                  *roundProgress
+	tickError              string
 	// plans caches the subscription of Codex auth files by auth_index.
 	plans map[string]cachedPlan
 	// dirty marks records not written yet, flushArmed a write flushTimer is
@@ -121,8 +135,9 @@ type pelicanProgress struct {
 func Open(opts Options) *Service {
 	s := &Service{
 		host: opts.Host, configCredentials: opts.ConfigCredentials, path: opts.Path, canWrite: opts.CanWrite, logf: opts.Logf, now: opts.Now,
+		inspectionPath: opts.InspectionPath, location: opts.Location,
 		hist: emptyHistory(), candy: map[string]*candyProgress{}, fingerprint: map[string]*fingerprintProgress{},
-		trace: map[string]*traceProgress{}, pelican: map[string]*pelicanProgress{}, inspections: map[string]inspection{},
+		trace: map[string]*traceProgress{}, pelican: map[string]*pelicanProgress{},
 		fingerprintSlots: make(chan struct{}, FingerprintMaxConcurrency), traceSlots: make(chan struct{}, traceGlobalConcurrency),
 		askSlots: make(chan struct{}, askGlobalConcurrency),
 	}
@@ -135,8 +150,12 @@ func Open(opts Options) *Service {
 	if s.now == nil {
 		s.now = time.Now
 	}
+	if s.location == nil {
+		s.location = time.UTC
+	}
 	s.mu.Lock()
 	s.openHistory(opts.Legacy)
+	s.openInspection()
 	s.mu.Unlock()
 	return s
 }
@@ -513,7 +532,7 @@ func (s *Service) HandOff(limit time.Duration) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.flushNowLocked()
-	return len(s.candy) + len(s.fingerprint) + len(s.trace) + len(s.pelican)
+	return s.runningLocked()
 }
 
 func (s *Service) cancelAllLocked() {
@@ -532,13 +551,25 @@ func (s *Service) cancelAllLocked() {
 		p.Phase = "cancelling"
 		p.cancel()
 	}
+	if s.round != nil {
+		s.round.cancel()
+	}
 }
 
-// Running counts the credentials with a test in progress.
+// Running counts the credentials with a test in progress, and an inspection
+// round under way.
 func (s *Service) Running() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return len(s.candy) + len(s.fingerprint) + len(s.trace) + len(s.pelican)
+	return s.runningLocked()
+}
+
+func (s *Service) runningLocked() int {
+	running := len(s.candy) + len(s.fingerprint) + len(s.trace) + len(s.pelican)
+	if s.round != nil {
+		running++
+	}
+	return running
 }
 
 // Record returns one record in full. A candy record has no ID: id is its

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -222,26 +223,115 @@ func TestStopCancelsARunningTest(t *testing.T) {
 	}
 }
 
-// An inspection's verdict counts only its own records: a wrong answer marks
-// the credential degraded. Its candy records keep their answers, as
-// candy-eval's inspection script reads them.
-func TestInspectionVerdict(t *testing.T) {
-	s := open(t, Options{Path: filepath.Join(t.TempDir(), "quality.json"), Host: &fakeHost{answer: "最少取出 19 个"}})
-	if _, err := s.Inspection(TestCandy); err == nil {
-		t.Fatal("verdict before any inspection")
+// A schedule slot is due from its time on, until a round ran for it; a
+// schedule missed while nothing ran catches up with today's latest slot only.
+func TestDueSlot(t *testing.T) {
+	shanghai := time.FixedZone("CST", 8*3600)
+	times := []string{"08:00", "14:00", "20:00"}
+	at := func(clock string) time.Time {
+		parsed, _ := time.ParseInLocation("2006-01-02 15:04", "2026-10-21 "+clock, shanghai)
+		return parsed.UTC()
 	}
-	// A config API key is matched by its group.
-	req := InspectionRequest{RunRequest: RunRequest{Test: TestCandy, Model: "gpt-6-sol", Runs: 1}, Include: []string{"rel*"}}
-	if summary, err := s.Inspect(req); err != nil || summary.Started != 1 {
-		t.Fatalf("inspect = %+v, %v", summary, err)
+	for _, c := range []struct {
+		now  string
+		done []string
+		want string
+	}{
+		{now: "07:59", want: ""},
+		{now: "08:00", want: "2026-10-21 08:00"},
+		{now: "13:00", done: []string{"2026-10-21 08:00"}, want: ""},
+		{now: "15:30", want: "2026-10-21 14:00"},
+		{now: "15:30", done: []string{"2026-10-21 14:00"}, want: ""},
+		{now: "23:59", done: []string{"2026-10-21 08:00"}, want: "2026-10-21 20:00"},
+	} {
+		got := dueSlot(at(c.now), shanghai, times, func(slot string) bool { return slices.Contains(c.done, slot) })
+		if got != c.want {
+			t.Errorf("at %s with %v done: due %q, want %q", c.now, c.done, got, c.want)
+		}
 	}
+}
+
+// A round asks every group's channels, records skipped ones, judges the
+// answers by day and keeps the wrong ones; it survives a restart, and the
+// slot it ran for is not run again.
+func TestInspectionRoundIsJudgedAndSaved(t *testing.T) {
+	dir := t.TempDir()
+	host := &fakeHost{answer: "最少取出 19 个"}
+	now := time.Date(2026, 10, 21, 6, 30, 0, 0, time.UTC) // 14:30 in Shanghai
+	shanghai := time.FixedZone("CST", 8*3600)
+	opts := Options{Path: filepath.Join(dir, "quality.json"), InspectionPath: filepath.Join(dir, "inspection.json"), Host: host,
+		Location: shanghai, Now: func() time.Time { return now }}
+	s := open(t, opts)
+	s.Tick() // the default schedule is off
+	if s.Running() != 0 {
+		t.Fatal("a round started while the schedule is off")
+	}
+	settings := InspectionSettings{Enabled: true, Times: []string{"14:00", "08:00"}, Runs: 2, Groups: []InspectionGroup{
+		{Model: "gpt-6-sol", Effort: "low", Channels: []string{"0123456789ABCDEF", "ffffffffffffffff"}},
+	}}
+	if _, _, err := s.SetInspection(settings); err != nil {
+		t.Fatal(err)
+	}
+	s.Tick()
 	waitIdle(t, s)
-	view, err := s.Inspection(TestCandy)
-	if err != nil || view.Running || len(view.Credentials) != 1 || view.Credentials[0].Degraded == nil || !*view.Credentials[0].Degraded {
-		t.Fatalf("inspection = %+v, %v", view, err)
+	view := s.Inspection(7)
+	cells := view.Days[0].Cells
+	if view.Days[0].Date != "2026-10-21" || len(cells) != 2 || view.Settings.Times[0] != "08:00" {
+		t.Fatalf("view = %+v", view)
 	}
-	if results := view.Credentials[0].Results.([]CandyResult); results[0].Answer != "最少取出 19 个" {
-		t.Fatalf("inspected records = %+v", results)
+	asked, missing := cells[0], cells[1]
+	if asked.AuthIndex != "0123456789abcdef" || asked.Answered != 2 || asked.Correct != 0 || asked.Verdict != "degraded" ||
+		len(asked.Rounds) != 1 || !asked.Rounds[0].Scheduled || asked.Rounds[0].WrongAnswers != 2 {
+		t.Fatalf("asked channel = %+v", asked)
+	}
+	if missing.Verdict != "skipped" || missing.Rounds[0].Skipped != "missing" {
+		t.Fatalf("missing channel = %+v", missing)
+	}
+	if attention := s.Attention(); len(attention) != 1 || attention[0].Verdict != "degraded" {
+		t.Fatalf("attention = %+v", attention)
+	}
+	item, err := s.InspectionAnswers(asked.Rounds[0].Round, asked.AuthIndex, "gpt-6-sol", "low")
+	if err != nil || len(item.(roundItem).Wrong) != 2 || item.(roundItem).Wrong[0] != host.answer {
+		t.Fatalf("answers = %+v, %v", item, err)
+	}
+	if !view.NextAt.Equal(time.Date(2026, 10, 22, 8, 0, 0, 0, shanghai)) {
+		t.Fatalf("next round at %v", view.NextAt)
+	}
+	// The manual history is untouched.
+	if state, _ := s.State(); len(state.Auths[0].Results) != 0 {
+		t.Fatalf("candy history = %+v", state.Auths[0].Results)
+	}
+	s.Stop()
+	reopened := open(t, opts)
+	reopened.Tick()
+	if reopened.Running() != 0 || host.requests() != 2 {
+		t.Fatalf("the slot ran again: running %d, requests %d", reopened.Running(), host.requests())
+	}
+	if again := reopened.Inspection(7); !again.Settings.Enabled || len(again.Days[0].Cells) != 2 {
+		t.Fatalf("reopened view = %+v", again)
+	}
+}
+
+// A hot replacement cancels the round under way, which records nothing, so
+// the instance taking over runs its slot again.
+func TestHandOffDropsTheRoundUnderWay(t *testing.T) {
+	dir := t.TempDir()
+	host := &fakeHost{hold: true}
+	s := open(t, Options{Path: filepath.Join(dir, "quality.json"), InspectionPath: filepath.Join(dir, "inspection.json"), Host: host})
+	if _, _, err := s.SetInspection(InspectionSettings{Enabled: true, Times: []string{"00:00"}, Runs: 1,
+		Groups: []InspectionGroup{{Model: "gpt-6-sol", Channels: []string{"0123456789abcdef"}}}}); err != nil {
+		t.Fatal(err)
+	}
+	s.Tick()
+	waitFor(t, "the question", func() bool { return host.openStreams() == 1 })
+	if err := s.StartInspection(); !errors.Is(err, ErrBusy) {
+		t.Fatalf("second round: %v", err)
+	}
+	if left := s.HandOff(5 * time.Second); left != 0 {
+		t.Fatalf("%d still running after HandOff", left)
+	}
+	if view := s.Inspection(1); view.Running != nil || len(view.Days[0].Cells) != 0 || view.NextAt.IsZero() {
+		t.Fatalf("after HandOff: %+v", view)
 	}
 }
 

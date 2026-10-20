@@ -1,0 +1,51 @@
+/* ===== Inspection (巡检): schedule, groups, day matrix, dialogs =====
+ * Builds on the shared .card, .badge, .seg, .switch, .table-wrap,
+ * .channel-filter and .code-block rules. */
+
+.inspection-page { display: flex; flex-direction: column; gap: 12px; }
+.card.inspection-schedule { display: flex; flex-direction: column; gap: 12px; padding: 16px 18px; }
+.inspection-schedule-row { display: flex; align-items: center; gap: 8px 12px; flex-wrap: wrap; }
+.inspection-label { font-size: 13px; font-weight: 600; }
+.inspection-time { display: inline-flex; align-items: center; gap: 4px; }
+.inspection-time .input { width: auto; padding: 6px 8px; }
+.inspection-runs { display: inline-flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 600; }
+.inspection-runs .input { width: 72px; }
+.inspection-progress { width: 100%; max-width: 360px; height: 6px; accent-color: var(--accent); }
+.inspection-warn { color: var(--warn-text); }
+
+.inspection-groups-head { display: flex; align-items: center; gap: 8px 12px; flex-wrap: wrap; margin-top: 8px; }
+.inspection-groups-head .usage-section-title { margin: 0; }
+/* styles.css hides .seg on desktop except where a page opts in. */
+.inspection-page .inspection-days { display: inline-flex !important; margin: 0; }
+.inspection-page .inspection-days .seg-btn { padding: 4px 12px; white-space: nowrap; }
+
+.card.inspection-group { display: flex; flex-direction: column; gap: 10px; padding: 14px 16px; }
+.inspection-group-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.inspection-group-head h3 { margin: 0; font-size: 15px; }
+.inspection-fresh { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 0; }
+.inspection-table th:first-child, .inspection-table td:first-child { min-width: 140px; }
+.inspection-table td.num, .inspection-table th.num { text-align: center; white-space: nowrap; }
+.inspection-cell {
+  min-width: 44px; padding: 2px 8px; border: 1px solid var(--border); border-radius: var(--r-full);
+  background: var(--panel); color: var(--muted); font: inherit; font-size: 12px; font-weight: 700; cursor: pointer;
+}
+.inspection-cell:focus-visible { outline: none; box-shadow: 0 0 0 3px var(--accent-ring); }
+.inspection-cell.ok { color: var(--ok); border-color: var(--ok-border); background: var(--ok-soft); }
+.inspection-cell.warn { color: var(--warn-text); border-color: color-mix(in srgb, var(--warn) 45%, transparent); background: color-mix(in srgb, var(--warn) 12%, transparent); }
+.inspection-cell.danger { color: var(--danger); border-color: var(--danger-border); background: var(--danger-soft); }
+.inspection-cell.err { color: var(--danger); border-style: dashed; }
+
+.inspection-editor { display: flex; flex-direction: column; gap: 10px; }
+.inspection-effort { display: inline-flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 600; }
+.inspection-effort select { width: auto; padding: 6px 10px; }
+.inspection-pick { list-style: none; margin: 0; padding: 0; max-height: 50vh; overflow: auto; border: 1px solid var(--border); border-radius: var(--r-md, 8px); }
+.inspection-pick li { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 6px 10px; border-bottom: 1px solid var(--border); }
+.inspection-pick li:last-child { border-bottom: 0; }
+.inspection-pick .check-row { flex: 1; min-width: 180px; }
+
+.inspection-cell-summary { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 0 0 12px; }
+.inspection-rounds { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 10px; }
+.inspection-round { display: flex; flex-direction: column; gap: 6px; padding-bottom: 10px; border-bottom: 1px solid var(--border); }
+.inspection-round:last-child { border-bottom: 0; }
+.inspection-round-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 13px; }
+.inspection-answer { max-height: 240px; margin: 0; white-space: pre-wrap; }

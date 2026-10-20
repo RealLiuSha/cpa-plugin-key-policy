@@ -1,18 +1,11 @@
 package channel
 
 import (
-	"context"
 	"crypto/sha256"
-	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"fmt"
-	"io"
-	"log"
 	"math"
-	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -77,7 +70,7 @@ func TestObserveSummarizesLast24hAndToday(t *testing.T) {
 	loc := mustShanghai(t)
 	now := time.Date(2026, 10, 19, 15, 30, 0, 0, loc)
 	r := newTestRegistry(t, Options{MetaPath: filepath.Join(t.TempDir(), "channels.json"), Location: loc, Now: fixedNow(now)})
-	if _, err := r.UpdateMeta(MetaPatch{AuthIndex: indexA, CostRatio: ptr(0.5)}); err != nil {
+	if _, err := r.UpdateMeta(MetaPatch{AuthIndex: indexA, Vendor: ptr("Acme")}); err != nil {
 		t.Fatal(err)
 	}
 	ago := func(minutes int) time.Time { return now.Add(-time.Duration(minutes) * time.Minute) }
@@ -110,7 +103,7 @@ func TestObserveSummarizesLast24hAndToday(t *testing.T) {
 		t.Fatalf("views = %+v, want only %s", views, indexA)
 	}
 	view := views[0]
-	if view.AuthID != "codex:apikey:1" || view.Provider != "codex" || view.BaseURL != "https://up.example/v1" || view.Meta.CostRatio != 0.5 {
+	if view.AuthID != "codex:apikey:1" || view.Provider != "codex" || view.BaseURL != "https://up.example/v1" || view.Meta.Vendor != "Acme" {
 		t.Fatalf("identity = %q %q %q meta %+v", view.AuthID, view.Provider, view.BaseURL, view.Meta)
 	}
 	last24h, today := view.Last24h, view.Today
@@ -131,8 +124,8 @@ func TestObserveSummarizesLast24hAndToday(t *testing.T) {
 	if today.TTFTP95Ms <= 300 || today.TTFTP95Ms > 500 {
 		t.Fatalf("ttft p95 %d", today.TTFTP95Ms)
 	}
-	if !nearly(today.ListCostUSD, 0.003) || !nearly(today.UpstreamCostUSD, 0.0015) || !today.LastAt.Equal(ago(10)) {
-		t.Fatalf("cost list %v upstream %v last %v", today.ListCostUSD, today.UpstreamCostUSD, today.LastAt)
+	if !nearly(today.ListCostUSD, 0.003) || !today.LastAt.Equal(ago(10)) {
+		t.Fatalf("list cost %v last %v", today.ListCostUSD, today.LastAt)
 	}
 	detail, _ := r.Detail(indexA)
 	if errs := detail.RecentErrors; len(errs) != 2 || errs[0].StatusCode != 0 || errs[1].StatusCode != 429 {
@@ -254,11 +247,6 @@ func TestUpdateMetaValidatesPersistsAndRespectsReadOnly(t *testing.T) {
 	for name, patch := range map[string]MetaPatch{
 		"short auth_index":   {AuthIndex: "abc"},
 		"non-hex auth_index": {AuthIndex: "0123456789abcdeg"},
-		"ratio above 10":     {AuthIndex: indexA, CostRatio: ptr(10.5)},
-		"negative ratio":     {AuthIndex: indexA, CostRatio: ptr(-0.1)},
-		"NaN ratio":          {AuthIndex: indexA, CostRatio: ptr(math.NaN())},
-		"negative threshold": {AuthIndex: indexA, Balance: &BalanceSource{Kind: BalanceSub2API, ThresholdUSD: -1}},
-		"unknown kind":       {AuthIndex: indexA, Balance: &BalanceSource{Kind: "stripe"}},
 		"long display name":  {AuthIndex: indexA, DisplayName: ptr(strings.Repeat("名", 201))},
 	} {
 		if _, err := r.UpdateMeta(patch); !errors.Is(err, ErrInvalid) {
@@ -269,14 +257,14 @@ func TestUpdateMetaValidatesPersistsAndRespectsReadOnly(t *testing.T) {
 		t.Fatalf("rejected patches wrote the file: %v", err)
 	}
 
-	meta, err := r.UpdateMeta(MetaPatch{AuthIndex: " 0123456789ABCDEF ", DisplayName: ptr("  主力  "), Vendor: ptr("Acme"), Note: ptr(strings.Repeat("备", 200)), CostRatio: ptr(10.0), Balance: &BalanceSource{Kind: " Sub2API ", ThresholdUSD: 5}})
+	meta, err := r.UpdateMeta(MetaPatch{AuthIndex: " 0123456789ABCDEF ", DisplayName: ptr("  主力  "), Vendor: ptr("Acme"), Note: ptr(strings.Repeat("备", 200))})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if meta.AuthIndex != indexA || meta.DisplayName != "主力" || meta.CostRatio != 10 || meta.Balance != (BalanceSource{Kind: BalanceSub2API, ThresholdUSD: 5}) || !meta.UpdatedAt.Equal(now) {
+	if meta.AuthIndex != indexA || meta.DisplayName != "主力" || !meta.UpdatedAt.Equal(now) {
 		t.Fatalf("normalized meta = %+v", meta)
 	}
-	if meta, err = r.UpdateMeta(MetaPatch{AuthIndex: indexA, Note: ptr("")}); err != nil || meta.Vendor != "Acme" || meta.Note != "" || meta.CostRatio != 10 {
+	if meta, err = r.UpdateMeta(MetaPatch{AuthIndex: indexA, Note: ptr("")}); err != nil || meta.Vendor != "Acme" || meta.Note != "" {
 		t.Fatalf("partial patch = %+v, %v", meta, err)
 	}
 	for index, patch := range map[string]MetaPatch{indexB: {Vendor: ptr("beta")}, indexC: {DisplayName: ptr("no vendor")}} {
@@ -490,207 +478,69 @@ func TestFlushStatsDoesNotFreeAChannelGivenMetadataMeanwhile(t *testing.T) {
 	}
 }
 
-func TestRefreshBalanceReadsBothSourcesWithoutLeakingTheKey(t *testing.T) {
-	const key = "relay-key-7"
-	const missing, unpriced, unlimited, tokens = "00000000000000d0", "00000000000000e0", "00000000000000f0", "00000000000000a0"
-	loc := mustShanghai(t)
-	var calls []string
-	failSub2API := false
-	httpDo := func(_ context.Context, method, url string, headers map[string]string) (int, []byte, error) {
-		calls = append(calls, url)
-		if method != http.MethodGet || headers["Authorization"] != "Bearer "+key {
-			return 0, nil, fmt.Errorf("unexpected request %s %s", method, url)
-		}
-		switch url {
-		case "https://sub.example/v1/usage":
-			if failSub2API {
-				return 401, []byte(`{"error":{"type":"authentication_error","message":"Invalid API key relay-key-7"}}`), nil
-			}
-			return 200, []byte(`{"mode":"unrestricted","isValid":true,"remaining":4.5,"balance":4.5,"unit":"USD"}`), nil
-		case "https://bill.example/v1/dashboard/billing/subscription":
-			return 200, []byte(`{"object":"billing_subscription","has_payment_method":true,"hard_limit_usd":12.5}`), nil
-		case "https://bill.example/v1/dashboard/billing/usage?start_date=2026-10-01&end_date=2026-10-19":
-			return 200, []byte(`{"object":"list","total_usage":250}`), nil
-		case "https://err.example/v1/dashboard/billing/subscription":
-			return 200, []byte(`{"error":{"message":"token relay-key-7 has expired","type":"new_api_error"}}`), nil
-		case "https://unlimited.example/v1/dashboard/billing/subscription":
-			// new-api and one-api answer this for a token with unlimited quota.
-			return 200, []byte(`{"object":"billing_subscription","has_payment_method":true,"hard_limit_usd":100000000}`), nil
-		case "https://unlimited.example/v1/dashboard/billing/usage?start_date=2026-10-01&end_date=2026-10-19":
-			return 200, []byte(`{"object":"list","total_usage":20}`), nil
-		case "https://tokens.example/v1/dashboard/billing/subscription":
-			// new-api showing raw quota: a quota above 1e8 is not unlimited.
-			return 200, []byte(`{"object":"billing_subscription","has_payment_method":true,"hard_limit_usd":160000000}`), nil
-		case "https://tokens.example/v1/dashboard/billing/usage?start_date=2026-10-01&end_date=2026-10-19":
-			return 200, []byte(`{"object":"list","total_usage":1000000000}`), nil
-		}
-		return 404, []byte("not found"), nil
-	}
-	credentials := map[string]Credential{
-		indexA:    {BaseURL: "https://sub.example/v1/", APIKey: key},
-		indexB:    {BaseURL: "https://bill.example", APIKey: " " + key + " "},
-		indexC:    {BaseURL: "https://err.example/v1", APIKey: key},
-		unlimited: {BaseURL: "https://unlimited.example/v1", APIKey: key},
-		tokens:    {BaseURL: "https://tokens.example/v1", APIKey: key},
-	}
-	r := newTestRegistry(t, Options{
-		MetaPath: filepath.Join(t.TempDir(), "channels.json"),
-		Location: loc,
-		Now:      fixedNow(time.Date(2026, 10, 19, 9, 0, 0, 0, loc)),
-		HTTPDo:   httpDo,
-		Credentials: func(index string) (Credential, bool) {
-			credential, ok := credentials[index]
-			return credential, ok
-		},
-	})
-	for index, kind := range map[string]string{indexA: BalanceSub2API, indexB: BalanceOpenAIBilling, indexC: BalanceOpenAIBilling, unlimited: BalanceOpenAIBilling, tokens: BalanceOpenAIBilling, missing: BalanceSub2API} {
-		if _, err := r.UpdateMeta(MetaPatch{AuthIndex: index, Balance: &BalanceSource{Kind: kind, ThresholdUSD: 5}}); err != nil {
-			t.Fatal(err)
-		}
-	}
-	for _, tc := range []struct {
-		name, index string
-		remaining   float64
-		low         bool
-		// unit is "" for openai_billing: the site's display unit is unknown.
-		unit    string
-		failure string
-	}{
-		{"sub2api", indexA, 4.5, true, "USD", ""},
-		{"openai billing", indexB, 10, false, "", ""},
-		{"openai billing in raw quota", tokens, 150000000, false, "", ""},
-		{"error object in a 200 answer", indexC, 0, false, "", "GET /v1/dashboard/billing/subscription: HTTP 200: upstream error: token [redacted] has expired"},
-		{"token with unlimited quota", unlimited, 0, false, "", "GET /v1/dashboard/billing/subscription: HTTP 200: the key has unlimited quota on this site, so the account balance cannot be read with it"},
-		{"credential missing from CPA's config", missing, 0, false, "", "credential not found in CPA's config"},
-	} {
-		state, err := r.RefreshBalance(context.Background(), tc.index)
-		if err != nil || state.Error != tc.failure || state.Remaining != tc.remaining || state.Low != tc.low || state.Unit != tc.unit || state.At.IsZero() {
-			t.Errorf("%s: state %+v err %v", tc.name, state, err)
-		}
-	}
-
-	// A failed query names the status, keeps the last reading and never
-	// shows the key, even when the upstream echoes it.
-	failSub2API = true
-	state, err := r.RefreshBalance(context.Background(), indexA)
-	if err != nil || !strings.Contains(state.Error, "GET /v1/usage: HTTP 401") || strings.Contains(state.Error, key) || state.Remaining != 4.5 || !state.Low {
-		t.Fatalf("failed refresh = %+v, %v", state, err)
-	}
-	if _, err := r.UpdateMeta(MetaPatch{AuthIndex: unpriced, Vendor: ptr("x")}); err != nil {
+// Files of 0.21.0 and earlier may hold cost_ratio and balance: they load, an
+// entry that held nothing else is dropped, and the next write leaves both out.
+func TestLegacyCostAndBalanceFieldsAreIgnored(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "channels.json")
+	legacy := `{"version":1,"channels":[` +
+		`{"auth_index":"` + indexA + `","cost_ratio":0.5,"balance":{"kind":"sub2api","threshold_usd":5}},` +
+		`{"auth_index":"` + indexB + `","vendor":"beta","cost_ratio":2}]}`
+	if err := os.WriteFile(path, []byte(legacy), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := r.RefreshBalance(context.Background(), unpriced); !errors.Is(err, ErrNoBalanceSource) {
-		t.Fatalf("refresh without a source err = %v", err)
+	r := newTestRegistry(t, Options{MetaPath: path})
+	views := r.List()
+	if len(views) != 1 || views[0].AuthIndex != indexB || views[0].Meta.Vendor != "beta" {
+		t.Fatalf("views = %+v, want only %s with its vendor", views, indexB)
 	}
-	if _, err := r.RefreshBalance(context.Background(), "nope"); !errors.Is(err, ErrInvalid) {
-		t.Fatalf("refresh of a malformed index err = %v", err)
+	if _, err := r.UpdateMeta(MetaPatch{AuthIndex: indexB, Note: ptr("kept")}); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil || strings.Contains(string(raw), "cost_ratio") || strings.Contains(string(raw), "balance") || strings.Contains(string(raw), indexA) {
+		t.Fatalf("rewritten file = %s (%v)", raw, err)
+	}
+}
+
+// Delete forgets metadata and statistics at once: a reload from the files
+// does not bring the channel back, while other channels are untouched.
+func TestDeleteForgetsMetadataAndStatistics(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Date(2026, 10, 20, 8, 0, 0, 0, time.UTC)
+	writable := true
+	opts := Options{MetaPath: filepath.Join(dir, "channels.json"), StatsPath: filepath.Join(dir, "stats.json"), Now: fixedNow(now), CanWrite: func() bool { return writable }}
+	r := newTestRegistry(t, opts)
+	if _, err := r.UpdateMeta(MetaPatch{AuthIndex: indexA, Vendor: ptr("gone")}); err != nil {
+		t.Fatal(err)
+	}
+	r.Observe(Observation{AuthIndex: indexA, At: now.Add(-time.Hour)})
+	r.Observe(Observation{AuthIndex: indexB, At: now.Add(-time.Hour)})
+	if err := r.FlushStats(); err != nil {
+		t.Fatal(err)
 	}
 
-	calls = nil
-	canceled, cancel := context.WithCancel(context.Background())
-	cancel()
-	if r.RefreshBalances(canceled); len(calls) != 0 {
-		t.Fatalf("canceled refresh queried %v", calls)
+	writable = false
+	if _, err := r.Delete(indexA); !errors.Is(err, ErrReadOnly) {
+		t.Fatalf("read-only delete err = %v", err)
 	}
-	failSub2API = false
-	// One request for sub2api, two for each billing site, one each for the
-	// error object and the unlimited token; the missing credential needs none.
-	if r.RefreshBalances(context.Background()); len(calls) != 7 {
-		t.Fatalf("refresh queried %v", calls)
+	writable = true
+	if _, err := r.Delete("abc"); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("malformed auth_index err = %v", err)
 	}
-	for _, view := range r.List() {
-		if view.AuthIndex == indexA && (view.Balance == nil || view.Balance.Error != "" || view.Balance.Remaining != 4.5) {
-			t.Fatalf("listed balance = %+v", view.Balance)
+	if found, err := r.Delete(strings.ToUpper(indexA)); err != nil || !found {
+		t.Fatalf("delete = %v, %v", found, err)
+	}
+	if found, err := r.Delete(indexA); err != nil || found {
+		t.Fatalf("second delete = %v, %v", found, err)
+	}
+	for label, registry := range map[string]*Registry{"memory": r, "reloaded": newTestRegistry(t, opts)} {
+		views := registry.List()
+		if len(views) != 1 || views[0].AuthIndex != indexB {
+			t.Fatalf("%s views = %+v, want only %s", label, views, indexB)
 		}
 	}
 }
 
-func TestRefreshBalanceUsesTheCredentialsProxy(t *testing.T) {
-	const usage = `{"mode":"unrestricted","isValid":true,"remaining":3,"unit":"USD"}`
-	var mu sync.Mutex
-	var proxied, direct []string
-	record := func(into *[]string, answer string) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
-			mu.Lock()
-			*into = append(*into, request.URL.String())
-			mu.Unlock()
-			_, _ = w.Write([]byte(answer))
-		})
-	}
-	proxy := httptest.NewServer(record(&proxied, usage))
-	defer proxy.Close()
-	target := httptest.NewServer(record(&direct, usage))
-	defer target.Close()
-	const invalid, unsupported = "00000000000000d0", "00000000000000e0"
-	credentials := map[string]Credential{
-		// The host does not resolve: only the proxy can answer for it.
-		indexA:      {BaseURL: "http://sub.proxied.example/v1", APIKey: "k", ProxyURL: proxy.URL},
-		indexB:      {BaseURL: target.URL, APIKey: "k", ProxyURL: "DIRECT"},
-		indexC:      {BaseURL: target.URL, APIKey: "k", ProxyURL: "none"},
-		invalid:     {BaseURL: target.URL, APIKey: "k", ProxyURL: "http://user:secret-pass@[bad"},
-		unsupported: {BaseURL: target.URL, APIKey: "k", ProxyURL: "ftp://user:secret-pass@p.example"},
-	}
-	r := newTestRegistry(t, Options{
-		MetaPath: filepath.Join(t.TempDir(), "channels.json"),
-		Credentials: func(index string) (Credential, bool) {
-			credential, ok := credentials[index]
-			return credential, ok
-		},
-	})
-	for index := range credentials {
-		if _, err := r.UpdateMeta(MetaPatch{AuthIndex: index, Balance: &BalanceSource{Kind: BalanceSub2API}}); err != nil {
-			t.Fatal(err)
-		}
-	}
-	for _, index := range []string{indexA, indexB, indexC} {
-		if state, err := r.RefreshBalance(context.Background(), index); err != nil || state.Error != "" || state.Remaining != 3 {
-			t.Fatalf("%s: state %+v err %v", index, state, err)
-		}
-	}
-	if !reflect.DeepEqual(proxied, []string{"http://sub.proxied.example/v1/usage"}) || !reflect.DeepEqual(direct, []string{"/v1/usage", "/v1/usage"}) {
-		t.Fatalf("through the proxy %v, direct %v", proxied, direct)
-	}
-	for _, index := range []string{invalid, unsupported} {
-		state, err := r.RefreshBalance(context.Background(), index)
-		if err != nil || !strings.Contains(state.Error, "proxy-url CPA's config gives this credential") || strings.Contains(state.Error, "secret-pass") {
-			t.Errorf("%s: state %+v err %v", index, state, err)
-		}
-	}
-	if len(proxied) != 1 || len(direct) != 2 {
-		t.Fatalf("a rejected proxy-url sent a request: proxied %v, direct %v", proxied, direct)
-	}
-
-	// As in CPA, the hop to an https proxy offers only HTTP/1.1: a proxy that
-	// picks h2 cannot take the HTTP/1.1 CONNECT that follows. The client
-	// rejects the test certificate afterwards; the offer is recorded first.
-	var offered [][]string
-	tlsProxy := httptest.NewUnstartedServer(http.NotFoundHandler())
-	tlsProxy.TLS = &tls.Config{NextProtos: []string{"h2", "http/1.1"}, GetConfigForClient: func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
-		mu.Lock()
-		offered = append(offered, hello.SupportedProtos)
-		mu.Unlock()
-		return nil, nil
-	}}
-	tlsProxy.Config.ErrorLog = log.New(io.Discard, "", 0)
-	tlsProxy.StartTLS()
-	defer tlsProxy.Close()
-	const viaHTTPSProxy = "00000000000000f0"
-	credentials[viaHTTPSProxy] = Credential{BaseURL: "https://sub.proxied.example/v1", APIKey: "k", ProxyURL: tlsProxy.URL}
-	if _, err := r.UpdateMeta(MetaPatch{AuthIndex: viaHTTPSProxy, Balance: &BalanceSource{Kind: BalanceSub2API}}); err != nil {
-		t.Fatal(err)
-	}
-	if state, err := r.RefreshBalance(context.Background(), viaHTTPSProxy); err != nil || state.Error == "" {
-		t.Fatalf("through the untrusted https proxy: state %+v err %v", state, err)
-	}
-	mu.Lock()
-	defer mu.Unlock()
-	if !reflect.DeepEqual(offered, [][]string{{"http/1.1"}}) {
-		t.Fatalf("protocols offered to the https proxy = %q, want only http/1.1", offered)
-	}
-}
-
-// The expected IDs and providers are what CPA v8.0.13's config synthesizer
-// gives these configs; the global proxy-url is not part of an ID.
 func TestReadCPAConfigDerivesCPAAuthIndexes(t *testing.T) {
 	type credential struct{ kind, prefix, baseURL, apiKey, id, provider, group, proxyURL string }
 	for _, tc := range []struct {

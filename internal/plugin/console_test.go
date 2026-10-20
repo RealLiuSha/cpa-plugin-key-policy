@@ -138,6 +138,53 @@ func TestUsageFeedsChannelStatistics(t *testing.T) {
 	}
 }
 
+// A channel CPA's config no longer has can be deleted with its adapter
+// rules; one still configured is refused, since traffic would bring it back.
+func TestDeleteChannelForgetsWhatCPANoLongerHas(t *testing.T) {
+	app := newTestApp(t, appOptions{})
+	cpaConfig := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(cpaConfig, []byte("config-version: 8\napi-keys:\n  codex:\n    - name: \"codex-6\"\n      base-url: \"https://relay.example/v1\"\n      keys:\n        - api-key: \"sk-relay-1\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	reconfigure(t, app, "cpa_config_path: "+cpaConfig+"\n")
+	sum := sha256.Sum256([]byte("codex-api-key:https://relay.example/v1+sk-relay-1"))
+	configured := hex.EncodeToString(sum[:8])
+	for _, index := range []string{testChannel, configured} {
+		recordUsage(t, app, UsageHandleRequest{AuthIndex: index, Provider: "codex", Model: "gpt-5-codex", APIKey: testKeyID, Detail: UsageDetail{InputTokens: 10}})
+	}
+	managementOK(t, app, http.MethodPost, "/adapters", nil, []byte(`{"channel":"`+testChannel+`","type":"edits_image_field","enabled":true}`))
+
+	if response := managementCall(t, app, http.MethodDelete, "/channels", url.Values{"auth_index": {configured}}, nil); response.StatusCode != http.StatusConflict || errorCode(t, response) != "channel_in_cpa" {
+		t.Fatalf("delete of a configured channel = %d %s", response.StatusCode, response.Body)
+	}
+	var deleted struct {
+		Deleted     string `json:"deleted"`
+		RulesDelete int    `json:"adapter_rules_deleted"`
+	}
+	decode(t, managementOK(t, app, http.MethodDelete, "/channels", url.Values{"auth_index": {strings.ToUpper(testChannel)}}, nil), &deleted)
+	if deleted.Deleted != testChannel || deleted.RulesDelete != 1 {
+		t.Fatalf("deleted = %+v", deleted)
+	}
+	var listed struct {
+		Channels []struct {
+			AuthIndex string `json:"auth_index"`
+		} `json:"channels"`
+	}
+	decode(t, managementOK(t, app, http.MethodGet, "/channels", nil, nil), &listed)
+	if len(listed.Channels) != 1 || listed.Channels[0].AuthIndex != configured {
+		t.Fatalf("channels after delete = %+v", listed.Channels)
+	}
+	if rules := managementOK(t, app, http.MethodGet, "/adapters", nil, nil); strings.Contains(string(rules), testChannel) {
+		t.Fatalf("rules after delete = %s", rules)
+	}
+	if response := managementCall(t, app, http.MethodDelete, "/channels", url.Values{"auth_index": {testChannel}}, nil); response.StatusCode != http.StatusNotFound {
+		t.Fatalf("second delete = %d %s", response.StatusCode, response.Body)
+	}
+	if audit := managementOK(t, app, http.MethodGet, "/audit", url.Values{"action": {"delete_channel"}}, nil); !strings.Contains(string(audit), testChannel) {
+		t.Fatalf("audit = %s", audit)
+	}
+}
+
 func TestSearchRoutingFollowsTheSwitch(t *testing.T) {
 	app := newTestApp(t, appOptions{})
 	if registration := reconfigure(t, app, ""); registration.Capabilities.ModelRouter {
@@ -926,17 +973,18 @@ func TestShutdownKeepsTheJournalTailInChannelStats(t *testing.T) {
 	}
 }
 
-// Detection runs spend the credentials' quota and a clear destroys records:
-// both are audited, by test name.
+// Detection runs and inspection rounds spend the credentials' quota, and a
+// clear destroys records: they are audited, as is a schedule change.
 func TestDetectionRunsAndClearsAreAudited(t *testing.T) {
 	app := newTestApp(t, appOptions{})
 	host := newDetectionHost()
 	close(host.release) // every stream ends at once
 	app.SetHost(host)
 	managementOK(t, app, http.MethodPost, "/quality/run", nil, []byte(candyRun))
-	managementOK(t, app, http.MethodPost, "/quality/inspection", nil, []byte(`{"test":"candy","model":"gpt-5","runs":1,"include":["a"]}`))
+	managementOK(t, app, http.MethodPut, "/quality/inspection", nil, []byte(`{"times":["08:00"],"runs":1,"groups":[{"model":"gpt-5","channels":["0123456789abcdef"]}]}`))
+	managementOK(t, app, http.MethodPost, "/quality/inspection", nil, nil)
 	managementOK(t, app, http.MethodDelete, "/quality/results", url.Values{"test": {"all"}}, nil)
-	for action, target := range map[string]string{"run_quality": "candy", "start_inspection": "candy", "clear_quality": "all"} {
+	for action, target := range map[string]string{"run_quality": "candy", "update_inspection": "inspection", "start_inspection": "inspection", "clear_quality": "all"} {
 		var audit struct {
 			Events []struct {
 				Target  string                     `json:"target"`

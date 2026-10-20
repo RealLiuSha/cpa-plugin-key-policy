@@ -24,8 +24,8 @@ var (
 	settingsFields       = []string{"version", "plugin_id", "display_name", "modules", "module_errors", "hooks", "config_warnings", "files", "ui", "ownership", "health", "timezone"}
 	searchStateFields    = []string{"enabled", "declared", "settings", "status"}
 	channelViewFields    = []string{"auth_index", "meta", "last_24h", "today", "rules"}
-	channelViewOptional  = []string{"auth_id", "provider", "base_url", "balance"}
-	channelSummaryFields = []string{"attempts", "failures", "success_rate", "latency_p50_ms", "latency_p95_ms", "ttft_p50_ms", "ttft_p95_ms", "input_tokens", "output_tokens", "list_cost_usd", "upstream_cost_usd"}
+	channelViewOptional  = []string{"auth_id", "provider", "base_url"}
+	channelSummaryFields = []string{"attempts", "failures", "success_rate", "latency_p50_ms", "latency_p95_ms", "ttft_p50_ms", "ttft_p95_ms", "input_tokens", "output_tokens", "list_cost_usd"}
 )
 
 func TestConsoleResponseShapes(t *testing.T) {
@@ -40,7 +40,7 @@ func TestConsoleResponseShapes(t *testing.T) {
 		Channels []json.RawMessage `json:"channels"`
 	}
 	body := managementOK(t, app, http.MethodGet, "/channels", nil, nil)
-	assertShape(t, "GET /channels", body, []string{"channels", "groups"}, nil)
+	assertShape(t, "GET /channels", body, []string{"channels", "groups", "ids"}, nil)
 	decode(t, body, &channels)
 	if len(channels.Channels) != 1 {
 		t.Fatalf("channels = %s", body)

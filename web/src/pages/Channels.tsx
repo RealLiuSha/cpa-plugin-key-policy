@@ -3,10 +3,12 @@ import { Link, useSearchParams } from "react-router-dom";
 import { fetchChannelData, type ChannelData } from "../api/channels";
 import { extractApiError } from "../api/error";
 import { groupChannels, mergeChannels, type ChannelRow } from "../channelMerge";
+import { ALL, channelTypes, filterChannels, modelCounts, useChannelModels, type ChannelModels } from "../channelModels";
 import ChannelDetail, { DETAIL_TABS, type DetailTab } from "../components/ChannelDetail";
-import { BalanceValue, ChannelStateBadge, FailurePill } from "../components/ChannelState";
+import ChannelFilter from "../components/ChannelFilter";
+import { ChannelStateBadge, FailurePill } from "../components/ChannelState";
 import { ConfirmDialog } from "../components/Modal";
-import { formatMillis, formatPercent, formatUSD } from "../format";
+import { formatMillis, formatPercent } from "../format";
 import { useT } from "../i18n";
 import { useVisiblePolling } from "../polling";
 import { setUnsaved } from "../store/unsaved";
@@ -24,14 +26,19 @@ function successRate(row: ChannelRow): string {
   return day && day.attempts > 0 ? formatPercent(day.success_rate) : "—";
 }
 
+// The first models a channel serves; "…" while they are looked up.
+function modelsText(row: ChannelRow, models: ChannelModels | null): string {
+  if (!row.authIndex) return "—";
+  const served = models?.get(row.authIndex);
+  if (!served) return models ? "—" : "…";
+  if (served.length === 0) return "—";
+  return served.length > 2 ? `${served.slice(0, 2).join(", ")} +${served.length - 2}` : served.join(", ");
+}
+
 // Latencies of a window without attempts are not measurements.
 function latency(row: ChannelRow, field: "latency_p50_ms" | "ttft_p50_ms"): string {
   const day = row.view?.last_24h;
   return day && day.attempts > 0 ? formatMillis(day[field]) : "—";
-}
-
-function upstreamToday(row: ChannelRow): string {
-  return (row.view?.meta.cost_ratio ?? 0) > 0 ? formatUSD(row.view!.today.upstream_cost_usd) : "—";
 }
 
 function ChannelName({ row, search, onOpen }: { row: ChannelRow; search: (authIndex: string) => string; onOpen: (event: React.MouseEvent, authIndex: string) => void }) {
@@ -54,6 +61,8 @@ export default function Channels() {
   const [params, setParams] = useSearchParams();
   const selected = params.get("auth_index") ?? "";
   const tab: DetailTab = DETAIL_TABS.find((value) => value === params.get("tab")) ?? "overview";
+  const typeFilter = params.get("type") ?? ALL;
+  const modelFilter = params.get("model") ?? ALL;
   const [data, setData] = useState<ChannelData | null>(null);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
@@ -94,19 +103,34 @@ export default function Channels() {
     channels: data.channels,
     cpaListed: data.cpa !== null,
   }) : [], [data]);
-  const groups = useMemo(() => groupChannels(rows), [rows]);
+  const models = useChannelModels(rows, data?.ids ?? {});
+  const shown = useMemo(() => filterChannels(rows, typeFilter, modelFilter, models), [rows, typeFilter, modelFilter, models]);
+  const groups = useMemo(() => groupChannels(shown), [shown]);
   const selectedRow = selected ? rows.find((row) => row.authIndex === selected) ?? (data ? placeholderRow(selected) : undefined) : undefined;
 
-  // The selection and tab live in the URL: the back button closes the
-  // detail on phones and other pages can link to a channel.
+  // The selection, tab and filters live in the URL: the back button closes
+  // the detail on phones and other pages can link to a channel.
+  const filters = () => {
+    const next = new URLSearchParams();
+    if (typeFilter !== ALL) next.set("type", typeFilter);
+    if (modelFilter !== ALL) next.set("model", modelFilter);
+    return next;
+  };
   const search = (authIndex: string, nextTab: DetailTab = tab) => {
-    const next = new URLSearchParams({ auth_index: authIndex });
+    const next = filters();
+    next.set("auth_index", authIndex);
     if (nextTab !== "overview") next.set("tab", nextTab);
     return `?${next}`;
   };
   const leave = (target: string) => {
     if (dirty) setLeaving(target);
     else setParams(new URLSearchParams(target));
+  };
+  const setFilter = (name: "type" | "model", value: string) => {
+    const next = new URLSearchParams(params);
+    if (value === ALL) next.delete(name);
+    else next.set(name, value);
+    setParams(next, { replace: true });
   };
   const open = (event: React.MouseEvent, authIndex: string) => {
     if (!dirty || authIndex === selected) return;
@@ -131,9 +155,26 @@ export default function Channels() {
       {data && data.cpa === null && <p className="notice" role="status">{t("channels.cpaFailed", { error: extractApiError(data.cpaError, t("channels.cpaFailedUnknown")) })}</p>}
       <div className={"channels-layout" + (selectedRow ? " has-detail" : "")}>
         <div className="channel-list">
-          {data && <div className="key-list-context"><span>{t("channels.count", { total: rows.length, groups: groups.length })}</span><span>{lastUpdated ? t("keys.lastUpdated", { time: lastUpdated.toLocaleTimeString() }) : ""}</span></div>}
+          {data && rows.length > 0 && (
+            <ChannelFilter
+              types={channelTypes(rows)}
+              type={typeFilter}
+              models={models && modelCounts(filterChannels(rows, typeFilter, ALL, models).map((row) => row.authIndex), models)}
+              model={modelFilter}
+              onType={(value) => setFilter("type", value)}
+              onModel={(value) => setFilter("model", value)}
+            />
+          )}
+          {data && (
+            <div className="key-list-context">
+              <span>{shown.length === rows.length ? t("channels.count", { total: rows.length, groups: groups.length }) : t("channels.countFiltered", { shown: shown.length, total: rows.length })}</span>
+              <span>{lastUpdated ? t("keys.lastUpdated", { time: lastUpdated.toLocaleTimeString() }) : ""}</span>
+            </div>
+          )}
           {!data ? (loading && <div className="card muted" role="status">{t("keys.loading")}</div>) : rows.length === 0 ? (
             <div className="empty-state">{t("channels.empty")}</div>
+          ) : shown.length === 0 ? (
+            <div className="empty-state">{t("channels.filteredEmpty")}</div>
           ) : groups.map((group) => (
             <section key={group.vendor || "-"} className="channel-group" aria-label={group.vendor || t("channels.noVendor")}>
               <h2 className="usage-section-title">{group.vendor || t("channels.noVendor")} <span className="muted">· {group.rows.length}</span></h2>
@@ -143,13 +184,12 @@ export default function Channels() {
                     <tr>
                       <th>{t("channels.col.name")}</th>
                       <th>{t("channels.col.type")}</th>
+                      <th>{t("channels.col.models")}</th>
                       <th>{t("channels.col.status")}</th>
                       <th className="num">{t("channels.col.success")}</th>
                       <th className="num">{t("channels.col.latency")}</th>
                       <th className="num">{t("channels.col.ttft")}</th>
-                      <th className="num">{t("channels.col.upstreamToday")}</th>
                       <th className="num">{t("channels.col.rules")}</th>
-                      <th className="num">{t("channels.col.balance")}</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -157,13 +197,12 @@ export default function Channels() {
                       <tr key={row.key} className={row.authIndex && row.authIndex === selected ? "selected" : ""} aria-current={row.authIndex && row.authIndex === selected ? "true" : undefined}>
                         <td className="channel-name-cell"><ChannelName row={row} search={search} onOpen={open} /></td>
                         <td><span className="mono">{row.provider || "—"}</span> <OriginBadge row={row} /></td>
+                        <td className="mono channel-models" title={models?.get(row.authIndex)?.join("\n")}>{modelsText(row, models)}</td>
                         <td><div className="channel-badges"><ChannelStateBadge row={row} /><FailurePill summary={row.view?.last_24h} /></div></td>
                         <td className="num mono">{successRate(row)}</td>
                         <td className="num mono">{latency(row, "latency_p50_ms")}</td>
                         <td className="num mono">{latency(row, "ttft_p50_ms")}</td>
-                        <td className="num mono">{upstreamToday(row)}</td>
                         <td className="num mono">{row.view?.rules || "—"}</td>
-                        <td className="num"><BalanceValue balance={row.view?.balance} /></td>
                       </tr>
                     ))}
                   </tbody>
@@ -175,12 +214,11 @@ export default function Channels() {
                     <div className="channel-card-head"><ChannelName row={row} search={search} onOpen={open} /><OriginBadge row={row} /></div>
                     <div className="channel-badges"><ChannelStateBadge row={row} /><FailurePill summary={row.view?.last_24h} /></div>
                     <dl className="channel-card-facts">
+                      <div><dt>{t("channels.col.models")}</dt><dd className="mono">{modelsText(row, models)}</dd></div>
                       <div><dt>{t("channels.col.success")}</dt><dd className="mono">{successRate(row)}</dd></div>
                       <div><dt>{t("channels.col.latency")}</dt><dd className="mono">{latency(row, "latency_p50_ms")}</dd></div>
                       <div><dt>{t("channels.col.ttft")}</dt><dd className="mono">{latency(row, "ttft_p50_ms")}</dd></div>
-                      {(row.view?.meta.cost_ratio ?? 0) > 0 && <div><dt>{t("channels.col.upstreamToday")}</dt><dd className="mono">{upstreamToday(row)}</dd></div>}
                       {(row.view?.rules ?? 0) > 0 && <div><dt>{t("channels.col.rules")}</dt><dd className="mono">{row.view!.rules}</dd></div>}
-                      {row.view?.balance && <div><dt>{t("channels.col.balance")}</dt><dd><BalanceValue balance={row.view.balance} /></dd></div>}
                     </dl>
                   </article>
                 ))}
@@ -194,8 +232,9 @@ export default function Channels() {
             row={selectedRow}
             tab={tab}
             onTab={(next) => setParams(new URLSearchParams(search(selectedRow.authIndex, next).slice(1)), { replace: true })}
-            onClose={() => leave("")}
+            onClose={() => leave(`?${filters()}`)}
             onChanged={() => void load()}
+            onDeleted={() => { setDirty(false); setParams(filters(), { replace: true }); void load(); }}
             onDirty={setDirty}
           />
         )}

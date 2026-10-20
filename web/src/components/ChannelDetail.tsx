@@ -1,21 +1,20 @@
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
-import { fetchChannelDetail, patchChannel, refreshChannelBalance } from "../api/channels";
+import { deleteChannel, fetchChannelDetail, patchChannel } from "../api/channels";
 import { apiErrorCode, extractApiError } from "../api/error";
 import type { ChannelRow } from "../channelMerge";
 import { copyText } from "../clipboard";
 import { formatCount, formatDateTime, formatMillis, formatPercent, formatUSD, timeValue } from "../format";
 import { useT } from "../i18n";
-import type { BalanceKind, ChannelBalance, ChannelDetail as Detail, ChannelMeta, ChannelPatch, ChannelSummary } from "../types";
+import type { ChannelDetail as Detail, ChannelMeta, ChannelSummary } from "../types";
 import ChannelAdapters from "./ChannelAdapters";
-import { BalanceValue, ChannelStateBadge, FailurePill } from "./ChannelState";
+import { ChannelStateBadge, FailurePill } from "./ChannelState";
 import HourlyChart from "./HourlyChart";
+import { ConfirmDialog } from "./Modal";
 
 type Translate = ReturnType<typeof useT>;
 
-export const DETAIL_TABS = ["overview", "adapters", "cost", "notes"] as const;
+export const DETAIL_TABS = ["overview", "adapters", "notes"] as const;
 export type DetailTab = (typeof DETAIL_TABS)[number];
-
-const BALANCE_KINDS: BalanceKind[] = ["", "sub2api", "openai_billing"];
 
 function statusCodes(summary: ChannelSummary): string {
   return Object.entries(summary.status_codes ?? {}).sort(([a], [b]) => a.localeCompare(b)).map(([code, n]) => `${code} ×${n}`).join(", ");
@@ -46,7 +45,7 @@ export function feedbackReport(name: string, baseUrl: string, detail: Detail, t:
   return lines.join("\n");
 }
 
-function SummaryTable({ detail, costs }: { detail: Detail; costs: boolean }) {
+function SummaryTable({ detail }: { detail: Detail }) {
   const t = useT();
   const rows: [string, (s: ChannelSummary) => string][] = [
     ["channels.summary.attempts", (s) => formatCount(s.attempts)],
@@ -57,7 +56,6 @@ function SummaryTable({ detail, costs }: { detail: Detail; costs: boolean }) {
     ["channels.summary.tokens", (s) => `${formatCount(s.input_tokens)} / ${formatCount(s.output_tokens)}`],
     ["channels.summary.listCost", (s) => formatUSD(s.list_cost_usd)],
   ];
-  if (costs) rows.push(["channels.summary.upstreamCost", (s) => formatUSD(s.upstream_cost_usd)]);
   return (
     <div className="table-scroll">
       <table className="channel-summary">
@@ -104,10 +102,50 @@ function CpaFacts({ row }: { row: ChannelRow }) {
   );
 }
 
-function OverviewTab({ row, detail, missing }: { row: ChannelRow; detail: Detail | null; missing: boolean }) {
+// A channel CPA no longer lists keeps the plugin's records until they age
+// out; this forgets them now, with the adapter rules bound to it.
+function DeleteChannel({ authIndex, onDeleted }: { authIndex: string; onDeleted: () => void }) {
+  const t = useT();
+  const [confirming, setConfirming] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const remove = async () => {
+    setBusy(true);
+    setError("");
+    try {
+      await deleteChannel(authIndex);
+      setConfirming(false);
+      onDeleted();
+    } catch (reason) {
+      setConfirming(false);
+      setError(extractApiError(reason, t("channels.delete.failed")));
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <section className="detail-section">
+      <p className="field-hint">{t("channels.delete.hint")}</p>
+      <button type="button" className="btn sm danger" disabled={busy} onClick={() => setConfirming(true)}>{t("channels.delete.button")}</button>
+      {error && <p className="error" role="alert">{error}</p>}
+      {confirming && (
+        <ConfirmDialog
+          title={t("channels.delete.title")}
+          message={t("channels.delete.message")}
+          cancelLabel={t("channels.delete.cancel")}
+          confirmLabel={t("channels.delete.confirm")}
+          busy={busy}
+          onCancel={() => setConfirming(false)}
+          onConfirm={() => void remove()}
+        />
+      )}
+    </section>
+  );
+}
+
+function OverviewTab({ row, detail, missing, onDeleted }: { row: ChannelRow; detail: Detail | null; missing: boolean; onDeleted: () => void }) {
   const t = useT();
   const [copy, setCopy] = useState<{ ok: boolean; text: string } | null>(null);
-  const costs = (detail?.meta.cost_ratio ?? 0) > 0;
   const copyFeedback = async () => {
     if (!detail) return;
     const text = feedbackReport(row.name, row.baseUrl, detail, t);
@@ -116,11 +154,12 @@ function OverviewTab({ row, detail, missing }: { row: ChannelRow; detail: Detail
   return (
     <>
       <CpaFacts row={row} />
+      {row.origin === "plugin" && row.state === "missing" && <DeleteChannel authIndex={row.authIndex} onDeleted={onDeleted} />}
       {missing ? <div className="empty-state">{t("channels.noUsage")}</div> : detail && (
         <>
           <section className="detail-section">
             <h3>{t("channels.summaryTitle")}</h3>
-            <SummaryTable detail={detail} costs={costs} />
+            <SummaryTable detail={detail} />
           </section>
           <section className="detail-section">
             <h3>{t("channels.hoursTitle")}</h3>
@@ -155,86 +194,6 @@ function OverviewTab({ row, detail, missing }: { row: ChannelRow; detail: Detail
         </>
       )}
     </>
-  );
-}
-
-function CostTab({ authIndex, meta, balance, onSaved, onRefreshed, onDirty }: { authIndex: string; meta: ChannelMeta; balance: ChannelBalance | null; onSaved: (meta: ChannelMeta) => void; onRefreshed: () => void; onDirty: (dirty: boolean) => void }) {
-  const t = useT();
-  const ids = useId();
-  const [ratio, setRatio] = useState(String(meta.cost_ratio ?? 0));
-  const [kind, setKind] = useState<BalanceKind>(meta.balance?.kind ?? "");
-  const [threshold, setThreshold] = useState(String(meta.balance?.threshold_usd ?? 0));
-  // The fields as loaded or last saved, compared as typed: "0.50" saved as
-  // 0.5 is not a change.
-  const [baseline, setBaseline] = useState({ ratio, kind, threshold });
-  const [current, setCurrent] = useState<ChannelBalance | null>(balance);
-  const [message, setMessage] = useState<{ ok: boolean; text: string } | null>(null);
-  const [busy, setBusy] = useState(false);
-  const savedKind = meta.balance?.kind ?? "";
-  const dirty = ratio !== baseline.ratio || kind !== baseline.kind || threshold !== baseline.threshold;
-
-  useEffect(() => setCurrent(balance), [balance]);
-  useEffect(() => onDirty(dirty), [dirty, onDirty]);
-
-  const save = async (event: React.FormEvent) => {
-    event.preventDefault();
-    const costRatio = Number(ratio);
-    const thresholdUSD = Number(threshold);
-    if (!Number.isFinite(costRatio) || costRatio < 0 || costRatio > 10) return setMessage({ ok: false, text: t("channels.cost.ratioInvalid") });
-    if (!Number.isFinite(thresholdUSD) || thresholdUSD < 0) return setMessage({ ok: false, text: t("channels.cost.thresholdInvalid") });
-    setBusy(true);
-    setMessage(null);
-    try {
-      const patch: ChannelPatch = { auth_index: authIndex, cost_ratio: costRatio, balance: { kind, threshold_usd: thresholdUSD } };
-      onSaved(await patchChannel(patch));
-      setBaseline({ ratio, kind, threshold });
-      setMessage({ ok: true, text: t("channels.saved") });
-    } catch (reason) {
-      setMessage({ ok: false, text: extractApiError(reason, t("channels.saveFailed")) });
-    } finally {
-      setBusy(false);
-    }
-  };
-  const refresh = async () => {
-    setBusy(true);
-    setMessage(null);
-    try {
-      setCurrent(await refreshChannelBalance(authIndex));
-      onRefreshed();
-    } catch (reason) {
-      setMessage({ ok: false, text: extractApiError(reason, t("channels.cost.refreshFailed")) });
-    } finally {
-      setBusy(false);
-    }
-  };
-  return (
-    <form className="detail-form" onSubmit={(event) => void save(event)}>
-      <label htmlFor={`${ids}-ratio`} className="field-label">{t("channels.cost.ratio")}</label>
-      <input id={`${ids}-ratio`} className="input" type="number" min={0} max={10} step="any" inputMode="decimal" value={ratio} onChange={(event) => setRatio(event.target.value)} />
-      <p className="field-hint">{t("channels.cost.ratioHint")}</p>
-      <label htmlFor={`${ids}-kind`} className="field-label">{t("channels.cost.source")}</label>
-      <select id={`${ids}-kind`} className="input" value={kind} onChange={(event) => setKind(event.target.value as BalanceKind)}>
-        {BALANCE_KINDS.map((value) => <option key={value || "none"} value={value}>{t(`channels.cost.kind.${value || "none"}`)}</option>)}
-      </select>
-      <p className="field-hint">{t(`channels.cost.kindHint.${kind || "none"}`)}</p>
-      {kind && (
-        <>
-          <label htmlFor={`${ids}-threshold`} className="field-label">{t("channels.cost.threshold")}</label>
-          <input id={`${ids}-threshold`} className="input" type="number" min={0} step="any" inputMode="decimal" value={threshold} onChange={(event) => setThreshold(event.target.value)} />
-          <p className="field-hint">{t("channels.cost.thresholdHint")}</p>
-        </>
-      )}
-      <div className="detail-section">
-        <h3>{t("channels.cost.current")}</h3>
-        <p><BalanceValue balance={current} />{current?.at && <span className="muted"> · {t("channels.balanceAt", { time: formatDateTime(current.at) })}</span>}</p>
-        {current?.error && <p className="error">{current.error}</p>}
-        {savedKind ? (
-          <button type="button" className="btn sm" disabled={busy} onClick={() => void refresh()}>{t("channels.cost.refresh")}</button>
-        ) : <p className="field-hint">{t("channels.cost.noSource")}</p>}
-      </div>
-      {message && <div className={message.ok ? "success" : "error"} role={message.ok ? "status" : "alert"}>{message.text}</div>}
-      <div className="form-actions"><button type="submit" className="btn primary" disabled={busy}>{t(busy ? "keyForm.submitting" : "channels.save")}</button></div>
-    </form>
   );
 }
 
@@ -279,17 +238,17 @@ function NotesTab({ authIndex, meta, onSaved, onDirty }: { authIndex: string; me
   );
 }
 
-// One channel: an overview of its health, its adapter rules, cost and
-// balance settings, and notes. A desktop side panel; a full view on phones.
+// One channel: an overview of its health, its adapter rules and notes. A desktop side panel; a full view on phones.
 // The parent keys it by channel, so a new channel starts from scratch. A tab
 // stays mounted once opened, so switching tabs keeps what was typed and not
 // saved; onDirty tells the parent whether any tab holds such changes.
-export default function ChannelDetail({ row, tab, onTab, onClose, onChanged, onDirty }: {
+export default function ChannelDetail({ row, tab, onTab, onClose, onChanged, onDeleted, onDirty }: {
   row: ChannelRow;
   tab: DetailTab;
   onTab: (tab: DetailTab) => void;
   onClose: () => void;
   onChanged: () => void;
+  onDeleted: () => void;
   onDirty: (dirty: boolean) => void;
 }) {
   const t = useT();
@@ -366,9 +325,8 @@ export default function ChannelDetail({ row, tab, onTab, onClose, onChanged, onD
               <button type="button" className="btn sm" onClick={() => void load()}>{t("stats.retry")}</button>
             </div>
           )}
-          {value === "overview" && (detail || missing || error ? <OverviewTab row={row} detail={detail} missing={missing} /> : <div className="muted" role="status">{t("keys.loading")}</div>)}
+          {value === "overview" && (detail || missing || error ? <OverviewTab row={row} detail={detail} missing={missing} onDeleted={onDeleted} /> : <div className="muted" role="status">{t("keys.loading")}</div>)}
           {value === "adapters" && <ChannelAdapters channel={authIndex} onChanged={onChanged} onDirty={reportDirty.adapters} />}
-          {value === "cost" && <CostTab authIndex={authIndex} meta={meta} balance={detail?.balance ?? row.view?.balance ?? null} onSaved={saved} onRefreshed={onChanged} onDirty={reportDirty.cost} />}
           {value === "notes" && <NotesTab authIndex={authIndex} meta={meta} onSaved={saved} onDirty={reportDirty.notes} />}
         </div>
       ))}

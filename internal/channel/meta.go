@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"maps"
-	"math"
 	"os"
 	"sort"
 	"strings"
@@ -17,7 +16,6 @@ import (
 const (
 	metaFileVersion = 1
 	maxTextLength   = 200
-	maxCostRatio    = 10
 )
 
 // metaFile is the metadata file: {"version":1,"channels":[Meta...]}.
@@ -53,6 +51,12 @@ func loadMeta(path string) (map[string]Meta, error) {
 		if _, duplicate := metas[meta.AuthIndex]; duplicate {
 			return nil, fmt.Errorf("channel metadata %s: duplicate auth_index %s", path, meta.AuthIndex)
 		}
+		// An entry that only held the cost ratio or balance source of 0.21.0
+		// and earlier records nothing now; keeping it would pin the channel
+		// to the list after its statistics expire.
+		if meta.blank() {
+			continue
+		}
 		metas[meta.AuthIndex] = meta
 	}
 	return metas, nil
@@ -74,29 +78,17 @@ func normalizeMeta(m Meta) (Meta, error) {
 			return Meta{}, invalidf("%s must be at most %d characters", field.name, maxTextLength)
 		}
 	}
-	if math.IsNaN(m.CostRatio) || m.CostRatio < 0 || m.CostRatio > maxCostRatio {
-		return Meta{}, invalidf("cost_ratio must be between 0 and %d", maxCostRatio)
-	}
-	m.Balance.Kind = strings.ToLower(strings.TrimSpace(m.Balance.Kind))
-	switch m.Balance.Kind {
-	case "", BalanceSub2API, BalanceOpenAIBilling:
-	default:
-		return Meta{}, invalidf("balance.kind must be empty, %s or %s", BalanceSub2API, BalanceOpenAIBilling)
-	}
-	if math.IsNaN(m.Balance.ThresholdUSD) || math.IsInf(m.Balance.ThresholdUSD, 0) || m.Balance.ThresholdUSD < 0 {
-		return Meta{}, invalidf("balance.threshold_usd must be a number of at least 0")
-	}
 	return m, nil
 }
 
 // blank reports whether nothing beyond the auth_index is recorded.
 func (m Meta) blank() bool {
-	return m.DisplayName == "" && m.Vendor == "" && m.Note == "" && m.CostRatio == 0 && m.Balance == BalanceSource{}
+	return m.DisplayName == "" && m.Vendor == "" && m.Note == ""
 }
 
 // UpdateMeta applies a patch, validates it (auth_index 16 hex characters in
-// any case, cost ratio in [0, 10], threshold >= 0, known balance kind, text
-// fields trimmed and at most 200 characters) and persists the metadata.
+// any case, text fields trimmed and at most 200 characters) and persists the
+// metadata.
 // Invalid input wraps ErrInvalid. While CanWrite reports false it returns
 // ErrReadOnly; a failed write wraps ErrPersist. Either way the metadata in
 // memory is unchanged. A patch that leaves every field empty removes the
@@ -120,12 +112,6 @@ func (r *Registry) UpdateMeta(p MetaPatch) (Meta, error) {
 	if p.Note != nil {
 		next.Note = *p.Note
 	}
-	if p.CostRatio != nil {
-		next.CostRatio = *p.CostRatio
-	}
-	if p.Balance != nil {
-		next.Balance = *p.Balance
-	}
 	if next, err = normalizeMeta(next); err != nil {
 		return Meta{}, err
 	}
@@ -148,12 +134,6 @@ func (r *Registry) UpdateMeta(p MetaPatch) (Meta, error) {
 	r.metaMu.Lock()
 	r.metas = metas
 	r.metaMu.Unlock()
-	if current.Balance.Kind != next.Balance.Kind {
-		// A reading from another source no longer describes this channel.
-		r.balanceMu.Lock()
-		delete(r.balances, index)
-		r.balanceMu.Unlock()
-	}
 	return next, nil
 }
 

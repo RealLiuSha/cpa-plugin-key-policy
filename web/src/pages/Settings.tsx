@@ -88,7 +88,6 @@ export default function Settings() {
               </div>
               <div><dt><Link to="/channels">{t("overview.moduleAdapters")}</Link></dt><dd>{modules.adapters ? t("overview.adapterCount", { rules: modules.adapters.rules, enabled: modules.adapters.enabled_rules }) : t("overview.moduleUnavailable")}</dd></div>
               <div><dt><Link to="/channels">{t("settings.moduleChannels")}</Link></dt><dd>{modules.channels ? t("settings.channelCount", { tracked: modules.channels.tracked }) : t("overview.moduleUnavailable")}</dd></div>
-              <div><dt>{t("overview.moduleBalances")}</dt><dd>{modules.balances ? t("overview.balanceCount", { tracked: modules.balances.tracked, low: modules.balances.low }) : t("overview.moduleUnavailable")}</dd></div>
             </dl>
             {moduleErrors.length > 0 && (
               <div className="notice" role="alert">

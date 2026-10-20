@@ -197,6 +197,16 @@ export interface QualitySettings {
   pelican: { model: string; effort: string };
 }
 
+// Every test asked with model.
+export function withModel(settings: QualitySettings, model: string): QualitySettings {
+  return {
+    candy: { ...settings.candy, model },
+    fingerprint: { ...settings.fingerprint, model },
+    modeltrace: { ...settings.modeltrace, model },
+    pelican: { ...settings.pelican, model },
+  };
+}
+
 export function defaultSettings(config: QualityConfig): QualitySettings {
   const modes = config.fingerprint.modes;
   return {

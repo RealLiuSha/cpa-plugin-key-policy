@@ -6,25 +6,30 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ChannelDetail, ChannelSummary, ChannelView } from "../types";
 
 (globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
-vi.mock("../api/channels", () => ({ fetchChannelData: vi.fn(), fetchChannelDetail: vi.fn(), patchChannel: vi.fn(), refreshChannelBalance: vi.fn() }));
+vi.mock("../api/channels", () => ({ fetchChannelData: vi.fn(), fetchChannelDetail: vi.fn(), patchChannel: vi.fn(), deleteChannel: vi.fn() }));
 vi.mock("../api/adapters", async (importOriginal) => ({ ...(await importOriginal<typeof import("../api/adapters")>()), fetchAdapters: vi.fn(), previewAdapter: vi.fn(), saveAdapter: vi.fn(), tryAdapter: vi.fn() }));
+// CPA's model registry: the xai auth file serves Grok, the codex key GPT and an image model.
+vi.mock("../api/cpa", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../api/cpa")>()),
+  fetchCredentialModels: vi.fn(async (name: string) => (name === "xai-a.json" ? ["grok-4.7"] : name === "codex:apikey:inferhub" ? ["gpt-6.1-sol", "gpt-image-2"] : [])),
+}));
 const { translate } = vi.hoisted(() => ({ translate: (key: string, vars?: Record<string, string | number>) => key + (vars ? ` ${Object.values(vars).join(" ")}` : "") }));
 vi.mock("../i18n", () => ({ useT: () => translate }));
 import Channels from "./Channels";
-import { fetchChannelData, fetchChannelDetail, patchChannel } from "../api/channels";
+import { deleteChannel, fetchChannelData, fetchChannelDetail, patchChannel } from "../api/channels";
 import { fetchAdapters, previewAdapter, saveAdapter, tryAdapter, type AdapterPreview } from "../api/adapters";
 import { AxiosError } from "axios";
 import type { AdapterRule } from "../types";
 
 const summary = (attempts: number, failures: number): ChannelSummary => ({
   attempts, failures, success_rate: attempts ? (attempts - failures) / attempts : 0, status_codes: failures ? { "502": failures } : undefined,
-  latency_p50_ms: 2300, latency_p95_ms: 9100, ttft_p50_ms: 800, ttft_p95_ms: 2100, input_tokens: 1000, output_tokens: 200, list_cost_usd: 0.012, upstream_cost_usd: 0.004,
+  latency_p50_ms: 2300, latency_p95_ms: 9100, ttft_p50_ms: 800, ttft_p95_ms: 2100, input_tokens: 1000, output_tokens: 200, list_cost_usd: 0.012,
 });
 const inferhub: ChannelView = {
   auth_index: "47c2d6c61505edc3", auth_id: "codex:apikey:1a2b3c4d5e6f", provider: "codex", base_url: "https://inferhub.net/v1",
-  meta: { auth_index: "47c2d6c61505edc3", display_name: "Inferhub", cost_ratio: 0.4 }, last_24h: summary(10, 3), today: summary(4, 1), balance: null, rules: 1,
+  meta: { auth_index: "47c2d6c61505edc3", display_name: "Inferhub" }, last_24h: summary(10, 3), today: summary(4, 1), rules: 1,
 };
-const gone: ChannelView = { auth_index: "9999000000000001", provider: "claude", base_url: "https://gone.example/v1", meta: { auth_index: "9999000000000001" }, last_24h: summary(0, 0), today: summary(0, 0), balance: null, rules: 0 };
+const gone: ChannelView = { auth_index: "9999000000000001", provider: "claude", base_url: "https://gone.example/v1", meta: { auth_index: "9999000000000001" }, last_24h: summary(0, 0), today: summary(0, 0), rules: 0 };
 const detail: ChannelDetail = {
   ...inferhub, last_7d: summary(70, 5), hours: [{ hour: "2026-10-18T15:00:00Z", attempts: 3, failures: 1, latency_p50_ms: 2100, list_cost_usd: 0.001 }],
   recent_errors: [{ at: "2026-10-18T15:20:00Z", status_code: 502, model: "gpt-6-sol", snippet: "upstream connect error" }],
@@ -52,6 +57,7 @@ beforeEach(() => {
       authFiles: [{ id: "xai-a.json", authIndex: "7d80e580c338085a", name: "xai-a.json", provider: "xai", label: "a@example.com", status: "active", statusMessage: "", disabled: false, unavailable: true, nextRetryAfter: "2026-10-19T01:00:00Z", cooldowns: [], success: 1189, failed: 5 }],
     },
     cpaError: null,
+    ids: { "47c2d6c61505edc3": "codex:apikey:inferhub" },
   });
   vi.mocked(fetchChannelDetail).mockResolvedValue(detail);
   vi.mocked(patchChannel).mockImplementation(async (patch) => ({ ...inferhub.meta, ...patch, updated_at: "2026-10-19T01:00:00Z" }));
@@ -75,10 +81,30 @@ describe("Channels page", () => {
     expect(inferhubRow.textContent).toContain("channels.failurePill 30%");
     expect(inferhubRow.textContent).toContain("70%");
     expect(inferhubRow.textContent).toContain("2.3 s");
-    expect(inferhubRow.textContent).toContain("$0.004");
     expect(groups[0].textContent).toContain("channels.state.missing");
     expect(groups[2].textContent).toContain("a@example.com");
     expect(groups[2].textContent).toContain("channels.state.unavailable");
+  });
+
+  it("narrows the list by type, then by a model CPA routes to the channel, and keeps the filter in the URL", async () => {
+    await render();
+    const vendors = () => [...container.querySelectorAll(".channel-group")].map((group) => group.getAttribute("aria-label"));
+    const select = (selector: string, value: string) => act(async () => {
+      Simulate.change(container.querySelector(selector)!, { target: { value } as unknown as EventTarget & HTMLSelectElement });
+      await tick();
+    });
+    const models = [...container.querySelectorAll<HTMLOptionElement>(".channel-filter-model option")].map((option) => option.value);
+    expect(models).toEqual(["all", "gpt-6.1-sol", "gpt-image-2", "grok-4.7"]);
+    await select(".channel-filter-model", "grok-4.7");
+    expect(vendors()).toEqual(["xai"]);
+    expect(container.querySelector('[data-testid="location"]')?.textContent).toBe("?model=grok-4.7");
+    await select(".channel-filter-model", "all");
+    await select(".channel-filter-type", "ai_providers:codex");
+    expect(vendors()).toEqual(["inferhub.net"]);
+    expect(container.querySelector(".channel-table tbody tr")?.textContent).toContain("gpt-6.1-sol, gpt-image-2");
+    // Opening a channel keeps the filter.
+    await click(container.querySelector('a.channel-name[href*="47c2d6c61505edc3"]')!);
+    expect(container.querySelector('[data-testid="location"]')?.textContent).toBe("?type=ai_providers%3Acodex&auth_index=47c2d6c61505edc3");
   });
 
   it("opens a channel from the URL, copies a feedback report and saves notes", async () => {
@@ -92,6 +118,8 @@ describe("Channels page", () => {
     expect(panel.textContent).toContain("gpt-6.1-sol");
     expect(panel.textContent).toContain("channels.cpa.ownedHint");
     expect(panel.textContent).toContain("upstream connect error");
+    // A channel CPA still has cannot be deleted here.
+    expect(panel.textContent).not.toContain("channels.delete.button");
 
     await click(button("channels.copyFeedback"));
     const report = (writeText.mock.calls[0] as unknown[])[0] as string;
@@ -113,6 +141,20 @@ describe("Channels page", () => {
     await click(container.querySelector('button[aria-label="models.close"]')!);
     expect(container.querySelector(".channel-detail")).toBeNull();
     expect(container.querySelector('[data-testid="location"]')?.textContent).toBe("");
+  });
+
+  it("deletes a channel CPA dropped after a confirmation and closes it", async () => {
+    vi.mocked(deleteChannel).mockResolvedValue();
+    await render("/channels?auth_index=9999000000000001");
+    expect(container.querySelector(".channel-detail")?.textContent).toContain("channels.delete.hint");
+    await click(button("channels.delete.button"));
+    expect(container.querySelector('[role="dialog"]')?.textContent).toContain("channels.delete.message");
+    const loads = vi.mocked(fetchChannelData).mock.calls.length;
+    await click(button("channels.delete.confirm"));
+    expect(deleteChannel).toHaveBeenCalledWith("9999000000000001");
+    expect(container.querySelector(".channel-detail")).toBeNull();
+    expect(container.querySelector('[data-testid="location"]')?.textContent).toBe("");
+    expect(vi.mocked(fetchChannelData).mock.calls.length).toBeGreaterThan(loads);
   });
 
   it("keeps unsaved notes across tabs and asks before leaving the channel", async () => {

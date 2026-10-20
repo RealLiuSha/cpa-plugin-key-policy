@@ -1105,17 +1105,20 @@ ul.overview-warnings { padding-left: 28px; display: flex; flex-direction: column
 .channel-table.card.table-wrap { overflow-x: auto; }
 /* Fixed column widths keep the columns of every vendor group aligned. */
 .channel-table table { min-width: 880px; table-layout: fixed; }
-.channel-table th:nth-child(1) { width: 21%; }
-.channel-table th:nth-child(2) { width: 14%; }
-.channel-table th:nth-child(3) { width: 17%; }
-.channel-table th:nth-child(4), .channel-table th:nth-child(7) { width: 10%; }
-.channel-table th:nth-child(5), .channel-table th:nth-child(6), .channel-table th:nth-child(9) { width: 8%; }
-.channel-table th:nth-child(8) { width: 6%; }
+.channel-table th:nth-child(1) { width: 20%; }
+.channel-table th:nth-child(2) { width: 12%; }
+.channel-table th:nth-child(3), .channel-table th:nth-child(4) { width: 16%; }
+.channel-table th:nth-child(5) { width: 10%; }
+.channel-table th:nth-child(6), .channel-table th:nth-child(7) { width: 9%; }
+.channel-table th:nth-child(8) { width: 8%; }
 .channel-table td { overflow-wrap: anywhere; }
-/* Beside the detail panel the list keeps name, type, status, success,
- * latency and balance; the panel shows the rest. */
+.channel-table td.channel-models { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
+/* Beside the detail panel the list keeps name, type, status, success and
+ * latency; the panel shows the rest. */
 .channels-layout.has-detail .channel-table table { min-width: 620px; }
-.channels-layout.has-detail .channel-table :is(th, td):is(:nth-child(6), :nth-child(7), :nth-child(8)) { display: none; }
+.channels-layout.has-detail .channel-table :is(th, td):is(:nth-child(3), :nth-child(7), :nth-child(8)) { display: none; }
+.channel-filter { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.channel-filter select { width: auto; min-width: 160px; max-width: 100%; padding: 6px 10px; font-size: 13px; }
 .channel-table th, .channel-table td { vertical-align: middle; }
 .channel-table tr.selected td { background: var(--accent-soft); }
 .channel-name-cell { min-width: 160px; max-width: 260px; overflow-wrap: anywhere; }

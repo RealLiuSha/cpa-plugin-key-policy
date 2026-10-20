@@ -1,11 +1,12 @@
 import { useEffect, useId, useRef } from "react";
 import { Link } from "react-router-dom";
 import type { ChannelRow } from "../channelMerge";
+import ChannelFilter from "../components/ChannelFilter";
 import { formatDateTime } from "../format";
 import { useT } from "../i18n";
 import { channelPath } from "../navigation";
 import {
-  ALL_CREDENTIALS, credentialLabel, credentialTypes, displayName, providerType, recordCount, runningTest, selectable, statusText, stopping, testable,
+  credentialLabel, credentialTypes, displayName, providerType, recordCount, runningTest, selectable, statusText, stopping, testable,
   type QualitySettings,
 } from "./helpers";
 import { HistoryItems, LatestResult, ResultSummary } from "./results";
@@ -18,6 +19,10 @@ interface ListProps {
   credentials: QualityCredential[];
   visible: QualityCredential[];
   type: string;
+  // The models the credentials of the type serve, null while they are
+  // looked up, and the one the list is narrowed to.
+  models: { model: string; count: number }[] | null;
+  model: string;
   selected: ReadonlySet<string>;
   expanded: ReadonlySet<string>;
   channels: Map<string, ChannelRow>;
@@ -26,17 +31,13 @@ interface ListProps {
   // An action is in flight.
   acting: boolean;
   onType: (type: string) => void;
+  onModel: (model: string) => void;
   onSelect: (ids: string[], checked: boolean) => void;
   onToggle: (id: string) => void;
   onRun: (credential: QualityCredential) => void;
   onCancel: (credential: QualityCredential) => void;
   onOpen: (target: DetailTarget) => void;
   onClear: () => void;
-}
-
-function typeLabel(t: Translate, type: string): string {
-  const [source, provider] = type.split(/:(.*)/);
-  return source === "auth_files" || source === "ai_providers" ? t(`quality.filter.${source}`, { provider }) : type;
 }
 
 function coolingReason(t: Translate, credential: QualityCredential): string {
@@ -52,7 +53,7 @@ function blocker(t: Translate, credential: QualityCredential): string {
   return running ? t("quality.blocked.busy", { test: t(`quality.busy.${running}`) }) : "";
 }
 
-type RowProps = Omit<ListProps, "credentials" | "visible" | "type" | "selected" | "expanded" | "onType" | "onClear"> & {
+type RowProps = Omit<ListProps, "credentials" | "visible" | "type" | "models" | "model" | "selected" | "expanded" | "onType" | "onModel" | "onClear"> & {
   credential: QualityCredential;
   checked: boolean;
   open: boolean;
@@ -110,7 +111,7 @@ function CredentialRow({ test, credential, checked, open, channels, settings, co
 // The credentials of the current filter with one test's results. Only
 // enabled credentials that are not cooling down or busy can be selected.
 export default function CredentialList(props: ListProps) {
-  const { test, credentials, visible, type, selected, expanded, acting, onType, onSelect, onClear } = props;
+  const { test, credentials, visible, type, models, model, selected, expanded, acting, onType, onModel, onSelect, onClear } = props;
   const t = useT();
   const selectAll = useRef<HTMLInputElement>(null);
   const candidates = visible.filter(selectable);
@@ -128,10 +129,7 @@ export default function CredentialList(props: ListProps) {
           <input ref={selectAll} type="checkbox" checked={all} disabled={candidates.length === 0} onChange={(event) => onSelect(candidates.map((credential) => credential.id), event.target.checked)} />
           {t("quality.selectAll")}
         </label>
-        <select className="quality-type" aria-label={t("quality.filter.label")} value={type} onChange={(event) => onType(event.target.value)}>
-          <option value={ALL_CREDENTIALS}>{t("quality.filter.all")}</option>
-          {credentialTypes(credentials, type).map((value) => <option key={value} value={value}>{typeLabel(t, value)}</option>)}
-        </select>
+        <ChannelFilter types={credentialTypes(credentials, type)} type={type} models={models} model={model} onType={onType} onModel={onModel} />
         <span className="muted">{t("quality.count", { shown: visible.length, testable: candidates.length })}</span>
         <span className="spacer" />
         <button type="button" className="btn sm danger-outline" disabled={acting || !hasRecords} onClick={onClear}>{t("quality.clearTest", { test: t(`quality.tab.${test}`) })}</button>

@@ -4,26 +4,25 @@ import { fetchOverview } from "../api/overview";
 import { extractApiError } from "../api/error";
 import { AuditEventCard } from "./Audit";
 import { channelPath } from "../navigation";
-import { formatAmount, formatCount, formatPercent, formatUSD } from "../format";
+import { formatCount, formatPercent, formatUSD } from "../format";
 import { useT } from "../i18n";
 import type { OverviewChannelAttention, OverviewResponse } from "../types";
 
 type Translate = ReturnType<typeof useT>;
 
-// Upstream cost and margin mean something only when some channel has a cost
-// ratio or the backend already priced upstream spend today.
-export function showsUpstreamCost(overview: OverviewResponse): boolean {
-  return overview.today.upstream_cost_usd !== 0 || overview.today.costed_channels > 0;
-}
-
 function channelReason(item: OverviewChannelAttention, t: Translate): string {
   if (item.reason === "failure_rate") return t("overview.channelReason.failure_rate", { rate: formatPercent(item.value ?? 0) });
-  if (item.reason === "balance_low") return item.value === undefined ? t("overview.channelReason.balance_low_plain") : t("overview.channelReason.balance_low", { amount: formatAmount(item.value) });
-  if (item.reason === "balance_error") return t("overview.channelReason.balance_error");
+  if (item.reason === "degraded" || item.reason === "suspect") {
+    return t(`overview.channelReason.${item.reason}`, { model: item.model ?? "", correct: item.correct ?? 0, answered: item.answered ?? 0 });
+  }
   return item.reason;
 }
 
-function Kpis({ overview, costs }: { overview: OverviewResponse; costs: boolean }) {
+// An inspection verdict leads to the inspection page, a failure rate to the
+// channel.
+const attentionPath = (item: OverviewChannelAttention) => (item.reason === "failure_rate" ? channelPath(item.auth_index) : "/inspection");
+
+function Kpis({ overview }: { overview: OverviewResponse }) {
   const t = useT();
   const today = overview.today;
   const failureShare = today.attempts > 0 ? ` (${formatPercent(today.failures / today.attempts)})` : "";
@@ -32,10 +31,6 @@ function Kpis({ overview, costs }: { overview: OverviewResponse; costs: boolean 
     ["overview.kpi.failures", formatCount(today.failures) + failureShare, today.failures > 0],
     ["overview.kpi.billed", formatUSD(today.billed_usd)],
   ];
-  if (costs) {
-    items.push(["overview.kpi.upstreamCost", formatUSD(today.upstream_cost_usd)]);
-    items.push(["overview.kpi.margin", formatUSD(today.margin_usd), today.margin_usd < 0]);
-  }
   return (
     <section className="overview-section" aria-label={t("overview.todayTitle")}>
       <h2 className="usage-section-title">{t("overview.todayTitle")}</h2>
@@ -47,8 +42,6 @@ function Kpis({ overview, costs }: { overview: OverviewResponse; costs: boolean 
           </div>
         ))}
       </div>
-      {!costs && <p className="muted overview-hint">{t("overview.costHidden")}</p>}
-      {costs && today.uncosted_channels > 0 && <p className="muted overview-hint">{t("overview.costPartial", { count: today.uncosted_channels })}</p>}
     </section>
   );
 }
@@ -89,9 +82,9 @@ function ChannelsCard({ channels }: { channels: OverviewResponse["channels"] }) 
       {channels.attention.length === 0 ? <p className="muted">{t("overview.channelsClear")}</p> : (
         <ul className="overview-list">
           {channels.attention.map((item) => (
-            <li key={`${item.auth_index}-${item.reason}`}>
-              <Link to={channelPath(item.auth_index)} className={item.display_name ? "" : "mono"}>{item.display_name || item.auth_index}</Link>
-              <span className={"badge " + (item.reason === "balance_low" ? "warn" : "danger")}>{channelReason(item, t)}</span>
+            <li key={`${item.auth_index}-${item.reason}-${item.model ?? ""}-${item.effort ?? ""}`}>
+              <Link to={attentionPath(item)} className={item.display_name ? "" : "mono"}>{item.display_name || item.auth_index}</Link>
+              <span className={`badge ${item.reason === "suspect" ? "warn" : "danger"}`}>{channelReason(item, t)}</span>
             </li>
           ))}
         </ul>
@@ -102,7 +95,7 @@ function ChannelsCard({ channels }: { channels: OverviewResponse["channels"] }) 
 
 function ModulesCard({ overview }: { overview: OverviewResponse }) {
   const t = useT();
-  const { search, adapters, balances } = overview.modules;
+  const { search, adapters } = overview.modules;
   const searchState = search.enabled === search.declared ? (search.enabled ? "on" : "off") : "applying";
   return (
     <section className="card overview-card" data-testid="overview-modules">
@@ -113,7 +106,6 @@ function ModulesCard({ overview }: { overview: OverviewResponse }) {
       <dl className="overview-facts">
         <div><dt><Link to="/search">{t("overview.moduleSearch")}</Link></dt><dd>{t(`overview.searchState.${searchState}`)}</dd></div>
         <div><dt><Link to="/channels">{t("overview.moduleAdapters")}</Link></dt>{adapters ? <dd>{t("overview.adapterCount", { rules: adapters.rules, enabled: adapters.enabled_rules })}</dd> : <dd className="overview-warn">{t("overview.moduleUnavailable")}</dd>}</div>
-        <div><dt>{t("overview.moduleBalances")}</dt>{balances ? <dd className={balances.low > 0 ? "overview-warn" : ""}>{t("overview.balanceCount", { tracked: balances.tracked, low: balances.low })}</dd> : <dd className="overview-warn">{t("overview.moduleUnavailable")}</dd>}</div>
       </dl>
     </section>
   );
@@ -173,7 +165,7 @@ export default function Overview() {
       )}
       {!overview ? (loading && <div className="card muted" role="status">{t("keys.loading")}</div>) : (
         <>
-          <Kpis overview={overview} costs={showsUpstreamCost(overview)} />
+          <Kpis overview={overview} />
           <div className="overview-grid">
             <KeysCard keys={overview.keys} />
             <ChannelsCard channels={overview.channels} />

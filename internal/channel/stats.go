@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/maphash"
+	"maps"
 	"math"
 	"os"
 	"slices"
@@ -411,7 +412,7 @@ func (a *aggregate) add(b *hourStats) {
 	a.lastAt = max(a.lastAt, b.lastAt)
 }
 
-func (a *aggregate) summary(costRatio float64, loc *time.Location) Summary {
+func (a *aggregate) summary(loc *time.Location) Summary {
 	s := Summary{
 		Attempts:     a.attempts,
 		Failures:     a.failures,
@@ -432,7 +433,6 @@ func (a *aggregate) summary(costRatio float64, loc *time.Location) Summary {
 			s.StatusCodes[strconv.Itoa(int(code))] = int(count)
 		}
 	}
-	s.UpstreamCostUSD = s.ListCostUSD * costRatio
 	if a.lastAt > 0 {
 		s.LastAt = time.Unix(0, a.lastAt).In(loc)
 	}
@@ -495,12 +495,12 @@ func (r *Registry) List() []View {
 		}
 		c.mu.Unlock()
 		if active || hasMeta {
-			views = append(views, r.withBalance(view, meta))
+			views = append(views, view)
 		}
 	}
 	for index, meta := range metas {
 		if _, seen := channels[index]; !seen {
-			views = append(views, r.withBalance(r.channelView(index, nil, meta, w), meta))
+			views = append(views, r.channelView(index, nil, meta, w))
 		}
 	}
 	sort.Slice(views, func(i, j int) bool {
@@ -526,8 +526,8 @@ func (r *Registry) channelView(index string, c *channelStats, meta Meta, w spans
 		c.collect(w.last24h, &last24h)
 		c.collect(w.today, &today)
 	}
-	view.Last24h = last24h.summary(meta.CostRatio, r.loc)
-	view.Today = today.summary(meta.CostRatio, r.loc)
+	view.Last24h = last24h.summary(r.loc)
+	view.Today = today.summary(r.loc)
 	return view
 }
 
@@ -572,8 +572,7 @@ func (r *Registry) Detail(authIndex string) (Detail, bool) {
 			detail.Hours = append(detail.Hours, Point{Hour: hourStart(h, r.loc)})
 		}
 	}
-	detail.View = r.withBalance(detail.View, meta)
-	detail.Last7d = week.summary(meta.CostRatio, r.loc)
+	detail.Last7d = week.summary(r.loc)
 	return detail, true
 }
 
@@ -648,6 +647,56 @@ func (r *Registry) evictIdle(indexes []string) {
 			delete(r.channels, index)
 		}
 	}
+}
+
+// Delete forgets a channel: its metadata and its statistics, which are
+// written at once so a restart does not bring them back. A channel CPA still
+// sends traffic to reappears with its next attempt. It reports whether there
+// was anything to forget. While CanWrite reports false it returns
+// ErrReadOnly; a failed metadata write wraps ErrPersist and changes nothing.
+// A failed statistics write is logged and retried by the next flush.
+func (r *Registry) Delete(authIndex string) (bool, error) {
+	index, err := normalizeAuthIndex(authIndex)
+	if err != nil {
+		return false, err
+	}
+	if !r.canWrite() {
+		return false, ErrReadOnly
+	}
+	r.flushMu.Lock()
+	defer r.flushMu.Unlock()
+	r.metaWriteMu.Lock()
+	_, hadMeta := r.metaFor(index)
+	if hadMeta {
+		r.metaMu.RLock()
+		metas := maps.Clone(r.metas)
+		r.metaMu.RUnlock()
+		delete(metas, index)
+		if err := r.writeMeta(metas); err != nil {
+			r.metaWriteMu.Unlock()
+			return false, err
+		}
+		r.metaMu.Lock()
+		r.metas = metas
+		r.metaMu.Unlock()
+	}
+	// Holding handoffMu exclusively, no Observe is between channelFor and its
+	// update, so none lands on the dropped entry.
+	r.handoffMu.Lock()
+	r.mu.Lock()
+	_, hadStats := r.channels[index]
+	delete(r.channels, index)
+	r.mu.Unlock()
+	r.handoffMu.Unlock()
+	r.metaWriteMu.Unlock()
+	if hadStats {
+		generation := r.generation.Add(1)
+		snapshot, _ := r.statsSnapshot(r.now())
+		if err := r.writeStatsLocked(snapshot, generation); err != nil {
+			r.logf("warn", "cpa-key-policy: channel statistics not saved after deleting "+index+": "+err.Error())
+		}
+	}
+	return hadMeta || hadStats, nil
 }
 
 // writeStatsLocked writes snapshot, taken at generation, unless the file

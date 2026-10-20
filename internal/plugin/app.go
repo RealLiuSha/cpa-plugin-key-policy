@@ -469,7 +469,7 @@ func (a *App) registration() Registration {
 				{Name: "keys", Type: "array", Description: "First-boot downstream key seeds. State is authoritative after initialization."},
 				{Name: "models", Type: "array", Description: "First-boot price rows: upstream model id (name), optional provider qualifier, billing mode and prices."},
 				{Name: "search_enabled", Type: "boolean", Description: "Route Codex alpha search (registers a model router; settings are on the plugin's search page)."},
-				{Name: "cpa_config_path", Type: "string", Description: "CPA config.yaml, read only for the upstream keys of balance queries and detection tests. Defaults to config.yaml."},
+				{Name: "cpa_config_path", Type: "string", Description: "CPA config.yaml, read only for the upstream keys of detection tests and adapter rule tries and for group names. Defaults to config.yaml."},
 			},
 		},
 		Capabilities: Capabilities{
@@ -662,10 +662,10 @@ func (a *App) managementRegistration() ManagementRegistrationResponse {
 			{Method: http.MethodPost, Path: base + "/models/pricing-preview", Description: "Preview Models.dev prices for selected CPA models without writing state."},
 			{Method: http.MethodPost, Path: base + "/models/import", Description: "Create $0 price rows for upstream models; existing rows are skipped."},
 			{Method: http.MethodGet, Path: base + "/overview", Description: "Today's numbers and what needs attention across keys and channels."},
-			{Method: http.MethodGet, Path: base + "/channels", Description: "Per-channel statistics, metadata and balances by CPA auth_index."},
+			{Method: http.MethodGet, Path: base + "/channels", Description: "Per-channel statistics and metadata by CPA auth_index."},
 			{Method: http.MethodGet, Path: base + "/channels/detail", Description: "One channel's 7-day history and recent errors."},
-			{Method: http.MethodPatch, Path: base + "/channels", Description: "Update one channel's name, vendor, note, cost ratio or balance source."},
-			{Method: http.MethodPost, Path: base + "/channels/balance/refresh", Description: "Query one channel's upstream balance now."},
+			{Method: http.MethodPatch, Path: base + "/channels", Description: "Update one channel's name, vendor or note."},
+			{Method: http.MethodDelete, Path: base + "/channels", Description: "Forget a channel CPA's config no longer has: its statistics, metadata and adapter rules."},
 			{Method: http.MethodGet, Path: base + "/adapters", Description: "List per-channel request rewrite rules."},
 			{Method: http.MethodPost, Path: base + "/adapters", Description: "Create or update a request rewrite rule."},
 			{Method: http.MethodDelete, Path: base + "/adapters", Description: "Delete a request rewrite rule by id."},
@@ -769,8 +769,8 @@ func (a *App) handleManagement(raw []byte) ([]byte, error) {
 		return OKEnvelope(a.channelDetail(req.Query.Get("auth_index")))
 	case req.Method == http.MethodPatch && path == base+"/channels":
 		return OKEnvelope(a.patchChannel(req.Body))
-	case req.Method == http.MethodPost && path == base+"/channels/balance/refresh":
-		return OKEnvelope(a.refreshChannelBalance(req.Body))
+	case req.Method == http.MethodDelete && path == base+"/channels":
+		return OKEnvelope(a.deleteChannel(req.Query.Get("auth_index")))
 	case req.Method == http.MethodGet && path == base+"/adapters":
 		return OKEnvelope(a.listAdapters())
 	case req.Method == http.MethodPost && path == base+"/adapters":
@@ -798,13 +798,11 @@ func (a *App) handleManagement(raw []byte) ([]byte, error) {
 
 // networkBoundCalls wait on the network and write no data file: an adapter
 // test request through host.model.execute (its audit line is written under
-// writeMu before the call), a models.dev price preview and an upstream
-// balance query, whose reading stays in memory. They do not hold writeMu,
-// which would hold quiesce up for as long as they wait.
+// writeMu before the call) and a models.dev price preview. They do not hold
+// writeMu, which would hold quiesce up for as long as they wait.
 var networkBoundCalls = map[string]bool{
-	"/adapters/try":             true,
-	"/models/pricing-preview":   true,
-	"/channels/balance/refresh": true,
+	"/adapters/try":           true,
+	"/models/pricing-preview": true,
 }
 
 // upgrading answers a write that reached a quiesced instance.

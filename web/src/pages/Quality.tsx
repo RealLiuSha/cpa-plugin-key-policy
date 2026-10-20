@@ -5,6 +5,7 @@ import { extractApiError } from "../api/error";
 import { fetchModelPrices } from "../api/modelPrices";
 import { cancelQuality, clearQualityResults, fetchQuality, runQuality } from "../api/quality";
 import { mergeChannels, type ChannelRow } from "../channelMerge";
+import { ALL, modelCounts, servesModel, useChannelModels } from "../channelModels";
 import { ConfirmDialog } from "../components/Modal";
 import { formatCount } from "../format";
 import { useT } from "../i18n";
@@ -13,7 +14,7 @@ import CredentialList from "../quality/CredentialList";
 import RecordDialog from "../quality/RecordDialog";
 import SettingsForm from "../quality/SettingsForm";
 import {
-  DEFAULT_CREDENTIAL_TYPE, defaultSettings, displayName, ofType, parseCredentialType, planRun, recordCount, runningTest, selectable,
+  DEFAULT_CREDENTIAL_TYPE, defaultSettings, displayName, ofType, parseCredentialType, planRun, recordCount, runningTest, selectable, withModel,
   type PlannedRun, type QualitySettings,
 } from "../quality/helpers";
 import { CODEX_CONTEXT_TOKENS, QUALITY_TESTS, type DetailTarget, type QualityConfig, type QualityCredential, type QualityState, type QualityTest } from "../quality/types";
@@ -64,6 +65,7 @@ export default function Quality() {
   const [params, setParams] = useSearchParams();
   const tab: QualityTest = QUALITY_TESTS.find((value) => value === params.get("tab")) ?? "candy";
   const type = parseCredentialType(params.get("type"));
+  const model = params.get("model") ?? ALL;
   const [state, setState] = useState<QualityState | null>(null);
   const [channels, setChannels] = useState<ChannelData | null>(null);
   const [models, setModels] = useState<string[]>([]);
@@ -133,13 +135,13 @@ export default function Quality() {
     }
   };
 
-  const channelRows = useMemo(() => {
-    const rows: ChannelRow[] = channels ? mergeChannels({ config: channels.cpa?.config ?? [], authFiles: channels.cpa?.authFiles ?? [], channels: channels.channels, cpaListed: channels.cpa !== null }) : [];
-    return new Map(rows.filter((row) => row.authIndex).map((row) => [row.authIndex, row]));
-  }, [channels]);
+  const channelList = useMemo((): ChannelRow[] => channels ? mergeChannels({ config: channels.cpa?.config ?? [], authFiles: channels.cpa?.authFiles ?? [], channels: channels.channels, cpaListed: channels.cpa !== null }) : [], [channels]);
+  const channelRows = useMemo(() => new Map(channelList.filter((row) => row.authIndex).map((row) => [row.authIndex, row])), [channelList]);
+  const channelModels = useChannelModels(channelList, channels?.ids ?? {});
 
   const credentials = state?.auths ?? [];
-  const visible = credentials.filter((credential) => ofType(credential, type));
+  const typed = credentials.filter((credential) => ofType(credential, type));
+  const visible = typed.filter((credential) => servesModel(credential.auth_index ?? "", model, channelModels));
   const candidates = visible.filter(selectable);
   const chosen = candidates.filter((credential) => selected[tab].has(credential.id));
   // Nothing selected runs every testable credential of the filter.
@@ -155,6 +157,12 @@ export default function Quality() {
   const changeType = (value: string) => {
     setSelected(emptyPerTest());
     setParam("type", value, DEFAULT_CREDENTIAL_TYPE);
+  };
+  // Narrowing the list to a model also asks every test with it.
+  const changeModel = (value: string) => {
+    setSelected(emptyPerTest());
+    setParam("model", value, ALL);
+    if (value !== ALL) setSettings((current) => current && withModel(current, value));
   };
   const select = (list: string[], checked: boolean) => setSelected((current) => {
     const next = new Set(current[tab]);
@@ -271,6 +279,8 @@ export default function Quality() {
               credentials={credentials}
               visible={visible}
               type={type}
+              models={channelModels && modelCounts(typed.map((credential) => credential.auth_index ?? ""), channelModels)}
+              model={model}
               selected={selected[tab]}
               expanded={expanded[tab]}
               channels={channelRows}
@@ -278,6 +288,7 @@ export default function Quality() {
               config={state.config}
               acting={acting}
               onType={changeType}
+              onModel={changeModel}
               onSelect={select}
               onToggle={toggle}
               onRun={(credential) => askRun(tab, [credential])}

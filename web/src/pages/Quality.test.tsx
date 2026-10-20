@@ -11,6 +11,7 @@ vi.mock("../api/quality", () => ({
   fetchQuality: vi.fn(), runQuality: vi.fn(), cancelQuality: vi.fn(), clearQualityResults: vi.fn(), fetchQualityRecord: vi.fn(), isRecordGone: vi.fn(() => false),
 }));
 vi.mock("../api/channels", () => ({ fetchChannelData: vi.fn() }));
+vi.mock("../api/cpa", () => ({ fetchCredentialModels: vi.fn(async () => []) }));
 vi.mock("../api/modelPrices", () => ({ fetchModelPrices: vi.fn() }));
 vi.mock("../polling", () => ({ useVisiblePolling: vi.fn() }));
 const { translate } = vi.hoisted(() => ({ translate: (key: string, vars?: Record<string, string | number>) => key + (vars ? ` ${Object.values(vars).join(" ")}` : "") }));
@@ -46,7 +47,7 @@ const carol = credential({
 const apiKey = credential({ id: "codex:apikey:3f2a", source: "ai_providers", name: "sk-e2e…aaaa", group: "ZhiYuan", base_url: "https://api.zhiyuan.example/v1" });
 const state = (auths: QualityCredential[], configError = ""): QualityState => ({ auths, storage_error: "", config_error: configError, config });
 const summary: ChannelSummary = {
-  attempts: 0, failures: 0, success_rate: 0, latency_p50_ms: 0, latency_p95_ms: 0, ttft_p50_ms: 0, ttft_p95_ms: 0, input_tokens: 0, output_tokens: 0, list_cost_usd: 0, upstream_cost_usd: 0,
+  attempts: 0, failures: 0, success_rate: 0, latency_p50_ms: 0, latency_p95_ms: 0, ttft_p50_ms: 0, ttft_p95_ms: 0, input_tokens: 0, output_tokens: 0, list_cost_usd: 0,
 };
 
 let container: HTMLDivElement;
@@ -62,9 +63,10 @@ const rows = () => [...container.querySelectorAll(".quality-row")];
 beforeEach(() => {
   vi.clearAllMocks();
   vi.mocked(fetchChannelData).mockResolvedValue({
-    channels: [{ auth_index: "a1", provider: "codex", meta: { auth_index: "a1", display_name: "Alice main" }, last_24h: summary, today: summary, balance: null, rules: 0 }],
+    channels: [{ auth_index: "a1", provider: "codex", meta: { auth_index: "a1", display_name: "Alice main" }, last_24h: summary, today: summary, rules: 0 }],
     cpa: { config: [], authFiles: [] },
     cpaError: null,
+    ids: {},
   });
   vi.mocked(fetchModelPrices).mockResolvedValue({ models: [], unpriced: [] });
   container = document.createElement("div");
@@ -95,7 +97,7 @@ describe("Quality page", () => {
     expect(rows()[3].textContent).toContain("sk-e2e…aaaa");
     expect(rows()[3].querySelector(".quality-url")?.getAttribute("title")).toBe("https://api.zhiyuan.example/v1");
 
-    await act(async () => { Simulate.change(container.querySelector(".quality-type")!, { target: { value: "auth_files:codex" } as unknown as EventTarget & HTMLSelectElement }); await tick(); });
+    await act(async () => { Simulate.change(container.querySelector(".channel-filter-type")!, { target: { value: "auth_files:codex" } as unknown as EventTarget & HTMLSelectElement }); await tick(); });
     expect(rows()).toHaveLength(3);
   });
 

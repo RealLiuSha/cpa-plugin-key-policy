@@ -1,6 +1,5 @@
 // Package channel keeps what the plugin knows about each upstream channel:
-// operator metadata, statistics built from CPA usage records, and upstream
-// balances.
+// operator metadata and statistics built from CPA usage records.
 //
 // A channel is one CPA credential, identified by its auth_index: 16
 // lowercase hex characters, the first 8 bytes of sha256 over
@@ -17,7 +16,6 @@
 package channel
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"strings"
@@ -26,18 +24,6 @@ import (
 	"time"
 
 	"cpa-key-policy/internal/policy/persist"
-)
-
-// Balance sources.
-const (
-	// BalanceSub2API reads GET <origin>/v1/usage (fields remaining, unit).
-	BalanceSub2API = "sub2api"
-	// BalanceOpenAIBilling reads the OpenAI-compatible
-	// /v1/dashboard/billing/subscription and /v1/dashboard/billing/usage
-	// that new-api and one-api serve: remaining = hard_limit_usd -
-	// total_usage/100, in the site's display currency (USD, CNY or raw
-	// quota), which the answer does not name, so the reading has no unit.
-	BalanceOpenAIBilling = "openai_billing"
 )
 
 // Errors the management routes tell apart. Validation failures wrap
@@ -53,39 +39,24 @@ var (
 	// ErrPersist wraps a failure to write the metadata file; the metadata
 	// in memory is then unchanged.
 	ErrPersist = errors.New("persist channel metadata")
-	// ErrNoBalanceSource rejects a balance refresh for a channel whose
-	// metadata names no balance source.
-	ErrNoBalanceSource = errors.New("channel has no balance source")
 )
 
-// BalanceSource says how to read a channel's upstream balance. ThresholdUSD
-// is compared with the reading in the reading's unit.
-type BalanceSource struct {
-	Kind         string  `json:"kind,omitempty"`
-	ThresholdUSD float64 `json:"threshold_usd,omitempty"`
-}
-
-// Meta is what the operator records about a channel.
+// Meta is what the operator records about a channel. Files written by
+// 0.21.0 and earlier may also hold cost_ratio and balance; they are ignored.
 type Meta struct {
-	AuthIndex   string `json:"auth_index"`
-	DisplayName string `json:"display_name,omitempty"`
-	Vendor      string `json:"vendor,omitempty"`
-	Note        string `json:"note,omitempty"`
-	// CostRatio prices upstream spend as list price x CostRatio; 0 means
-	// unknown and no upstream cost is shown.
-	CostRatio float64       `json:"cost_ratio,omitempty"`
-	Balance   BalanceSource `json:"balance,omitzero"`
-	UpdatedAt time.Time     `json:"updated_at,omitzero"`
+	AuthIndex   string    `json:"auth_index"`
+	DisplayName string    `json:"display_name,omitempty"`
+	Vendor      string    `json:"vendor,omitempty"`
+	Note        string    `json:"note,omitempty"`
+	UpdatedAt   time.Time `json:"updated_at,omitzero"`
 }
 
 // MetaPatch changes the given fields of one channel's Meta.
 type MetaPatch struct {
-	AuthIndex   string         `json:"auth_index"`
-	DisplayName *string        `json:"display_name,omitempty"`
-	Vendor      *string        `json:"vendor,omitempty"`
-	Note        *string        `json:"note,omitempty"`
-	CostRatio   *float64       `json:"cost_ratio,omitempty"`
-	Balance     *BalanceSource `json:"balance,omitempty"`
+	AuthIndex   string  `json:"auth_index"`
+	DisplayName *string `json:"display_name,omitempty"`
+	Vendor      *string `json:"vendor,omitempty"`
+	Note        *string `json:"note,omitempty"`
 }
 
 // Observation is the part of one usage record the statistics need.
@@ -127,19 +98,18 @@ type Observation struct {
 // where one was reported, so a burst of instant rejections does not pull
 // them down.
 type Summary struct {
-	Attempts        int64          `json:"attempts"`
-	Failures        int64          `json:"failures"`
-	SuccessRate     float64        `json:"success_rate"`
-	StatusCodes     map[string]int `json:"status_codes,omitempty"`
-	LatencyP50Ms    int64          `json:"latency_p50_ms"`
-	LatencyP95Ms    int64          `json:"latency_p95_ms"`
-	TTFTP50Ms       int64          `json:"ttft_p50_ms"`
-	TTFTP95Ms       int64          `json:"ttft_p95_ms"`
-	InputTokens     int64          `json:"input_tokens"`
-	OutputTokens    int64          `json:"output_tokens"`
-	ListCostUSD     float64        `json:"list_cost_usd"`
-	UpstreamCostUSD float64        `json:"upstream_cost_usd"`
-	LastAt          time.Time      `json:"last_at,omitzero"`
+	Attempts     int64          `json:"attempts"`
+	Failures     int64          `json:"failures"`
+	SuccessRate  float64        `json:"success_rate"`
+	StatusCodes  map[string]int `json:"status_codes,omitempty"`
+	LatencyP50Ms int64          `json:"latency_p50_ms"`
+	LatencyP95Ms int64          `json:"latency_p95_ms"`
+	TTFTP50Ms    int64          `json:"ttft_p50_ms"`
+	TTFTP95Ms    int64          `json:"ttft_p95_ms"`
+	InputTokens  int64          `json:"input_tokens"`
+	OutputTokens int64          `json:"output_tokens"`
+	ListCostUSD  float64        `json:"list_cost_usd"`
+	LastAt       time.Time      `json:"last_at,omitzero"`
 }
 
 // ErrorEntry is one recent failed attempt.
@@ -160,30 +130,15 @@ type Point struct {
 	ListCostUSD  float64 `json:"list_cost_usd"`
 }
 
-// BalanceState is the last balance reading.
-//
-// A failed query keeps Remaining and Unit of the previous successful
-// reading from the same source, if any, and describes the failure in Error;
-// At is the time of the latest query. Low compares the last known
-// Remaining with the channel's current threshold.
-type BalanceState struct {
-	Remaining float64   `json:"remaining"`
-	Unit      string    `json:"unit,omitempty"`
-	At        time.Time `json:"at,omitzero"`
-	Error     string    `json:"error,omitempty"`
-	Low       bool      `json:"low"`
-}
-
 // View is one channel in the channel list.
 type View struct {
-	AuthIndex string        `json:"auth_index"`
-	AuthID    string        `json:"auth_id,omitempty"`
-	Provider  string        `json:"provider,omitempty"`
-	BaseURL   string        `json:"base_url,omitempty"`
-	Meta      Meta          `json:"meta"`
-	Last24h   Summary       `json:"last_24h"`
-	Today     Summary       `json:"today"`
-	Balance   *BalanceState `json:"balance,omitempty"`
+	AuthIndex string  `json:"auth_index"`
+	AuthID    string  `json:"auth_id,omitempty"`
+	Provider  string  `json:"provider,omitempty"`
+	BaseURL   string  `json:"base_url,omitempty"`
+	Meta      Meta    `json:"meta"`
+	Last24h   Summary `json:"last_24h"`
+	Today     Summary `json:"today"`
 }
 
 // Detail adds history and recent errors to a View.
@@ -197,15 +152,15 @@ type Detail struct {
 	RecentErrors []ErrorEntry `json:"recent_errors"`
 }
 
-// Credential is one API key of CPA's config.yaml, which balance queries and
-// detection tests use; it never leaves the process. ID and Provider are what
+// Credential is one API key of CPA's config.yaml, which detection tests and
+// adapter rule tries use; it never leaves the process. ID and Provider are what
 // CPA's auth manager calls it, so a model request can be pinned to it; Group
 // is its v8 group or openai-compatibility provider name. ProxyURL is the
 // proxy CPA sends its requests through: the key's proxy-url, else CPA's
 // global one; empty means the environment's proxy, and "direct" or "none"
 // means none. Disabled says the key's excluded-models holds "*", which is how
 // CPA's panel disables a config API key: CPA routes no model to it, so a
-// detection test pinned to it can only fail. Balance queries still use it.
+// detection test pinned to it can only fail.
 type Credential struct {
 	AuthIndex string
 	ID        string
@@ -218,22 +173,20 @@ type Credential struct {
 	Disabled  bool
 }
 
-// Registry owns channel metadata, statistics and balances. Observe is safe
+// Registry owns channel metadata and statistics. Observe is safe
 // for concurrent use and takes constant time; nothing on the request path
 // waits for I/O.
 type Registry struct {
-	metaPath    string
-	statsPath   string
-	loc         *time.Location
-	canWrite    func() bool
-	now         func() time.Time
-	logf        func(level, message string)
-	credentials func(authIndex string) (Credential, bool)
-	httpDo      func(ctx context.Context, method, url string, headers map[string]string) (int, []byte, error)
+	metaPath  string
+	statsPath string
+	loc       *time.Location
+	canWrite  func() bool
+	now       func() time.Time
+	logf      func(level, message string)
 
 	// mu guards the channels map; each channel guards its own statistics.
 	// Lock order: flushMu, metaWriteMu, handoffMu, mu, then a channel's mu.
-	// metaMu and balanceMu come last: nothing is taken while either is held.
+	// metaMu comes last: nothing is taken while it is held.
 	mu       sync.RWMutex
 	channels map[string]*channelStats
 	// generation counts statistics changes; flushed is the generation the
@@ -247,9 +200,6 @@ type Registry struct {
 	metaWriteMu sync.Mutex
 	metaMu      sync.RWMutex
 	metas       map[string]Meta
-
-	balanceMu sync.Mutex
-	balances  map[string]balanceReading
 
 	// handoffMu makes HandOff a single instant for Observe: Observe holds it
 	// shared for its whole update, HandOff exclusively while it takes the
@@ -267,29 +217,20 @@ type Options struct {
 	CanWrite  func() bool
 	Now       func() time.Time
 	Logf      func(level, message string)
-	// Credentials resolves an auth_index to the upstream credential for a
-	// balance query; usually ReadCPAConfig over the configured path.
-	Credentials func(authIndex string) (Credential, bool)
-	// HTTPDo performs balance requests; nil means a client with a 15 s
-	// timeout that uses the credential's proxy as CPA does.
-	HTTPDo func(ctx context.Context, method, url string, headers map[string]string) (status int, body []byte, err error)
 }
 
 // NewRegistry loads metadata and the last statistics snapshot (missing
 // files mean empty). Statistics older than 7 days are dropped; a malformed
-// file is an error. Nil options default to UTC, always writable, time.Now,
-// no logging, no credentials and the default HTTP client.
+// file is an error. Nil options default to UTC, always writable, time.Now
+// and no logging.
 func NewRegistry(opts Options) (*Registry, error) {
 	r := &Registry{
-		metaPath:    opts.MetaPath,
-		statsPath:   opts.StatsPath,
-		loc:         opts.Location,
-		canWrite:    opts.CanWrite,
-		now:         opts.Now,
-		logf:        opts.Logf,
-		credentials: opts.Credentials,
-		httpDo:      opts.HTTPDo,
-		balances:    make(map[string]balanceReading),
+		metaPath:  opts.MetaPath,
+		statsPath: opts.StatsPath,
+		loc:       opts.Location,
+		canWrite:  opts.CanWrite,
+		now:       opts.Now,
+		logf:      opts.Logf,
 	}
 	if r.loc == nil {
 		r.loc = time.UTC
@@ -302,9 +243,6 @@ func NewRegistry(opts Options) (*Registry, error) {
 	}
 	if r.logf == nil {
 		r.logf = func(string, string) {}
-	}
-	if r.httpDo == nil {
-		r.httpDo = newHTTPDo()
 	}
 	var err error
 	if r.metas, err = loadMeta(r.metaPath); err != nil {

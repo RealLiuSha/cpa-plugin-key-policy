@@ -13,7 +13,8 @@
     "quality": "Quality",
     "settings": "Settings",
     "more": "More",
-    "navLabel": "Luobo navigation"
+    "navLabel": "Luobo navigation",
+    "inspection": "Inspection"
   },
   "login": {
     "subTitle": "Sign in to CLIProxyAPI",
@@ -188,14 +189,16 @@
       "migrate_state": "Data format upgraded",
       "adjust_balance": "Balance adjusted",
       "update_channel": "Update channel",
+      "delete_channel": "Delete channel",
       "upsert_adapter": "Save adapter rule",
       "delete_adapter": "Delete adapter rule",
       "try_adapter": "Send adapter rule for real",
       "update_search": "Update search settings",
       "import_search": "Import search settings",
       "run_quality": "Run detection",
-      "start_inspection": "Start scheduled check",
-      "clear_quality": "Clear detection records"
+      "start_inspection": "Start inspection",
+      "clear_quality": "Clear detection records",
+      "update_inspection": "Change inspection settings"
     },
     "field": {
       "daily_limit_usd": "Daily quota",
@@ -535,31 +538,25 @@
     "kpi": {
       "requests": "Requests",
       "failures": "Failed attempts",
-      "billed": "Billed",
-      "upstreamCost": "Upstream cost",
-      "margin": "Margin"
+      "billed": "Billed"
     },
-    "costHidden": "No channel has a cost ratio, so upstream cost and margin are hidden. Set a ratio under Cost & balance in a channel's detail.",
-    "costPartial": "{{count}} channels with traffic today have no cost ratio; their upstream cost counts as 0, so the margin is too high.",
     "keysTitle": "Keys needing attention",
     "keysSummary": "{{total}} keys: {{enabled}} enabled, {{limited}} out of quota, {{warning}} running low.",
     "keysClear": "No key is out of quota or running low.",
     "allKeys": "All keys",
     "channelsTitle": "Channels needing attention",
     "channelsSummary": "Luobo tracks {{total}} channels.",
-    "channelsClear": "No channel has a high failure rate or a balance problem.",
+    "channelsClear": "No channel has a high failure rate or a bad inspection.",
     "allChannels": "All channels",
     "channelReason": {
       "failure_rate": "24-hour failure rate {{rate}}",
-      "balance_low": "Low balance: {{amount}} left",
-      "balance_low_plain": "Balance below the alert threshold",
-      "balance_error": "Balance check failed"
+      "degraded": "Inspection: degraded on {{model}} {{correct}}/{{answered}}",
+      "suspect": "Inspection: suspect on {{model}} {{correct}}/{{answered}}"
     },
     "modulesTitle": "Modules",
     "toSettings": "Settings",
     "moduleSearch": "Search routing",
     "moduleAdapters": "Adapter rules",
-    "moduleBalances": "Balance tracking",
     "moduleUnavailable": "Data file unreadable; see Settings",
     "searchState": {
       "on": "On",
@@ -567,7 +564,6 @@
       "applying": "Being applied"
     },
     "adapterCount": "{{rules}} rules, {{enabled}} enabled",
-    "balanceCount": "{{tracked}} channels, {{low}} low",
     "warningsTitle": "Warnings",
     "warningsClear": "No warnings.",
     "changesTitle": "Recent changes",
@@ -592,9 +588,8 @@
       "success": "24 h success",
       "latency": "Latency p50",
       "ttft": "TTFT p50",
-      "upstreamToday": "Upstream cost today",
       "rules": "Rules",
-      "balance": "Balance"
+      "models": "Models"
     },
     "origin": {
       "config": "API key",
@@ -614,13 +609,10 @@
     "retryAt": "Retries after {{time}}",
     "failurePill": "{{rate}} failed",
     "failuresTitle": "{{failures}} of {{attempts}} attempts failed in the last 24 hours",
-    "balanceError": "Check failed",
-    "balanceAt": "Checked at {{time}}",
     "tabsLabel": "Channel detail",
     "tab": {
       "overview": "Overview",
       "adapters": "Adapters",
-      "cost": "Cost & balance",
       "notes": "Notes"
     },
     "tabUnsaved": "{{tab}} (unsaved changes)",
@@ -662,8 +654,7 @@
       "latency": "Latency p50 / p95",
       "ttft": "TTFT p50 / p95",
       "tokens": "Input / output tokens",
-      "listCost": "Cost at list price",
-      "upstreamCost": "Upstream cost"
+      "listCost": "Cost at list price"
     },
     "hoursTitle": "Attempts per hour (failures in red)",
     "hoursEmpty": "No recent attempts.",
@@ -683,29 +674,6 @@
       "errors": "Recent errors (time · status · model · excerpt):",
       "noErrors": "None"
     },
-    "cost": {
-      "ratio": "Cost ratio",
-      "ratioHint": "Upstream price = list price × ratio, from 0 to 10; 0 means the upstream price is unknown and no upstream cost is computed.",
-      "ratioInvalid": "The ratio must be between 0 and 10.",
-      "source": "Balance source",
-      "kind": {
-        "none": "No balance check",
-        "sub2api": "Sub2API (/v1/usage)",
-        "openai_billing": "OpenAI billing API (new-api, one-api)"
-      },
-      "kindHint": {
-        "none": "The upstream balance of this channel is not checked.",
-        "sub2api": "Reads the upstream's /v1/usage with this channel's key.",
-        "openai_billing": "Reads the upstream's /v1/dashboard/billing endpoints with this channel's key; the unit is the site's display currency."
-      },
-      "threshold": "Alert threshold",
-      "thresholdHint": "The overview flags the channel when its balance drops below this amount.",
-      "thresholdInvalid": "The threshold cannot be negative.",
-      "current": "Current balance",
-      "refresh": "Check now",
-      "refreshFailed": "Balance check failed",
-      "noSource": "Save a balance source to check the balance."
-    },
     "notes": {
       "name": "Display name",
       "nameHint": "Empty uses CPA's name or the auth_index.",
@@ -715,7 +683,28 @@
     },
     "save": "Save",
     "saved": "Saved.",
-    "saveFailed": "Save failed"
+    "saveFailed": "Save failed",
+    "delete": {
+      "button": "Delete channel",
+      "hint": "CPA's config no longer has this channel. You can delete the statistics, notes and adapter rules the plugin keeps for it.",
+      "title": "Delete this channel?",
+      "message": "This deletes the statistics, notes and adapter rules the plugin keeps for this channel. It cannot be undone.",
+      "confirm": "Delete",
+      "cancel": "Cancel",
+      "failed": "Could not delete the channel"
+    },
+    "filter": {
+      "type": "Channel type",
+      "allTypes": "All types",
+      "model": "Model",
+      "allModels": "All models",
+      "loadingModels": "Reading models…",
+      "modelOption": "{{model}} ({{count}})",
+      "auth_files": "Auth files · {{provider}}",
+      "ai_providers": "API keys · {{provider}}"
+    },
+    "countFiltered": "Showing {{shown}} of {{total}} channels",
+    "filteredEmpty": "No channel matches the filter."
   },
   "adapters": {
     "description": "Rewrites the request body before an attempt goes to this channel; only that attempt is affected.",
@@ -955,12 +944,6 @@
     "listLabel": "Credentials",
     "selectAll": "Select all testable credentials",
     "select": "Select {{name}}",
-    "filter": {
-      "label": "Credential type",
-      "all": "All credentials",
-      "auth_files": "Auth files · {{provider}}",
-      "ai_providers": "AI providers · {{provider}}"
-    },
     "source": {
       "auth_files": "Auth file",
       "ai_providers": "AI provider"
@@ -1211,5 +1194,85 @@
     },
     "notOwner": "This instance does not own the data directory: management writes are refused and the new instance owns the data.",
     "readOnly": "After a rolled-back hot replacement this instance could not take the data directory back (another instance may still hold its lock), so management writes are refused. It recovers on the next CPA config apply once the lock is free, or after a CPA restart."
+  },
+  "inspection": {
+    "title": "Inspection",
+    "description": "Asks the chosen channels the candy question at fixed times every day, grouped by model, to show which channel got dumber. Rounds are real upstream requests: they spend the channels' quota but bill no key.",
+    "loadFailed": "Could not load the inspection",
+    "saveFailed": "Could not save the inspection settings",
+    "startFailed": "Could not start the inspection",
+    "alreadyRunning": "An inspection round is already under way.",
+    "started": "An inspection round started; its progress refreshes by itself.",
+    "storageError": "Inspection data not saved: {{error}}",
+    "runNow": "Inspect now",
+    "scheduleTitle": "Schedule",
+    "enabled": "Inspect every day",
+    "runningProgress": "Inspecting: {{done}} / {{total}} channels",
+    "nextAt": "Next round {{time}}",
+    "off": "The schedule is off",
+    "times": "Times ({{timezone}})",
+    "timeLabel": "Time {{index}}",
+    "removeTime": "Remove {{time}}",
+    "addTime": "+ Add time",
+    "runs": "Questions per channel and round",
+    "cost": "With the current groups: about {{questions}} requests and {{tokens}} input tokens a day",
+    "reset": "Undo",
+    "saveSchedule": "Save",
+    "scheduleSaved": "Inspection settings saved.",
+    "groupsTitle": "Groups",
+    "daysLabel": "Days shown",
+    "days": "{{count}} days",
+    "addGroup": "Add group",
+    "noGroups": "No group yet. Add one: choose a model and check the channels serving it.",
+    "groupSaved": "Group saved.",
+    "groupRemoved": "Group removed.",
+    "removeTitle": "Remove the group?",
+    "removeMessage": "The {{model}} channels are no longer inspected; their results stay.",
+    "remove": "Remove",
+    "edit": "Edit",
+    "confirmTitle": "Inspect now",
+    "confirmMessage": "This sends {{questions}} candy questions to the channels of every group (about {{tokens}} input tokens) and spends their quota.",
+    "channelCount": "{{count}} channels",
+    "fresh": "{{count}} new channels also serve {{model}}: {{names}}",
+    "freshAdd": "Inspect them",
+    "freshIgnore": "Ignore",
+    "channel": "Channel",
+    "today": "Today",
+    "verdict": {
+      "ok": "OK",
+      "suspect": "Suspect",
+      "degraded": "Degraded",
+      "failed": "Failed",
+      "skipped": "Skipped"
+    },
+    "skipped": {
+      "missing": "CPA no longer has this channel",
+      "disabled": "The channel is disabled",
+      "unavailable": "The channel is cooling down"
+    },
+    "cell": {
+      "title": "{{name}} · {{date}}",
+      "close": "Close",
+      "total": "{{correct}} / {{answered}} right that day, {{failed}} failed",
+      "round": "{{correct}} / {{answered}} right",
+      "failed": "{{count}} failed",
+      "scheduled": "Scheduled",
+      "manual": "Manual",
+      "showWrong": "Show {{count}} wrong answers",
+      "answersGone": "Wrong answers are kept for 14 days; these are gone.",
+      "answersFailed": "Could not read the answers"
+    },
+    "editor": {
+      "newTitle": "Add group",
+      "editTitle": "Edit group",
+      "chooseModel": "Choose the model to inspect first.",
+      "chooseChannels": "Check at least one channel.",
+      "duplicate": "{{model}} ({{effort}}) already has a group.",
+      "hint": "Every channel serving the model starts checked; those left unchecked are remembered, so later only new channels are offered.",
+      "noChannels": "No channel of this type serves the model.",
+      "notServing": "No longer serves the model",
+      "count": "{{checked}} of {{total}} checked",
+      "save": "Save"
+    }
   }
 }

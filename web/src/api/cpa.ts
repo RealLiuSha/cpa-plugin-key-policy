@@ -180,6 +180,14 @@ async function getOptional(path: string): Promise<unknown> {
   }
 }
 
+// The models CPA routes to one credential, as its model registry has them:
+// the names clients ask for, with excluded models dropped and a provider's
+// default models filled in. name is an auth file's name or a credential ID.
+export async function fetchCredentialModels(name: string): Promise<string[]> {
+  const { data } = await apiClient().get<unknown>(MANAGEMENT + "/auth-files/models", { params: { name } });
+  return list(record(data).models).map((model) => text(record(model).id)).filter(Boolean);
+}
+
 export interface CpaCredentials {
   config: CpaConfigCredential[];
   authFiles: CpaAuthFile[];

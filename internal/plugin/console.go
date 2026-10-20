@@ -1,7 +1,6 @@
 package plugin
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -25,7 +24,6 @@ import (
 const (
 	failureRateAttention = 0.2
 	failureRateMinimum   = 5
-	balanceRefreshLimit  = 30 * time.Second
 )
 
 // moduleUnavailable answers a route whose module could not be opened.
@@ -72,7 +70,8 @@ func (a *App) listChannels() ManagementResponse {
 	for _, view := range views {
 		out = append(out, channelView{View: view, Rules: rules[view.AuthIndex]})
 	}
-	return jsonResponse(http.StatusOK, map[string]any{"channels": out, "groups": a.cpaCredentials.groups()})
+	groups, ids := a.cpaCredentials.groups()
+	return jsonResponse(http.StatusOK, map[string]any{"channels": out, "groups": groups, "ids": ids})
 }
 
 func (a *App) channelDetail(authIndex string) ManagementResponse {
@@ -119,12 +118,9 @@ func (a *App) patchChannel(body []byte) ManagementResponse {
 	}
 	changes := map[string]audit.Change{}
 	for name, values := range map[string][2]any{
-		"display_name":          {before.Meta.DisplayName, meta.DisplayName},
-		"vendor":                {before.Meta.Vendor, meta.Vendor},
-		"note":                  {before.Meta.Note, meta.Note},
-		"cost_ratio":            {before.Meta.CostRatio, meta.CostRatio},
-		"balance":               {before.Meta.Balance.Kind, meta.Balance.Kind},
-		"balance_threshold_usd": {before.Meta.Balance.ThresholdUSD, meta.Balance.ThresholdUSD},
+		"display_name": {before.Meta.DisplayName, meta.DisplayName},
+		"vendor":       {before.Meta.Vendor, meta.Vendor},
+		"note":         {before.Meta.Note, meta.Note},
 	} {
 		if values[0] != values[1] {
 			changes[name] = audit.Change{From: values[0], To: values[1]}
@@ -136,24 +132,44 @@ func (a *App) patchChannel(body []byte) ManagementResponse {
 	return jsonResponse(http.StatusOK, map[string]any{"meta": meta})
 }
 
-func (a *App) refreshChannelBalance(body []byte) ManagementResponse {
+// deleteChannel forgets a channel CPA's config.yaml no longer has: its
+// statistics, metadata and the adapter rules bound to it. A channel still in
+// the config is refused, since its next attempt would only bring it back
+// without its history. When the config cannot be read nothing is refused.
+func (a *App) deleteChannel(authIndex string) ManagementResponse {
 	set := a.modules.Load()
 	if set == nil || set.channels == nil {
 		return moduleUnavailable("channels")
 	}
-	var req struct {
-		AuthIndex string `json:"auth_index"`
+	index := strings.ToLower(strings.TrimSpace(authIndex))
+	if _, configured := a.cpaCredentials.lookup(index); configured {
+		return jsonError(http.StatusConflict, "channel_in_cpa", "the channel is still in CPA's config.yaml; remove it there first")
 	}
-	if err := decodeStrictBody(body, &req); err != nil {
-		return jsonError(http.StatusBadRequest, "invalid_json", err.Error())
+	a.channelPatchMu.Lock()
+	defer a.channelPatchMu.Unlock()
+	before, _ := set.channels.Detail(index)
+	found, err := set.channels.Delete(index)
+	if err != nil {
+		return a.moduleWriteError(err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), balanceRefreshLimit)
-	defer cancel()
-	state, err := set.channels.RefreshBalance(ctx, strings.ToLower(strings.TrimSpace(req.AuthIndex)))
-	if err != nil && state.Error == "" {
-		state.Error = err.Error()
+	removedRules := 0
+	if set.adapters != nil {
+		for _, rule := range set.adapters.Rules() {
+			if rule.Channel != index {
+				continue
+			}
+			if err := set.adapters.Delete(rule.ID); err != nil {
+				return a.moduleWriteError(err)
+			}
+			a.store.RecordChange("delete_adapter", rule.ID, map[string]audit.Change{"rule": {From: rule, To: nil}})
+			removedRules++
+		}
 	}
-	return jsonResponse(http.StatusOK, map[string]any{"balance": state})
+	if !found && removedRules == 0 {
+		return jsonError(http.StatusNotFound, "not_found", "unknown channel")
+	}
+	a.store.RecordChange("delete_channel", index, map[string]audit.Change{"channel": {From: before.View, To: nil}})
+	return jsonResponse(http.StatusOK, map[string]any{"deleted": index, "adapter_rules_deleted": removedRules})
 }
 
 // ruleView is a rule with its hit counter.
@@ -488,27 +504,23 @@ func (a *App) moduleStates(set *moduleSet) map[string]any {
 		states["adapters"] = map[string]any{"rules": len(rules), "enabled_rules": enabled}
 	}
 	if set.channels != nil {
-		tracked, low := 0, 0
-		views := set.channels.List()
-		for _, view := range views {
-			if view.Balance != nil {
-				tracked++
-				if view.Balance.Low {
-					low++
-				}
-			}
-		}
-		states["channels"] = map[string]any{"tracked": len(views)}
-		states["balances"] = map[string]any{"tracked": tracked, "low": low}
+		states["channels"] = map[string]any{"tracked": len(set.channels.List())}
 	}
 	return states
 }
 
+// channelAttention is a channel the overview points out: a high failure
+// rate, or an inspection verdict (degraded or suspect) with the model it was
+// asked with and its answers.
 type channelAttention struct {
 	AuthIndex   string  `json:"auth_index"`
 	DisplayName string  `json:"display_name"`
 	Reason      string  `json:"reason"`
 	Value       float64 `json:"value"`
+	Model       string  `json:"model,omitempty"`
+	Effort      string  `json:"effort,omitempty"`
+	Answered    int     `json:"answered,omitempty"`
+	Correct     int     `json:"correct,omitempty"`
 }
 
 type keyAttention struct {
@@ -524,8 +536,7 @@ func (a *App) overview() ManagementResponse {
 	// The channel numbers stay zero while the channels module is unavailable.
 	numbers := map[string]any{
 		"requests": today.Calls, "billed_usd": today.ChargedUSD,
-		"attempts": 0, "failures": 0, "costed_channels": 0, "uncosted_channels": 0,
-		"list_cost_usd": 0.0, "upstream_cost_usd": 0.0, "margin_usd": 0.0,
+		"attempts": 0, "failures": 0, "list_cost_usd": 0.0,
 	}
 
 	keys := a.store.Keys()
@@ -555,38 +566,28 @@ func (a *App) overview() ManagementResponse {
 		views := set.channels.List()
 		attention := []channelAttention{}
 		var attempts, failures int64
-		var listCost, upstreamCost float64
-		// Margin is billed revenue less the upstream cost of all traffic; a
-		// channel with traffic but no cost ratio adds nothing to that cost.
-		costed, uncosted := 0, 0
+		var listCost float64
 		for _, view := range views {
 			attempts += view.Today.Attempts
 			failures += view.Today.Failures
 			listCost += view.Today.ListCostUSD
-			upstreamCost += view.Today.UpstreamCostUSD
-			switch {
-			case view.Meta.CostRatio > 0:
-				costed++
-			case view.Today.Attempts > 0:
-				uncosted++
-			}
-			name := view.Meta.DisplayName
 			if day := view.Last24h; day.Attempts >= failureRateMinimum && 1-day.SuccessRate >= failureRateAttention {
-				attention = append(attention, channelAttention{AuthIndex: view.AuthIndex, DisplayName: name, Reason: "failure_rate", Value: 1 - day.SuccessRate})
-			}
-			if view.Balance != nil && view.Balance.Error != "" {
-				attention = append(attention, channelAttention{AuthIndex: view.AuthIndex, DisplayName: name, Reason: "balance_error"})
-			} else if view.Balance != nil && view.Balance.Low {
-				attention = append(attention, channelAttention{AuthIndex: view.AuthIndex, DisplayName: name, Reason: "balance_low", Value: view.Balance.Remaining})
+				attention = append(attention, channelAttention{AuthIndex: view.AuthIndex, DisplayName: view.Meta.DisplayName, Reason: "failure_rate", Value: 1 - day.SuccessRate})
 			}
 		}
 		numbers["attempts"] = attempts
 		numbers["failures"] = failures
-		numbers["costed_channels"] = costed
-		numbers["uncosted_channels"] = uncosted
 		numbers["list_cost_usd"] = listCost
-		numbers["upstream_cost_usd"] = upstreamCost
-		numbers["margin_usd"] = today.ChargedUSD - upstreamCost
+		if set.quality != nil {
+			names := make(map[string]string, len(views))
+			for _, view := range views {
+				names[view.AuthIndex] = view.Meta.DisplayName
+			}
+			for _, item := range set.quality.Attention() {
+				attention = append(attention, channelAttention{AuthIndex: item.AuthIndex, DisplayName: names[item.AuthIndex], Reason: item.Verdict,
+					Value: float64(item.Correct) / float64(item.Answered), Model: item.Model, Effort: item.Effort, Answered: item.Answered, Correct: item.Correct})
+			}
+		}
 		channels = map[string]any{"total": len(views), "attention": attention}
 	}
 
@@ -638,6 +639,7 @@ func (a *App) settingsPage() ManagementResponse {
 		{"channels", filepath.Join(dir, channelsFile)},
 		{"channel_stats", filepath.Join(dir, channelStatsFile)},
 		{"quality", filepath.Join(dir, qualityFile)},
+		{"inspection", filepath.Join(dir, inspectionFile)},
 	} {
 		file := dataFile{Name: item.name, Path: item.path}
 		if info, err := os.Stat(item.path); err == nil {
