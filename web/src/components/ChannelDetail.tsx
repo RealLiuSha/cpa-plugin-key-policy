@@ -1,11 +1,14 @@
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
+import { Link } from "react-router-dom";
 import { deleteChannel, fetchChannelDetail, patchChannel } from "../api/channels";
 import { apiErrorCode, extractApiError } from "../api/error";
 import type { ChannelRow } from "../channelMerge";
 import { copyText } from "../clipboard";
 import { formatCount, formatDateTime, formatMillis, formatPercent, formatUSD, timeValue } from "../format";
 import { useT } from "../i18n";
-import type { ChannelDetail as Detail, ChannelMeta, ChannelSummary } from "../types";
+import { formatMetric, QUALITY_METRICS } from "../modelQuality";
+import { channelsOfModel } from "../navigation";
+import type { ChannelDetail as Detail, ChannelMeta, ChannelModelSummary, ChannelSummary } from "../types";
 import ChannelAdapters from "./ChannelAdapters";
 import { ChannelStateBadge, FailurePill } from "./ChannelState";
 import HourlyChart from "./HourlyChart";
@@ -16,7 +19,7 @@ type Translate = ReturnType<typeof useT>;
 export const DETAIL_TABS = ["overview", "adapters", "notes"] as const;
 export type DetailTab = (typeof DETAIL_TABS)[number];
 
-function statusCodes(summary: ChannelSummary): string {
+function statusCodes(summary: Pick<ChannelSummary, "status_codes">): string {
   return Object.entries(summary.status_codes ?? {}).sort(([a], [b]) => a.localeCompare(b)).map(([code, n]) => `${code} ×${n}`).join(", ");
 }
 
@@ -63,6 +66,39 @@ function SummaryTable({ detail }: { detail: Detail }) {
         <tbody>
           {rows.map(([key, value]) => (
             <tr key={key}><td>{t(key)}</td><td className="num mono">{value(detail.last_24h)}</td><td className="num mono">{value(detail.last_7d)}</td></tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+// The last 7 days by model: what the channel served each model with. The
+// channel page compares one model across channels.
+function ModelTable({ authIndex, models }: { authIndex: string; models: ChannelModelSummary[] }) {
+  const t = useT();
+  if (models.length === 0) return <p className="muted">{t("channels.modelsEmpty")}</p>;
+  return (
+    <div className="table-scroll">
+      <table className="channel-summary channel-models-table">
+        <thead>
+          <tr>
+            <th>{t("channels.col.model")}</th>
+            <th className="num">{t("channels.col.modelAttempts")}</th>
+            <th className="num">{t("channels.col.success")}</th>
+            {QUALITY_METRICS.map((metric) => <th key={metric} className="num">{t(`channels.col.${metric}`)}</th>)}
+            <th className="num">{t("channels.col.ttftAvg")}</th>
+          </tr>
+        </thead>
+        <tbody>
+          {models.map((model) => (
+            <tr key={model.model}>
+              <td className="mono"><Link to={channelsOfModel(model.model, authIndex)}>{model.model}</Link></td>
+              <td className="num mono">{formatCount(model.attempts)}</td>
+              <td className="num mono" title={statusCodes(model) || undefined}>{model.attempts > 0 ? formatPercent(model.success_rate) : "—"}</td>
+              {QUALITY_METRICS.map((metric) => <td key={metric} className="num mono">{formatMetric(model, metric)}</td>)}
+              <td className="num mono">{model.ttft_avg_ms > 0 ? formatMillis(model.ttft_avg_ms) : "—"}</td>
+            </tr>
           ))}
         </tbody>
       </table>
@@ -160,6 +196,10 @@ function OverviewTab({ row, detail, missing, onDeleted }: { row: ChannelRow; det
           <section className="detail-section">
             <h3>{t("channels.summaryTitle")}</h3>
             <SummaryTable detail={detail} />
+          </section>
+          <section className="detail-section">
+            <h3>{t("channels.modelsTitle")}</h3>
+            <ModelTable authIndex={row.authIndex} models={detail.models_7d ?? []} />
           </section>
           <section className="detail-section">
             <h3>{t("channels.hoursTitle")}</h3>

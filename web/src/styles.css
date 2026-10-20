@@ -1119,6 +1119,10 @@ ul.overview-warnings { padding-left: 28px; display: flex; flex-direction: column
 .channels-layout.has-detail .channel-table :is(th, td):is(:nth-child(3), :nth-child(7), :nth-child(8)) { display: none; }
 .channel-filter { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
 .channel-filter select { width: auto; min-width: 160px; max-width: 100%; padding: 6px 10px; font-size: 13px; }
+/* A model chosen: its channels side by side, low metrics marked. */
+.channel-compare-hint { margin: 0 0 6px; }
+.metric-low { display: inline-flex; align-items: center; gap: 6px; color: var(--warn-text); }
+.channel-models-table td:first-child { overflow-wrap: anywhere; }
 .channel-table th, .channel-table td { vertical-align: middle; }
 .channel-table tr.selected td { background: var(--accent-soft); }
 .channel-name-cell { min-width: 160px; max-width: 260px; overflow-wrap: anywhere; }

@@ -55,3 +55,11 @@ export function navSection(pathname: string): NavSection | null {
 export function channelPath(authIndex: string): string {
   return `/channels?${new URLSearchParams({ auth_index: authIndex })}`;
 }
+
+// The channel page comparing the channels that serve model, with one
+// channel's detail open.
+export function channelsOfModel(model: string, authIndex = ""): string {
+  const params = new URLSearchParams({ model });
+  if (authIndex) params.set("auth_index", authIndex);
+  return `/channels?${params}`;
+}

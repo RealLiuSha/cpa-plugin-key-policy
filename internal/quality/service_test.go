@@ -251,12 +251,14 @@ func TestDueSlot(t *testing.T) {
 	}
 }
 
-// A round asks every group's channels, records skipped ones, judges the
-// answers by day and keeps the wrong ones; it survives a restart, and the
-// slot it ran for is not run again.
+// A round asks every group's channels the same variants, records skipped
+// ones, judges the answers by day and keeps the wrong ones beside their
+// questions; it survives a restart, and the slot it ran for is not run
+// again. When every answering channel of a group fails, the group is the
+// finding, not each channel.
 func TestInspectionRoundIsJudgedAndSaved(t *testing.T) {
 	dir := t.TempDir()
-	host := &fakeHost{answer: "最少取出 19 个"}
+	host := &fakeHost{answer: "答案：0", files: `{"files":[{"id":"codex-a.json","auth_index":"1111111111111111","name":"codex-a.json","provider":"codex","path":"/auths/codex-a.json"}]}`}
 	now := time.Date(2026, 10, 21, 6, 30, 0, 0, time.UTC) // 14:30 in Shanghai
 	shanghai := time.FixedZone("CST", 8*3600)
 	opts := Options{Path: filepath.Join(dir, "quality.json"), InspectionPath: filepath.Join(dir, "inspection.json"), Host: host,
@@ -267,7 +269,7 @@ func TestInspectionRoundIsJudgedAndSaved(t *testing.T) {
 		t.Fatal("a round started while the schedule is off")
 	}
 	settings := InspectionSettings{Enabled: true, Times: []string{"14:00", "08:00"}, Runs: 2, Groups: []InspectionGroup{
-		{Model: "gpt-6-sol", Effort: "low", Channels: []string{"0123456789ABCDEF", "ffffffffffffffff"}},
+		{Model: "gpt-6-sol", Effort: "low", Channels: []string{"0123456789ABCDEF", "1111111111111111", "ffffffffffffffff"}},
 	}}
 	if _, _, err := s.SetInspection(settings); err != nil {
 		t.Fatal(err)
@@ -275,11 +277,11 @@ func TestInspectionRoundIsJudgedAndSaved(t *testing.T) {
 	s.Tick()
 	waitIdle(t, s)
 	view := s.Inspection(7)
-	cells := view.Days[0].Cells
-	if view.Days[0].Date != "2026-10-21" || len(cells) != 2 || view.Settings.Times[0] != "08:00" {
+	day := view.Days[0]
+	if day.Date != "2026-10-21" || len(day.Cells) != 3 || view.Settings.Times[0] != "08:00" {
 		t.Fatalf("view = %+v", view)
 	}
-	asked, missing := cells[0], cells[1]
+	asked, missing := day.Cells[0], day.Cells[2]
 	if asked.AuthIndex != "0123456789abcdef" || asked.Answered != 2 || asked.Correct != 0 || asked.Verdict != "degraded" ||
 		len(asked.Rounds) != 1 || !asked.Rounds[0].Scheduled || asked.Rounds[0].WrongAnswers != 2 {
 		t.Fatalf("asked channel = %+v", asked)
@@ -287,27 +289,31 @@ func TestInspectionRoundIsJudgedAndSaved(t *testing.T) {
 	if missing.Verdict != "skipped" || missing.Rounds[0].Skipped != "missing" {
 		t.Fatalf("missing channel = %+v", missing)
 	}
-	if attention := s.Attention(); len(attention) != 1 || attention[0].Verdict != "degraded" {
+	if len(day.Groups) != 1 || !day.Groups[0].Low || day.Groups[0].Channels != 2 || day.Groups[0].BestAnswered != 2 {
+		t.Fatalf("groups = %+v", day.Groups)
+	}
+	if attention := s.Attention(); len(attention) != 1 || attention[0].Verdict != "group_low" || attention[0].AuthIndex != "" {
 		t.Fatalf("attention = %+v", attention)
 	}
-	item, err := s.InspectionAnswers(asked.Rounds[0].Round, asked.AuthIndex, "gpt-6-sol", "low")
-	if err != nil || len(item.(roundItem).Wrong) != 2 || item.(roundItem).Wrong[0] != host.answer {
-		t.Fatalf("answers = %+v, %v", item, err)
+	answers, err := s.InspectionAnswers(asked.Rounds[0].Round, asked.AuthIndex, "gpt-6-sol", "low")
+	if err != nil || len(answers.Misses) != 2 || answers.Misses[0].Answer != host.answer || answers.Misses[0].Expected < 10 ||
+		!strings.Contains(answers.Misses[0].Prompt, "答案") || answers.Misses[0].Prompt == answers.Misses[1].Prompt {
+		t.Fatalf("answers = %+v, %v", answers, err)
 	}
 	if !view.NextAt.Equal(time.Date(2026, 10, 22, 8, 0, 0, 0, shanghai)) {
 		t.Fatalf("next round at %v", view.NextAt)
 	}
 	// The manual history is untouched.
-	if state, _ := s.State(); len(state.Auths[0].Results) != 0 {
-		t.Fatalf("candy history = %+v", state.Auths[0].Results)
+	if state, _ := s.State(); len(state.Auths[0].Results)+len(state.Auths[1].Results) != 0 {
+		t.Fatalf("candy history = %+v", state.Auths)
 	}
 	s.Stop()
 	reopened := open(t, opts)
 	reopened.Tick()
-	if reopened.Running() != 0 || host.requests() != 2 {
+	if reopened.Running() != 0 || host.requests() != 4 {
 		t.Fatalf("the slot ran again: running %d, requests %d", reopened.Running(), host.requests())
 	}
-	if again := reopened.Inspection(7); !again.Settings.Enabled || len(again.Days[0].Cells) != 2 {
+	if again := reopened.Inspection(7); !again.Settings.Enabled || len(again.Days[0].Cells) != 3 {
 		t.Fatalf("reopened view = %+v", again)
 	}
 }

@@ -87,8 +87,31 @@ export function modelCounts(authIndexes: string[], models: ChannelModels): { mod
   return [...counts].map(([model, count]) => ({ model, count })).sort((a, b) => a.model.localeCompare(b.model));
 }
 
+// A model's name as the plugin's statistics key it: lower case, without a
+// reasoning suffix such as "(high)" (see modelKey in internal/channel).
+export function modelKey(name: string): string {
+  let key = name.trim();
+  const open = key.lastIndexOf("(");
+  if (key.endsWith(")") && open > 0) key = key.slice(0, open).trim();
+  return key.toLowerCase();
+}
+
 export function servesModel(authIndex: string, model: string, models: ChannelModels | null): boolean {
-  return model === ALL || Boolean(models?.get(authIndex)?.includes(model));
+  if (model === ALL) return true;
+  const key = modelKey(model);
+  return Boolean(models?.get(authIndex)?.some((name) => modelKey(name) === key));
+}
+
+// The name CPA lists for a model a link gave in another spelling, such as
+// the statistics' lower case; the name itself when no channel lists it.
+export function canonicalModel(models: ChannelModels | null, model: string): string {
+  if (model === ALL || !models) return model;
+  const key = modelKey(model);
+  for (const names of models.values()) {
+    const found = names.find((name) => modelKey(name) === key);
+    if (found) return found;
+  }
+  return model;
 }
 
 export function filterChannels(rows: ChannelRow[], type: string, model: string, models: ChannelModels | null): ChannelRow[] {

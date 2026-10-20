@@ -227,17 +227,21 @@ func tokenSemanticsFor(provider, executorType string) tokenSemantics {
 	return semanticsSubset
 }
 
-// billTokens splits a sanitized record into the billed token classes and
-// prices them. Cache reads come only from CacheReadTokens: CPA sets
-// CachedTokens to the creation count for Claude when reads are zero.
-func billTokens(price ModelPrice, semantics tokenSemantics, detail UsageDetail) Bucket {
-	hasWritePrice := price.CacheWritePricePerMillion != nil
+// tokenSplit is a record's tokens in disjoint classes: fresh input, cache
+// reads, cache writes and generated output, reasoning included.
+type tokenSplit struct{ input, cacheRead, cacheWrite, output int64 }
+
+// splitTokens splits a sanitized record by the provider's semantics. Cache
+// reads come only from CacheReadTokens: CPA sets CachedTokens to the creation
+// count for Claude when reads are zero. Cache writes are a class of their own
+// only when writesApart is set; otherwise they stay in input.
+func splitTokens(semantics tokenSemantics, detail UsageDetail, writesApart bool) tokenSplit {
 	cacheRead, output := detail.CacheReadTokens, detail.OutputTokens
 	var input, cacheWrite int64
 	switch semantics {
 	case semanticsIndependent:
 		input = detail.InputTokens
-		if hasWritePrice {
+		if writesApart {
 			cacheWrite = detail.CacheCreationTokens
 		} else {
 			input += detail.CacheCreationTokens
@@ -245,7 +249,7 @@ func billTokens(price ModelPrice, semantics tokenSemantics, detail UsageDetail) 
 	default:
 		cacheRead = min(cacheRead, detail.InputTokens)
 		input = detail.InputTokens - cacheRead
-		if hasWritePrice {
+		if writesApart {
 			cacheWrite = min(detail.CacheCreationTokens, input)
 			input -= cacheWrite
 		}
@@ -256,6 +260,29 @@ func billTokens(price ModelPrice, semantics tokenSemantics, detail UsageDetail) 
 			output += detail.ReasoningTokens
 		}
 	}
+	return tokenSplit{input: input, cacheRead: cacheRead, cacheWrite: cacheWrite, output: output}
+}
+
+// ShapeTokens reads one call's tokens the way billing does, the same for
+// every provider: prompt is every input token (cache reads and writes
+// included), cached the cache reads, generated every output token (reasoning
+// included), reasoning the reasoning alone. A record billing rejects as
+// invalid is all zero.
+func ShapeTokens(provider, executorType string, detail UsageDetail) (prompt, cached, generated, reasoning int64) {
+	detail, _, invalid := sanitizeDetail(detail)
+	if invalid {
+		return 0, 0, 0, 0
+	}
+	split := splitTokens(tokenSemanticsFor(provider, executorType), detail, true)
+	return split.input + split.cacheRead + split.cacheWrite, split.cacheRead, split.output, detail.ReasoningTokens
+}
+
+// billTokens splits a sanitized record into the billed token classes and
+// prices them.
+func billTokens(price ModelPrice, semantics tokenSemantics, detail UsageDetail) Bucket {
+	hasWritePrice := price.CacheWritePricePerMillion != nil
+	split := splitTokens(semantics, detail, hasWritePrice)
+	input, cacheRead, cacheWrite, output := split.input, split.cacheRead, split.cacheWrite, split.output
 	inputPrice := price.InputPricePerMillion
 	readPrice := price.CacheReadPricePerMillion
 	if readPrice == 0 {

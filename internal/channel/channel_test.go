@@ -182,6 +182,58 @@ func TestAdditionalModelRecordIsNotASecondAttempt(t *testing.T) {
 	}
 }
 
+// Each model a channel serves is summarized on its own, under the model the
+// client asked for without a reasoning suffix: success, cache share of the
+// prompt, reasoning per successful attempt, pace of visible output after the
+// first token of streamed answers and failures by status. A non-stream answer's TTFT is its
+// whole latency, so it sets no pace; the image tool's second record of an
+// attempt keeps the chat model's name but not its share, and a probe without a
+// downstream key counts only for the channel. The breakdown survives a flush
+// and reload.
+func TestModelsAreSummarizedApartAndReloaded(t *testing.T) {
+	now := time.Date(2026, 10, 21, 10, 30, 0, 0, time.UTC)
+	path := filepath.Join(t.TempDir(), "stats.json")
+	opts := Options{StatsPath: path, Now: fixedNow(now)}
+	r := newTestRegistry(t, opts)
+	sol := func(trace, requested string, stream bool, ttft, latency time.Duration, tokens Tokens) Observation {
+		return Observation{AuthIndex: indexA, Provider: "codex", Model: "gpt-6.1-sol-2026", RequestedModel: requested, At: now, Stream: stream,
+			TTFT: ttft, Latency: latency, Tokens: tokens, TraceID: trace, RequestedAt: now}
+	}
+	r.Observe(sol("t1", "GPT-6.1-sol(high)", true, time.Second, 3*time.Second, Tokens{Prompt: 1000, Cached: 800, Generated: 400, Reasoning: 300}))
+	r.Observe(sol("t2", "gpt-6.1-sol", true, 3*time.Second, 5*time.Second, Tokens{Prompt: 1000, Cached: 0, Generated: 200, Reasoning: 100}))
+	r.Observe(sol("t3", "gpt-6.1-sol", false, 9*time.Second, 9*time.Second+time.Millisecond, Tokens{Prompt: 1000, Cached: 200, Generated: 900, Reasoning: 200}))
+	// The image tool's record of the first attempt: same trace and start.
+	r.Observe(Observation{AuthIndex: indexA, Model: "gpt-image-2", RequestedModel: "GPT-6.1-sol(high)", TraceID: "t1", RequestedAt: now, At: now,
+		Tokens: Tokens{Prompt: 5000, Generated: 5000}})
+	r.Observe(Observation{AuthIndex: indexA, Model: "gpt-6.1-sol", At: now, Failed: true, StatusCode: 429})
+	// No requested model: the upstream one names it.
+	r.Observe(Observation{AuthIndex: indexA, Model: "gpt-6-astra", At: now, Tokens: Tokens{Prompt: 10, Generated: 5}})
+	// An inspection question counts for the channel, not for the model.
+	r.Observe(Observation{AuthIndex: indexA, Model: "gpt-6-astra", At: now, Probe: true, Tokens: Tokens{Prompt: 14000, Generated: 50}})
+
+	check := func(r *Registry) {
+		t.Helper()
+		view := r.List()[0]
+		models := view.Models24h
+		if view.Last24h.Attempts != 6 || len(models) != 2 || models[0].Model != "gpt-6.1-sol" || models[1].Model != "gpt-6-astra" {
+			t.Fatalf("models = %+v", models)
+		}
+		sol := models[0]
+		if sol.Attempts != 4 || sol.Failures != 1 || !nearly(sol.SuccessRate, 3.0/4) || sol.StatusCodes["429"] != 1 || sol.PromptTokens != 3000 ||
+			!nearly(sol.CacheHitRate, 1000.0/3000) || !nearly(sol.ReasoningPerAttempt, 200) || !nearly(sol.TokensPerSecond, 50) || sol.TTFTAvgMs != 2000 {
+			t.Fatalf("gpt-6.1-sol = %+v", sol)
+		}
+		if astra := models[1]; astra.Attempts != 1 || astra.TokensPerSecond != 0 || astra.TTFTAvgMs != 0 {
+			t.Fatalf("gpt-6-astra = %+v", astra)
+		}
+	}
+	check(r)
+	if err := r.FlushStats(); err != nil {
+		t.Fatal(err)
+	}
+	check(newTestRegistry(t, opts))
+}
+
 func TestTodayFollowsTheConfiguredLocation(t *testing.T) {
 	shanghai := mustShanghai(t)
 	now := time.Date(2026, 10, 19, 0, 30, 0, 0, shanghai)

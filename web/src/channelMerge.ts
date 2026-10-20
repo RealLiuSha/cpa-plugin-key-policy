@@ -149,7 +149,7 @@ export function groupChannels(rows: ChannelRow[]): ChannelGroup[] {
 }
 
 // Failed share of the window's attempts; null without attempts.
-export function failureRate(summary?: ChannelSummary): number | null {
+export function failureRate(summary?: Pick<ChannelSummary, "attempts" | "failures">): number | null {
   if (!summary || !(summary.attempts > 0)) return null;
   return summary.failures / summary.attempts;
 }

@@ -1,6 +1,7 @@
 package channel
 
 import (
+	"cmp"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -32,6 +33,9 @@ const (
 	recentStartsKept = 8
 	// clientClosedRequest is the status CPA records for a downstream cancel.
 	clientClosedRequest = 499
+	// maxModelsPerHour bounds the models one channel hour breaks down by;
+	// attempts of further models count only for the channel.
+	maxModelsPerHour = 16
 )
 
 // histogramBoundsMs are the inclusive upper bounds of the latency and TTFT
@@ -61,6 +65,9 @@ type statusCount struct {
 	count int64
 }
 
+// statusCodes counts failures by upstream status in a fixed table.
+type statusCodes [maxStatusCodes]statusCount
+
 // hourStats is one hour of one channel. Hours are unix hours (unix seconds
 // / 3600) and buckets therefore UTC-aligned.
 type hourStats struct {
@@ -69,7 +76,7 @@ type hourStats struct {
 	hour         int64
 	attempts     int64
 	failures     int64
-	codes        [maxStatusCodes]statusCount
+	codes        statusCodes
 	latency      histogram
 	ttft         histogram
 	inputTokens  int64
@@ -77,15 +84,74 @@ type hourStats struct {
 	listCostNano int64
 	// lastAt is the latest attempt in unix nanoseconds.
 	lastAt int64
+	// models breaks the hour down by the model clients asked for.
+	models []modelHour
 }
 
-// countStatus counts one failure under code. A full table admits a new code
-// only in place of one seen once, so it keeps the frequent codes without
-// ever overstating a count.
-func (b *hourStats) countStatus(code int32) {
+// modelHour is one model's share of a channel hour. streamed counts the
+// successful streamed attempts that reported a first-token time, ttftMs sums
+// those times; paceTokens and paceMs are the visible output tokens (reasoning
+// left out) and the time after the first token, over those that took at
+// least a millisecond more. CPA marks the first token at the first event with
+// content, and Codex streams no reasoning, so its reasoning time falls before
+// the first token.
+type modelHour struct {
+	model      string
+	attempts   int64
+	failures   int64
+	codes      statusCodes
+	prompt     int64
+	cached     int64
+	generated  int64
+	reasoning  int64
+	streamed   int64
+	ttftMs     int64
+	paceTokens int64
+	paceMs     int64
+}
+
+// model returns the hour's entry for key, adding it while the hour has
+// room; nil for no key or a full hour. key must not be a view of a borrowed
+// buffer once added, so it is cloned.
+func (b *hourStats) model(key string) *modelHour {
+	if key == "" {
+		return nil
+	}
+	for i := range b.models {
+		if b.models[i].model == key {
+			return &b.models[i]
+		}
+	}
+	if len(b.models) == maxModelsPerHour {
+		return nil
+	}
+	b.models = append(b.models, modelHour{model: strings.Clone(key)})
+	return &b.models[len(b.models)-1]
+}
+
+// modelKey is the model an observation is counted under: the requested model
+// (else the upstream one) without a reasoning suffix such as "(high)", in
+// lower case, as CPA's model lists name it.
+func modelKey(o *Observation) string {
+	name := strings.TrimSpace(o.RequestedModel)
+	if name == "" {
+		name = strings.TrimSpace(o.Model)
+	}
+	if strings.HasSuffix(name, ")") {
+		if i := strings.LastIndexByte(name, '('); i > 0 {
+			name = strings.TrimSpace(name[:i])
+		}
+	}
+	return strings.ToLower(name)
+}
+
+// count counts one failure under code. A full table admits a new code only
+// in place of one seen once, so it keeps the frequent codes without ever
+// overstating a count.
+func (t *statusCodes) count(code int32) {
 	free, single := -1, -1
-	for i := range b.codes {
-		entry := &b.codes[i]
+	for i := range t {
+		entry := &t[i]
 		switch {
 		case entry.count == 0:
 			if free < 0 {
@@ -102,8 +168,40 @@ func (b *hourStats) countStatus(code int32) {
 		free = single
 	}
 	if free >= 0 {
-		b.codes[free] = statusCount{code: code, count: 1}
+		t[free] = statusCount{code: code, count: 1}
 	}
+}
+
+// fileMap is the table as the statistics file writes it; nil when empty.
+func (t *statusCodes) fileMap() map[string]int64 {
+	var out map[string]int64
+	for _, entry := range t {
+		if entry.count > 0 {
+			if out == nil {
+				out = make(map[string]int64, maxStatusCodes)
+			}
+			out[strconv.Itoa(int(entry.code))] = entry.count
+		}
+	}
+	return out
+}
+
+// parseStatusCodes reads a table the statistics file wrote.
+func parseStatusCodes(codes map[string]int64) (statusCodes, error) {
+	var t statusCodes
+	if len(codes) > maxStatusCodes {
+		return t, fmt.Errorf("more than %d status codes", maxStatusCodes)
+	}
+	slot := 0
+	for key, count := range codes {
+		code, err := strconv.ParseInt(key, 10, 32)
+		if err != nil || code < 0 || count <= 0 {
+			return t, fmt.Errorf("an invalid status code count %q: %d", key, count)
+		}
+		t[slot] = statusCount{code: int32(code), count: count}
+		slot++
+	}
+	return t, nil
 }
 
 // channelStats holds one channel's last 7 days in a ring indexed by hour,
@@ -200,6 +298,85 @@ func (c *channelStats) collect(w span, into *aggregate) {
 	}
 }
 
+// collectModels sums the window by model, most attempts first. An hour from
+// a file can hold a model without attempts; it is left out.
+func (c *channelStats) collectModels(w span) []ModelSummary {
+	var sums []modelHour
+	codes := map[string]map[int32]int64{}
+	for h := w.from; h <= w.to; h++ {
+		b := &c.hours[slotIndex(h)]
+		if b.hour != h {
+			continue
+		}
+		for _, m := range b.models {
+			i := slices.IndexFunc(sums, func(sum modelHour) bool { return sum.model == m.model })
+			if i < 0 {
+				sums = append(sums, modelHour{model: m.model})
+				i = len(sums) - 1
+			}
+			sum := &sums[i]
+			sum.attempts += m.attempts
+			sum.failures += m.failures
+			sum.prompt += m.prompt
+			sum.cached += m.cached
+			sum.generated += m.generated
+			sum.reasoning += m.reasoning
+			sum.streamed += m.streamed
+			sum.ttftMs += m.ttftMs
+			sum.paceTokens += m.paceTokens
+			sum.paceMs += m.paceMs
+			for _, entry := range m.codes {
+				if entry.count > 0 {
+					if codes[m.model] == nil {
+						codes[m.model] = map[int32]int64{}
+					}
+					codes[m.model][entry.code] += entry.count
+				}
+			}
+		}
+	}
+	out := make([]ModelSummary, 0, len(sums))
+	for i := range sums {
+		if sums[i].attempts > 0 {
+			out = append(out, sums[i].summary(codes[sums[i].model]))
+		}
+	}
+	slices.SortFunc(out, func(a, b ModelSummary) int {
+		if a.Attempts != b.Attempts {
+			return cmp.Compare(b.Attempts, a.Attempts)
+		}
+		return strings.Compare(a.Model, b.Model)
+	})
+	return out
+}
+
+func (m *modelHour) summary(codes map[int32]int64) ModelSummary {
+	s := ModelSummary{Model: m.model, Attempts: m.attempts, Failures: m.failures, PromptTokens: m.prompt,
+		CachedTokens: m.cached, GeneratedTokens: m.generated, ReasoningTokens: m.reasoning}
+	if m.attempts > 0 {
+		s.SuccessRate = float64(m.attempts-m.failures) / float64(m.attempts)
+	}
+	if successes := m.attempts - m.failures; successes > 0 {
+		s.ReasoningPerAttempt = float64(m.reasoning) / float64(successes)
+	}
+	if m.prompt > 0 {
+		s.CacheHitRate = float64(min(m.cached, m.prompt)) / float64(m.prompt)
+	}
+	if m.paceMs > 0 {
+		s.TokensPerSecond = float64(m.paceTokens) * 1000 / float64(m.paceMs)
+	}
+	if m.streamed > 0 {
+		s.TTFTAvgMs = m.ttftMs / m.streamed
+	}
+	if len(codes) > 0 {
+		s.StatusCodes = make(map[string]int, len(codes))
+		for code, count := range codes {
+			s.StatusCodes[strconv.Itoa(int(code))] = int(count)
+		}
+	}
+	return s
+}
+
 // remember keeps the latest non-empty identity fields. They are cloned
 // because the caller's strings may be views of a borrowed request buffer.
 func (c *channelStats) remember(o *Observation) {
@@ -289,9 +466,16 @@ func (r *Registry) Observe(o Observation) {
 	if o.Failed {
 		failure = ErrorEntry{At: at, StatusCode: o.StatusCode, Model: strings.Clone(o.Model), Snippet: scrubText(o.ErrorSnippet, errorSnippetLimit)}
 	}
+	key := modelKey(&o)
+	if o.Probe {
+		key = ""
+	}
 	c := r.channelFor(o.AuthIndex)
 	c.mu.Lock()
 	b := c.slot(hour)
+	// The model's share; the second record of an attempt stays out of it
+	// (see below).
+	var m *modelHour
 	switch {
 	case o.Failed:
 		b.attempts++
@@ -300,13 +484,20 @@ func (r *Registry) Observe(o Observation) {
 		if o.StatusCode > 0 && o.StatusCode <= math.MaxInt32 {
 			code = int32(o.StatusCode)
 		}
-		b.countStatus(code)
+		b.codes.count(code)
 		c.addError(failure)
+		if m = b.model(key); m != nil {
+			m.attempts++
+			m.failures++
+			m.codes.count(code)
+		}
 	case c.countedStart(started):
 		// CPA's Codex image tool publishes a second successful record for
 		// the same executor call (PublishAdditionalModel): same trace and
 		// RequestedAt, another model. Each executor call stamps its own
-		// RequestedAt, so a retry is counted as an attempt again.
+		// RequestedAt, so a retry is counted as an attempt again. The record
+		// keeps the chat model's requested name, so its tokens stay out of
+		// that model's share.
 	default:
 		b.attempts++
 		if o.Latency > 0 {
@@ -315,10 +506,27 @@ func (r *Registry) Observe(o Observation) {
 		if o.TTFT > 0 {
 			b.ttft.add(o.TTFT)
 		}
+		if m = b.model(key); m != nil {
+			m.attempts++
+			if o.Stream && o.TTFT > 0 {
+				m.streamed++
+				m.ttftMs += o.TTFT.Milliseconds()
+				if pace, visible := o.Latency-o.TTFT, o.Tokens.Generated-o.Tokens.Reasoning; pace >= time.Millisecond && visible > 0 {
+					m.paceTokens += visible
+					m.paceMs += pace.Milliseconds()
+				}
+			}
+		}
 	}
 	b.inputTokens += max(o.InputTokens, 0)
 	b.outputTokens += max(o.OutputTokens, 0)
 	b.listCostNano += max(o.ListCostNano, 0)
+	if m != nil {
+		m.prompt += max(o.Tokens.Prompt, 0)
+		m.cached += max(o.Tokens.Cached, 0)
+		m.generated += max(o.Tokens.Generated, 0)
+		m.reasoning += max(o.Tokens.Reasoning, 0)
+	}
 	if nano := at.UnixNano(); nano > b.lastAt {
 		b.lastAt = nano
 	}
@@ -521,10 +729,12 @@ func (r *Registry) channelView(index string, c *channelStats, meta Meta, w spans
 	meta.AuthIndex = index
 	view := View{AuthIndex: index, Meta: meta}
 	var last24h, today aggregate
+	view.Models24h = []ModelSummary{}
 	if c != nil {
 		view.AuthID, view.Provider, view.BaseURL = c.authID, c.provider, c.baseURL
 		c.collect(w.last24h, &last24h)
 		c.collect(w.today, &today)
+		view.Models24h = c.collectModels(w.last24h)
 	}
 	view.Last24h = last24h.summary(r.loc)
 	view.Today = today.summary(r.loc)
@@ -542,7 +752,7 @@ func (r *Registry) Detail(authIndex string) (Detail, bool) {
 	now := r.now()
 	w := r.windows(now)
 	meta, hasMeta := r.metaFor(index)
-	detail := Detail{Hours: make([]Point, 0, hoursKept), RecentErrors: []ErrorEntry{}}
+	detail := Detail{Models7d: []ModelSummary{}, Hours: make([]Point, 0, hoursKept), RecentErrors: []ErrorEntry{}}
 	var week aggregate
 	active := false
 	if c := r.lookup(index); c != nil {
@@ -550,6 +760,7 @@ func (r *Registry) Detail(authIndex string) (Detail, bool) {
 		if active = c.active(w.last7d); active || hasMeta {
 			detail.View = r.channelView(index, c, meta, w)
 			c.collect(w.last7d, &week)
+			detail.Models7d = c.collectModels(w.last7d)
 			for h := w.last7d.from; h <= w.last7d.to; h++ {
 				detail.Hours = append(detail.Hours, hourPoint(&c.hours[slotIndex(h)], h, r.loc))
 			}
@@ -746,6 +957,23 @@ type statsFileHour struct {
 	OutputTokens int64            `json:"output_tokens,omitempty"`
 	ListCostNano int64            `json:"list_cost_nano,omitempty"`
 	LastAt       time.Time        `json:"last_at"`
+	// Models is the hour by model; files of 0.24.0 and earlier have none.
+	Models []statsFileModel `json:"models,omitempty"`
+}
+
+type statsFileModel struct {
+	Model           string           `json:"model"`
+	Attempts        int64            `json:"attempts,omitempty"`
+	Failures        int64            `json:"failures,omitempty"`
+	StatusCodes     map[string]int64 `json:"status_codes,omitempty"`
+	PromptTokens    int64            `json:"prompt_tokens,omitempty"`
+	CachedTokens    int64            `json:"cached_tokens,omitempty"`
+	GeneratedTokens int64            `json:"generated_tokens,omitempty"`
+	ReasoningTokens int64            `json:"reasoning_tokens,omitempty"`
+	Streamed        int64            `json:"streamed,omitempty"`
+	TTFTMs          int64            `json:"ttft_ms,omitempty"`
+	PaceTokens      int64            `json:"pace_tokens,omitempty"`
+	PaceMs          int64            `json:"pace_ms,omitempty"`
 }
 
 // statsSnapshot also returns the channels it leaves out: those without an
@@ -804,13 +1032,14 @@ func fileHour(b *hourStats) statsFileHour {
 	if b.lastAt > 0 {
 		out.LastAt = time.Unix(0, b.lastAt).UTC()
 	}
-	for _, entry := range b.codes {
-		if entry.count > 0 {
-			if out.StatusCodes == nil {
-				out.StatusCodes = make(map[string]int64, maxStatusCodes)
-			}
-			out.StatusCodes[strconv.Itoa(int(entry.code))] = entry.count
-		}
+	out.StatusCodes = b.codes.fileMap()
+	for i := range b.models {
+		m := &b.models[i]
+		out.Models = append(out.Models, statsFileModel{
+			Model: m.model, Attempts: m.attempts, Failures: m.failures, StatusCodes: m.codes.fileMap(),
+			PromptTokens: m.prompt, CachedTokens: m.cached, GeneratedTokens: m.generated, ReasoningTokens: m.reasoning,
+			Streamed: m.streamed, TTFTMs: m.ttftMs, PaceTokens: m.paceTokens, PaceMs: m.paceMs,
+		})
 	}
 	if b.latency != (histogram{}) {
 		out.Latency = slices.Clone(b.latency[:])
@@ -889,10 +1118,15 @@ func (fh statsFileHour) stats() (hourStats, error) {
 	if fh.Attempts < 0 || fh.Failures < 0 || fh.Failures > fh.Attempts || fh.InputTokens < 0 || fh.OutputTokens < 0 || fh.ListCostNano < 0 {
 		return hourStats{}, fmt.Errorf("hour %s has negative or inconsistent counts", fh.Hour.Format(time.RFC3339))
 	}
-	if len(fh.StatusCodes) > maxStatusCodes {
-		return hourStats{}, fmt.Errorf("hour %s has more than %d status codes", fh.Hour.Format(time.RFC3339), maxStatusCodes)
+	codes, err := parseStatusCodes(fh.StatusCodes)
+	if err != nil {
+		return hourStats{}, fmt.Errorf("hour %s has %w", fh.Hour.Format(time.RFC3339), err)
+	}
+	if len(fh.Models) > maxModelsPerHour {
+		return hourStats{}, fmt.Errorf("hour %s has more than %d models", fh.Hour.Format(time.RFC3339), maxModelsPerHour)
 	}
 	b := hourStats{
+		codes:        codes,
 		hour:         unixHour(fh.Hour),
 		attempts:     fh.Attempts,
 		failures:     fh.Failures,
@@ -903,14 +1137,15 @@ func (fh statsFileHour) stats() (hourStats, error) {
 	if !fh.LastAt.IsZero() {
 		b.lastAt = fh.LastAt.UnixNano()
 	}
-	slot := 0
-	for key, count := range fh.StatusCodes {
-		code, err := strconv.ParseInt(key, 10, 32)
-		if err != nil || code < 0 || count <= 0 {
-			return hourStats{}, fmt.Errorf("hour %s has an invalid status code count %q: %d", fh.Hour.Format(time.RFC3339), key, count)
+	for _, fm := range fh.Models {
+		m, err := fm.stats()
+		if err != nil {
+			return hourStats{}, fmt.Errorf("hour %s: %w", fh.Hour.Format(time.RFC3339), err)
 		}
-		b.codes[slot] = statusCount{code: int32(code), count: count}
-		slot++
+		if slices.ContainsFunc(b.models, func(other modelHour) bool { return other.model == m.model }) {
+			return hourStats{}, fmt.Errorf("hour %s has model %q twice", fh.Hour.Format(time.RFC3339), m.model)
+		}
+		b.models = append(b.models, m)
 	}
 	for _, h := range []struct {
 		counts []uint32
@@ -925,4 +1160,25 @@ func (fh statsFileHour) stats() (hourStats, error) {
 		}
 	}
 	return b, nil
+}
+
+func (fm statsFileModel) stats() (modelHour, error) {
+	if fm.Model == "" || fm.Model != strings.ToLower(strings.TrimSpace(fm.Model)) {
+		return modelHour{}, fmt.Errorf("model %q is not a model key", fm.Model)
+	}
+	for _, n := range []int64{fm.Attempts, fm.Failures, fm.PromptTokens, fm.CachedTokens, fm.GeneratedTokens, fm.ReasoningTokens, fm.Streamed, fm.TTFTMs, fm.PaceTokens, fm.PaceMs} {
+		if n < 0 {
+			return modelHour{}, fmt.Errorf("model %q has a negative count", fm.Model)
+		}
+	}
+	if fm.Failures > fm.Attempts || fm.Streamed > fm.Attempts-fm.Failures {
+		return modelHour{}, fmt.Errorf("model %q has inconsistent counts", fm.Model)
+	}
+	codes, err := parseStatusCodes(fm.StatusCodes)
+	if err != nil {
+		return modelHour{}, fmt.Errorf("model %q has %w", fm.Model, err)
+	}
+	return modelHour{model: fm.Model, attempts: fm.Attempts, failures: fm.Failures, codes: codes, prompt: fm.PromptTokens,
+		cached: fm.CachedTokens, generated: fm.GeneratedTokens, reasoning: fm.ReasoningTokens, streamed: fm.Streamed,
+		ttftMs: fm.TTFTMs, paceTokens: fm.PaceTokens, paceMs: fm.PaceMs}, nil
 }

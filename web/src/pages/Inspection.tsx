@@ -11,7 +11,7 @@ import { useT } from "../i18n";
 import CellDialog from "../inspection/CellDialog";
 import GroupEditor from "../inspection/GroupEditor";
 import { INSPECTION_DAYS, groupCells, groupKey, newChannels, questionsPerRound, verdictTone, zonedTime } from "../inspection/helpers";
-import { channelPath } from "../navigation";
+import { channelPath, channelsOfModel } from "../navigation";
 import { useVisiblePolling } from "../polling";
 import { CODEX_CONTEXT_TOKENS } from "../quality/types";
 import "../inspection/inspection.css";
@@ -288,16 +288,21 @@ function GroupCard({ group, state, rows, models, busy, nameOf, onEdit, onRemove,
   const fresh = newChannels(group, rows, models);
   const cells = groupCells(state.days, group);
   const today = state.days[0]?.date;
+  const bests = state.days.map((day) => day.groups.find((best) => best.model === group.model && best.effort === group.effort));
+  // The latest day with answers says whether the whole group is low.
+  const latest = bests.find(Boolean);
   return (
     <section className="card inspection-group" aria-label={group.model}>
       <div className="inspection-group-head">
         <h3 className="mono">{group.model}</h3>
         <span className="badge">{group.effort === "none" ? t("quality.settings.effortNone") : group.effort}</span>
         <span className="muted">{t("inspection.channelCount", { count: group.channels.length })}</span>
+        <Link to={channelsOfModel(group.model)}>{t("inspection.traffic")}</Link>
         <span className="spacer" />
         <button type="button" className="btn sm" disabled={busy} onClick={onEdit}>{t("inspection.edit")}</button>
         <button type="button" className="btn sm danger-outline" disabled={busy} onClick={onRemove}>{t("inspection.remove")}</button>
       </div>
+      {latest?.low && <p className="notice inspection-low" role="status">{t("inspection.groupLow", { correct: latest.best_correct, answered: latest.best_answered })}</p>}
       {fresh.length > 0 && (
         <div className="notice inspection-fresh" role="status">
           <span>{t("inspection.fresh", { count: fresh.length, model: group.model, names: fresh.map((row) => row.name).join("、") })}</span>
@@ -333,6 +338,16 @@ function GroupCard({ group, state, rows, models, busy, nameOf, onEdit, onRemove,
               </tr>
             ))}
           </tbody>
+          <tfoot>
+            <tr>
+              <th scope="row">{t("inspection.best")}</th>
+              {bests.map((best, index) => (
+                <td key={state.days[index].date} className="num mono">
+                  {best ? <span className={best.low ? "inspection-warn" : undefined} title={best.low ? t("inspection.bestLow") : undefined}>{best.best_correct}/{best.best_answered}</span> : <span className="muted">—</span>}
+                </td>
+              ))}
+            </tr>
+          </tfoot>
         </table>
       </div>
     </section>

@@ -3,15 +3,17 @@ import { Link, useSearchParams } from "react-router-dom";
 import { fetchChannelData, type ChannelData } from "../api/channels";
 import { extractApiError } from "../api/error";
 import { groupChannels, mergeChannels, type ChannelRow } from "../channelMerge";
-import { ALL, channelTypes, filterChannels, modelCounts, useChannelModels, type ChannelModels } from "../channelModels";
+import { ALL, canonicalModel, channelTypes, filterChannels, modelCounts, useChannelModels, type ChannelModels } from "../channelModels";
+import { formatMetric, formatMetricValue, isLow, MIN_COMPARED_ATTEMPTS, modelSummary, peerMedians, QUALITY_METRICS, type QualityMetric } from "../modelQuality";
 import ChannelDetail, { DETAIL_TABS, type DetailTab } from "../components/ChannelDetail";
 import ChannelFilter from "../components/ChannelFilter";
 import { ChannelStateBadge, FailurePill } from "../components/ChannelState";
 import { ConfirmDialog } from "../components/Modal";
-import { formatMillis, formatPercent } from "../format";
+import { formatCount, formatMillis, formatPercent } from "../format";
 import { useT } from "../i18n";
 import { useVisiblePolling } from "../polling";
 import { setUnsaved } from "../store/unsaved";
+import type { ChannelModelSummary } from "../types";
 
 export const CHANNEL_REFRESH_MS = 30_000;
 
@@ -41,6 +43,29 @@ function latency(row: ChannelRow, field: "latency_p50_ms" | "ttft_p50_ms"): stri
   return day && day.attempts > 0 ? formatMillis(day[field]) : "—";
 }
 
+// One table column: the default view, or a model's view of its channels.
+interface Column {
+  key: string;
+  header: string;
+  num?: boolean;
+  className?: string;
+  title?: (row: ChannelRow) => string | undefined;
+  cell: (row: ChannelRow) => React.ReactNode;
+}
+
+// A model's metric of a channel, marked when it is well below the channels
+// serving the same model.
+function MetricCell({ summary, metric, medians }: { summary?: ChannelModelSummary; metric: QualityMetric; medians: Partial<Record<QualityMetric, number>> }) {
+  const t = useT();
+  const low = isLow(summary, metric, medians);
+  const peer = medians[metric];
+  return (
+    <span className={low ? "metric-low" : undefined} title={peer !== undefined ? t("channels.quality.peer", { value: formatMetricValue(metric, peer) }) : undefined}>
+      {formatMetric(summary, metric)}{low && <span className="badge warn">{t("channels.quality.low")}</span>}
+    </span>
+  );
+}
+
 function ChannelName({ row, search, onOpen }: { row: ChannelRow; search: (authIndex: string) => string; onOpen: (event: React.MouseEvent, authIndex: string) => void }) {
   const t = useT();
   if (!row.authIndex) {
@@ -62,7 +87,7 @@ export default function Channels() {
   const selected = params.get("auth_index") ?? "";
   const tab: DetailTab = DETAIL_TABS.find((value) => value === params.get("tab")) ?? "overview";
   const typeFilter = params.get("type") ?? ALL;
-  const modelFilter = params.get("model") ?? ALL;
+  const modelChoice = params.get("model") ?? ALL;
   const [data, setData] = useState<ChannelData | null>(null);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
@@ -104,8 +129,14 @@ export default function Channels() {
     cpaListed: data.cpa !== null,
   }) : [], [data]);
   const models = useChannelModels(rows, data?.ids ?? {});
+  // A link may spell the model as the statistics do; the filter shows CPA's name.
+  const modelFilter = canonicalModel(models, modelChoice);
   const shown = useMemo(() => filterChannels(rows, typeFilter, modelFilter, models), [rows, typeFilter, modelFilter, models]);
   const groups = useMemo(() => groupChannels(shown), [shown]);
+  // With a model chosen the list compares the channels serving it.
+  const comparing = modelFilter !== ALL;
+  const summaryOf = (row: ChannelRow) => (comparing ? modelSummary(row.view?.models_24h, modelFilter) : undefined);
+  const medians = useMemo(() => (comparing ? peerMedians(shown.map((row) => modelSummary(row.view?.models_24h, modelFilter))) : {}), [comparing, shown, modelFilter]);
   const selectedRow = selected ? rows.find((row) => row.authIndex === selected) ?? (data ? placeholderRow(selected) : undefined) : undefined;
 
   // The selection, tab and filters live in the URL: the back button closes
@@ -138,6 +169,26 @@ export default function Channels() {
     setLeaving(search(authIndex));
   };
 
+  const columns: Column[] = [
+    { key: "name", header: t("channels.col.name"), className: "channel-name-cell", cell: (row) => <ChannelName row={row} search={search} onOpen={open} /> },
+    { key: "type", header: t("channels.col.type"), cell: (row) => <><span className="mono">{row.provider || "—"}</span> <OriginBadge row={row} /></> },
+    ...(comparing ? [
+      { key: "attempts", header: t("channels.col.modelAttempts"), num: true, className: "mono", cell: (row: ChannelRow) => formatCount(summaryOf(row)?.attempts ?? 0) },
+      { key: "status", header: t("channels.col.status"), cell: (row: ChannelRow) => <div className="channel-badges"><ChannelStateBadge row={row} /><FailurePill summary={summaryOf(row)} /></div> },
+      { key: "success", header: t("channels.col.success"), num: true, className: "mono", cell: (row: ChannelRow) => { const summary = summaryOf(row); return summary && summary.attempts > 0 ? formatPercent(summary.success_rate) : "—"; } },
+      ...QUALITY_METRICS.map((metric) => ({ key: metric, header: t(`channels.col.${metric}`), num: true, className: "mono", cell: (row: ChannelRow) => <MetricCell summary={summaryOf(row)} metric={metric} medians={medians} /> })),
+    ] : [
+      { key: "models", header: t("channels.col.models"), className: "mono channel-models", title: (row: ChannelRow) => models?.get(row.authIndex)?.join("\n"), cell: (row: ChannelRow) => modelsText(row, models) },
+      { key: "status", header: t("channels.col.status"), cell: (row: ChannelRow) => <div className="channel-badges"><ChannelStateBadge row={row} /><FailurePill summary={row.view?.last_24h} /></div> },
+      { key: "success", header: t("channels.col.success"), num: true, className: "mono", cell: successRate },
+      { key: "latency", header: t("channels.col.latency"), num: true, className: "mono", cell: (row: ChannelRow) => latency(row, "latency_p50_ms") },
+      { key: "ttft", header: t("channels.col.ttft"), num: true, className: "mono", cell: (row: ChannelRow) => latency(row, "ttft_p50_ms") },
+      { key: "rules", header: t("channels.col.rules"), num: true, className: "mono", cell: (row: ChannelRow) => row.view?.rules || "—" },
+    ]),
+  ];
+  // The name and status lead each card; the rest are its facts.
+  const facts = columns.filter((column) => column.key !== "name" && column.key !== "type" && column.key !== "status");
+
   return (
     <div className={"page channels-page" + (selectedRow ? " has-selection" : "")}>
       <div className="page-head">
@@ -165,6 +216,7 @@ export default function Channels() {
               onModel={(value) => setFilter("model", value)}
             />
           )}
+          {comparing && data && <p className="field-hint channel-compare-hint">{t("channels.quality.hint", { model: modelFilter, min: MIN_COMPARED_ATTEMPTS })}</p>}
           {data && (
             <div className="key-list-context">
               <span>{shown.length === rows.length ? t("channels.count", { total: rows.length, groups: groups.length }) : t("channels.countFiltered", { shown: shown.length, total: rows.length })}</span>
@@ -178,31 +230,17 @@ export default function Channels() {
           ) : groups.map((group) => (
             <section key={group.vendor || "-"} className="channel-group" aria-label={group.vendor || t("channels.noVendor")}>
               <h2 className="usage-section-title">{group.vendor || t("channels.noVendor")} <span className="muted">· {group.rows.length}</span></h2>
-              <div className="card table-wrap channel-table">
+              <div className={"card table-wrap channel-table" + (comparing ? " comparing" : "")}>
                 <table>
                   <thead>
-                    <tr>
-                      <th>{t("channels.col.name")}</th>
-                      <th>{t("channels.col.type")}</th>
-                      <th>{t("channels.col.models")}</th>
-                      <th>{t("channels.col.status")}</th>
-                      <th className="num">{t("channels.col.success")}</th>
-                      <th className="num">{t("channels.col.latency")}</th>
-                      <th className="num">{t("channels.col.ttft")}</th>
-                      <th className="num">{t("channels.col.rules")}</th>
-                    </tr>
+                    <tr>{columns.map((column) => <th key={column.key} className={column.num ? "num" : undefined}>{column.header}</th>)}</tr>
                   </thead>
                   <tbody>
                     {group.rows.map((row) => (
                       <tr key={row.key} className={row.authIndex && row.authIndex === selected ? "selected" : ""} aria-current={row.authIndex && row.authIndex === selected ? "true" : undefined}>
-                        <td className="channel-name-cell"><ChannelName row={row} search={search} onOpen={open} /></td>
-                        <td><span className="mono">{row.provider || "—"}</span> <OriginBadge row={row} /></td>
-                        <td className="mono channel-models" title={models?.get(row.authIndex)?.join("\n")}>{modelsText(row, models)}</td>
-                        <td><div className="channel-badges"><ChannelStateBadge row={row} /><FailurePill summary={row.view?.last_24h} /></div></td>
-                        <td className="num mono">{successRate(row)}</td>
-                        <td className="num mono">{latency(row, "latency_p50_ms")}</td>
-                        <td className="num mono">{latency(row, "ttft_p50_ms")}</td>
-                        <td className="num mono">{row.view?.rules || "—"}</td>
+                        {columns.map((column) => (
+                          <td key={column.key} className={[column.num ? "num" : "", column.className ?? ""].join(" ").trim() || undefined} title={column.title?.(row)}>{column.cell(row)}</td>
+                        ))}
                       </tr>
                     ))}
                   </tbody>
@@ -212,13 +250,9 @@ export default function Channels() {
                 {group.rows.map((row) => (
                   <article key={row.key} className="card channel-card">
                     <div className="channel-card-head"><ChannelName row={row} search={search} onOpen={open} /><OriginBadge row={row} /></div>
-                    <div className="channel-badges"><ChannelStateBadge row={row} /><FailurePill summary={row.view?.last_24h} /></div>
+                    <div className="channel-badges"><ChannelStateBadge row={row} /><FailurePill summary={comparing ? summaryOf(row) : row.view?.last_24h} /></div>
                     <dl className="channel-card-facts">
-                      <div><dt>{t("channels.col.models")}</dt><dd className="mono">{modelsText(row, models)}</dd></div>
-                      <div><dt>{t("channels.col.success")}</dt><dd className="mono">{successRate(row)}</dd></div>
-                      <div><dt>{t("channels.col.latency")}</dt><dd className="mono">{latency(row, "latency_p50_ms")}</dd></div>
-                      <div><dt>{t("channels.col.ttft")}</dt><dd className="mono">{latency(row, "ttft_p50_ms")}</dd></div>
-                      {(row.view?.rules ?? 0) > 0 && <div><dt>{t("channels.col.rules")}</dt><dd className="mono">{row.view!.rules}</dd></div>}
+                      {facts.filter((column) => column.key !== "rules" || (row.view?.rules ?? 0) > 0).map((column) => <div key={column.key}><dt>{column.header}</dt><dd className="mono">{column.cell(row)}</dd></div>)}
                     </dl>
                   </article>
                 ))}

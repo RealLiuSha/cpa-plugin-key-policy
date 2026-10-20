@@ -12,7 +12,7 @@ type Translate = ReturnType<typeof useT>;
 
 function channelReason(item: OverviewChannelAttention, t: Translate): string {
   if (item.reason === "failure_rate") return t("overview.channelReason.failure_rate", { rate: formatPercent(item.value ?? 0) });
-  if (item.reason === "degraded" || item.reason === "suspect") {
+  if (item.reason === "degraded" || item.reason === "suspect" || item.reason === "group_low") {
     return t(`overview.channelReason.${item.reason}`, { model: item.model ?? "", correct: item.correct ?? 0, answered: item.answered ?? 0 });
   }
   return item.reason;
@@ -83,7 +83,7 @@ function ChannelsCard({ channels }: { channels: OverviewResponse["channels"] }) 
         <ul className="overview-list">
           {channels.attention.map((item) => (
             <li key={`${item.auth_index}-${item.reason}-${item.model ?? ""}-${item.effort ?? ""}`}>
-              <Link to={attentionPath(item)} className={item.display_name ? "" : "mono"}>{item.display_name || item.auth_index}</Link>
+              <Link to={attentionPath(item)} className={item.display_name ? "" : "mono"}>{item.display_name || item.auth_index || item.model}</Link>
               <span className={`badge ${item.reason === "suspect" ? "warn" : "danger"}`}>{channelReason(item, t)}</span>
             </li>
           ))}

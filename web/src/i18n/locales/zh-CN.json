@@ -551,7 +551,8 @@
     "channelReason": {
       "failure_rate": "24 小时失败率 {{rate}}",
       "degraded": "巡检降智 {{model}} {{correct}}/{{answered}}",
-      "suspect": "巡检存疑 {{model}} {{correct}}/{{answered}}"
+      "suspect": "巡检存疑 {{model}} {{correct}}/{{answered}}",
+      "group_low": "巡检整组偏低 {{model}} 最好 {{correct}}/{{answered}}"
     },
     "modulesTitle": "模块状态",
     "toSettings": "前往设置",
@@ -572,7 +573,7 @@
   },
   "channels": {
     "title": "渠道",
-    "description": "CPA 中的每个上游凭据：CPA 的配置与实时状态，加上萝卜从用量记录统计的成功率、延迟、成本和余额。",
+    "description": "CPA 中的每个上游凭据：CPA 的配置与实时状态，加上萝卜从用量记录统计的成功率、延迟和按模型的质量指标。选一个模型可以横向比较提供它的渠道。",
     "loadFailed": "加载渠道失败",
     "cpaFailed": "读取 CPA 凭据列表失败（{{error}}），下面只显示萝卜记录过的渠道。",
     "cpaFailedUnknown": "未知错误",
@@ -589,7 +590,13 @@
       "latency": "延迟 p50",
       "ttft": "首字 p50",
       "rules": "规则",
-      "models": "模型"
+      "models": "模型",
+      "model": "模型",
+      "modelAttempts": "24 小时请求",
+      "reasoning": "推理 Token/次",
+      "cache": "缓存命中",
+      "speed": "输出速度",
+      "ttftAvg": "首字均值"
     },
     "origin": {
       "config": "API Key",
@@ -617,7 +624,7 @@
     },
     "tabUnsaved": "{{tab}}（有未保存的修改）",
     "leaveTitle": "放弃未保存的修改？",
-    "leaveMessage": "这个渠道的适配规则、成本与余额或备注里有还没保存的修改，离开后会丢失。",
+    "leaveMessage": "这个渠道的适配规则或备注里有还没保存的修改，离开后会丢失。",
     "leaveStay": "继续编辑",
     "leaveDiscard": "放弃修改",
     "detailFailed": "加载渠道详情失败",
@@ -704,7 +711,14 @@
       "ai_providers": "API Key · {{provider}}"
     },
     "countFiltered": "显示 {{shown}} / {{total}} 个渠道",
-    "filteredEmpty": "没有符合筛选条件的渠道。"
+    "filteredEmpty": "没有符合筛选条件的渠道。",
+    "quality": {
+      "low": "偏低",
+      "peer": "同模型渠道中位数 {{value}}",
+      "hint": "按 {{model}} 比较近 24 小时的真实请求：推理 Token、缓存命中和输出速度（只算可见输出）明显低于同模型其它渠道（成功请求至少 {{min}} 次才参与比较）时标「偏低」，常见原因是被换成了更便宜的模型或推理强度、或者没走提供商的缓存。不同提供商的计数口径不同，只在同一模型内比较。"
+    },
+    "modelsTitle": "按模型（近 7 天）",
+    "modelsEmpty": "近 7 天没有按模型的记录（0.25.0 起才开始统计）。"
   },
   "adapters": {
     "description": "在请求发往这个渠道之前改写请求体，只影响发往这个渠道的那一次尝试。",
@@ -1197,7 +1211,7 @@
   },
   "inspection": {
     "title": "巡检",
-    "description": "每天在固定时间用糖果题考一遍选中的渠道，按模型分组，看哪个渠道降智。每次巡检都是真实的上游请求，消耗渠道额度，但不计任何 Key 的账。",
+    "description": "每天在固定时间给选中的渠道出糖果题，按模型分组看哪个渠道降智。每一轮都会换一组数字、口味和形状随机的新题（同一轮所有渠道题目相同），中转无法按公开题目背答案。每次巡检都是真实的上游请求，消耗渠道额度，但不计任何 Key 的账。",
     "loadFailed": "加载巡检失败",
     "saveFailed": "保存巡检设置失败",
     "startFailed": "启动巡检失败",
@@ -1260,7 +1274,9 @@
       "manual": "手动",
       "showWrong": "查看 {{count}} 个答错的回答",
       "answersGone": "答错的回答只保留 14 天，已经清理。",
-      "answersFailed": "读取回答失败"
+      "answersFailed": "读取回答失败",
+      "question": "第 {{index}} 题（正确答案 {{expected}}）",
+      "published": "原题（正确答案 {{expected}}）"
     },
     "editor": {
       "newTitle": "新增巡检组",
@@ -1273,6 +1289,10 @@
       "notServing": "不再提供该模型",
       "count": "已选 {{checked}} / {{total}}",
       "save": "保存"
-    }
+    },
+    "traffic": "流量对比",
+    "best": "同组最好",
+    "bestLow": "这组至少两个渠道作答，最好的也不算正常：更可能是模型或推理强度做不了这题，而不是某个渠道的问题",
+    "groupLow": "最近一天这组最好的渠道只答对 {{correct}}/{{answered}}：更可能是模型或推理强度的问题，而不是某个渠道降智；可以提高推理强度，或在「流量对比」里看真实请求。"
   }
 }

@@ -49,3 +49,7 @@
 .inspection-round:last-child { border-bottom: 0; }
 .inspection-round-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 13px; }
 .inspection-answer { max-height: 240px; margin: 0; white-space: pre-wrap; }
+.inspection-table tfoot th, .inspection-table tfoot td { border-bottom: 0; color: var(--muted); font-weight: 600; }
+.inspection-low { margin: 0; }
+.inspection-miss { display: flex; flex-direction: column; gap: 6px; }
+.inspection-miss summary { cursor: pointer; color: var(--muted); font-size: 13px; width: fit-content; }

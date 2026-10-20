@@ -383,10 +383,10 @@ func TestUsageHandleTransportFieldNames(t *testing.T) {
 	decode(t, raw, &payload)
 	requestedModelField := string([]byte{65, 108, 105, 97, 115})
 	// Billing reads the first eight; channel statistics read the attempt's
-	// credential, timing and failure fields, which handleUsage lists again
-	// when it decodes the billing fields alone.
+	// credential, timing, streaming and failure fields, which handleUsage
+	// lists again when it decodes the billing fields alone.
 	fields := []string{"TraceID", "Provider", "ExecutorType", "Model", requestedModelField, "APIKey", "Failed", "Detail",
-		"BaseURL", "AuthID", "AuthIndex", "RequestedAt", "Latency", "TTFT", "Failure"}
+		"BaseURL", "AuthID", "AuthIndex", "RequestedAt", "Latency", "TTFT", "Stream", "Failure"}
 	for _, field := range fields {
 		if _, exists := payload[field]; !exists {
 			t.Fatalf("transport snapshot missing %q: %s", field, raw)

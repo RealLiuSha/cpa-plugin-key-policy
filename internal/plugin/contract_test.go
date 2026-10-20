@@ -23,7 +23,7 @@ var (
 	overviewFields       = []string{"today", "keys", "channels", "modules", "warnings", "recent_changes"}
 	settingsFields       = []string{"version", "plugin_id", "display_name", "modules", "module_errors", "hooks", "config_warnings", "files", "ui", "ownership", "health", "timezone"}
 	searchStateFields    = []string{"enabled", "declared", "settings", "status"}
-	channelViewFields    = []string{"auth_index", "meta", "last_24h", "today", "rules"}
+	channelViewFields    = []string{"auth_index", "meta", "last_24h", "today", "models_24h", "rules"}
 	channelViewOptional  = []string{"auth_id", "provider", "base_url"}
 	channelSummaryFields = []string{"attempts", "failures", "success_rate", "latency_p50_ms", "latency_p95_ms", "ttft_p50_ms", "ttft_p95_ms", "input_tokens", "output_tokens", "list_cost_usd"}
 )

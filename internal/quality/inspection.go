@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/rand"
 	"os"
 	"slices"
 	"strconv"
@@ -17,16 +18,18 @@ import (
 	"cpa-key-policy/internal/policy/persist"
 )
 
-// The daily inspection asks chosen channels the candy question at fixed
-// times of day, each group of channels with the model it serves. Its
-// settings and rounds live in a file of their own: rounds do not push the
-// manual test records out, and clearing those keeps the schedule.
+// The daily inspection asks chosen channels variants of the candy question
+// at fixed times of day, each group of channels with the model it serves;
+// every channel of a round gets the same variants, so that their answers
+// compare. Its settings and rounds live in a file of their own: rounds do
+// not push the manual test records out, and clearing those keeps the
+// schedule.
 
 // Inspection limits.
 const (
-	InspectionMaxTimes    = 6
-	InspectionMaxGroups   = 50
-	InspectionMaxChannels = 500
+	inspectionMaxTimes    = 6
+	inspectionMaxGroups   = 50
+	inspectionMaxChannels = 500
 )
 
 const (
@@ -42,9 +45,9 @@ const (
 	dateLayout = "2006-01-02"
 )
 
-// Efforts are the reasoning efforts a question can be asked with; none
+// efforts are the reasoning efforts a question can be asked with; none
 // leaves it to CPA.
-var Efforts = []string{"none", "minimal", "low", "medium", "high", "xhigh"}
+var efforts = []string{"none", "minimal", "low", "medium", "high", "xhigh"}
 
 // InspectionSettings is the schedule: at each of Times (HH:MM in the
 // plugin's timezone) every group's channels are asked Runs candy questions.
@@ -70,29 +73,41 @@ func defaultInspectionSettings() InspectionSettings {
 }
 
 // inspectionRound is one finished round. Slot names the schedule slot it ran
-// for, empty for a round the operator started.
+// for, empty for a round the operator started. Questions are the variants
+// every channel was asked, in order; rounds of 0.24.0 asked the published
+// question and have none.
 type inspectionRound struct {
-	ID       string      `json:"id"`
-	Slot     string      `json:"slot,omitempty"`
-	Started  time.Time   `json:"started"`
-	Finished time.Time   `json:"finished"`
-	Items    []roundItem `json:"items"`
+	ID        string         `json:"id"`
+	Slot      string         `json:"slot,omitempty"`
+	Started   time.Time      `json:"started"`
+	Finished  time.Time      `json:"finished"`
+	Questions []CandyVariant `json:"questions,omitempty"`
+	Items     []roundItem    `json:"items"`
 }
 
 // roundItem is one channel of a round, asked with its group's model.
 // Answered counts the questions that got an answer, Failed those that did
 // not; Error is the last failure. Skipped says why the channel was not asked:
-// missing from CPA, disabled or cooling down.
+// missing from CPA, disabled or cooling down. Wrong holds the wrong answers a
+// 0.24.0 file has; loading moves them into Misses.
 type roundItem struct {
-	AuthIndex string   `json:"auth_index"`
-	Model     string   `json:"model"`
-	Effort    string   `json:"effort"`
-	Answered  int      `json:"answered"`
-	Correct   int      `json:"correct"`
-	Failed    int      `json:"failed"`
-	Skipped   string   `json:"skipped,omitempty"`
-	Error     string   `json:"error,omitempty"`
-	Wrong     []string `json:"wrong,omitempty"`
+	AuthIndex string      `json:"auth_index"`
+	Model     string      `json:"model"`
+	Effort    string      `json:"effort"`
+	Answered  int         `json:"answered"`
+	Correct   int         `json:"correct"`
+	Failed    int         `json:"failed"`
+	Skipped   string      `json:"skipped,omitempty"`
+	Error     string      `json:"error,omitempty"`
+	Misses    []roundMiss `json:"misses,omitempty"`
+	Wrong     []string    `json:"wrong,omitempty"`
+}
+
+// roundMiss is a wrong answer to the round's question at Question; -1 is the
+// published question.
+type roundMiss struct {
+	Question int    `json:"question"`
+	Answer   string `json:"answer"`
 }
 
 type inspectionFile struct {
@@ -105,13 +120,14 @@ func emptyInspection() inspectionFile {
 	return inspectionFile{Version: inspectionFileVersion, Settings: defaultInspectionSettings(), Rounds: []inspectionRound{}}
 }
 
-// roundProgress is the round under way.
+// roundProgress is the round under way, asking questions.
 type roundProgress struct {
-	Slot    string    `json:"slot,omitempty"`
-	Started time.Time `json:"started"`
-	Done    int       `json:"done"`
-	Total   int       `json:"total"`
-	cancel  context.CancelFunc
+	Slot      string    `json:"slot,omitempty"`
+	Started   time.Time `json:"started"`
+	Done      int       `json:"done"`
+	Total     int       `json:"total"`
+	questions []CandyVariant
+	cancel    context.CancelFunc
 }
 
 // normalizeInspection validates settings from the operator or the file:
@@ -132,18 +148,18 @@ func normalizeInspection(in InspectionSettings) (InspectionSettings, error) {
 		}
 	}
 	slices.Sort(out.Times)
-	if len(out.Times) == 0 || len(out.Times) > InspectionMaxTimes {
-		return out, fmt.Errorf("%w: choose 1-%d times of day", ErrInvalid, InspectionMaxTimes)
+	if len(out.Times) == 0 || len(out.Times) > inspectionMaxTimes {
+		return out, fmt.Errorf("%w: choose 1-%d times of day", ErrInvalid, inspectionMaxTimes)
 	}
-	if len(in.Groups) > InspectionMaxGroups {
-		return out, fmt.Errorf("%w: at most %d groups", ErrInvalid, InspectionMaxGroups)
+	if len(in.Groups) > inspectionMaxGroups {
+		return out, fmt.Errorf("%w: at most %d groups", ErrInvalid, inspectionMaxGroups)
 	}
 	for _, group := range in.Groups {
 		group.Model, group.Effort = strings.TrimSpace(group.Model), cmp.Or(strings.TrimSpace(group.Effort), "none")
 		if !ValidModelName(group.Model, true) {
 			return out, fmt.Errorf("%w: choose a model for every group", ErrInvalid)
 		}
-		if !slices.Contains(Efforts, group.Effort) {
+		if !slices.Contains(efforts, group.Effort) {
 			return out, fmt.Errorf("%w: unknown reasoning effort %q", ErrInvalid, group.Effort)
 		}
 		if slices.ContainsFunc(out.Groups, func(g InspectionGroup) bool { return g.Model == group.Model && g.Effort == group.Effort }) {
@@ -157,8 +173,8 @@ func normalizeInspection(in InspectionSettings) (InspectionSettings, error) {
 			return out, err
 		}
 		group.Ignored = slices.DeleteFunc(group.Ignored, func(index string) bool { return slices.Contains(group.Channels, index) })
-		if len(group.Channels)+len(group.Ignored) > InspectionMaxChannels {
-			return out, fmt.Errorf("%w: at most %d channels per group", ErrInvalid, InspectionMaxChannels)
+		if len(group.Channels)+len(group.Ignored) > inspectionMaxChannels {
+			return out, fmt.Errorf("%w: at most %d channels per group", ErrInvalid, inspectionMaxChannels)
 		}
 		out.Groups = append(out.Groups, group)
 	}
@@ -255,9 +271,9 @@ type roundJob struct {
 	item       roundItem
 }
 
-// startRound asks every group's channels the candy question; slot names the
-// schedule slot it runs for. Channels missing from CPA, disabled or cooling
-// down are recorded as skipped.
+// startRound asks every group's channels the same new variants of the candy
+// question; slot names the schedule slot it runs for. Channels missing from
+// CPA, disabled or cooling down are recorded as skipped.
 func (s *Service) startRound(slot string) error {
 	credentials, _, err := s.credentials()
 	if err != nil {
@@ -304,18 +320,24 @@ func (s *Service) startRound(slot string) error {
 	if len(jobs) == 0 {
 		return fmt.Errorf("%w: no channel is chosen for the inspection", ErrInvalid)
 	}
+	started := s.now()
+	rng := rand.New(rand.NewSource(started.UnixNano()))
+	questions := make([]CandyVariant, settings.Runs)
+	for i := range questions {
+		questions[i] = NewCandyVariant(rng)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
-	p := &roundProgress{Slot: slot, Started: s.now().UTC(), Done: skipped, Total: len(jobs), cancel: cancel}
+	p := &roundProgress{Slot: slot, Started: started.UTC(), Done: skipped, Total: len(jobs), questions: questions, cancel: cancel}
 	s.round = p
 	s.tasks.Add(1)
-	go s.runRound(ctx, p, settings.Runs, jobs)
+	go s.runRound(ctx, p, jobs)
 	return nil
 }
 
 // runRound asks the channels in parallel, each its questions one after
 // another, and records the round once all are done. A cancelled round
 // records nothing.
-func (s *Service) runRound(ctx context.Context, p *roundProgress, runs int, jobs []roundJob) {
+func (s *Service) runRound(ctx context.Context, p *roundProgress, jobs []roundJob) {
 	defer s.finish("inspection", func() { s.round = nil }, p.cancel)
 	var wg sync.WaitGroup
 	for i := range jobs {
@@ -330,7 +352,7 @@ func (s *Service) runRound(ctx context.Context, p *roundProgress, runs int, jobs
 					s.logf("error", fmt.Sprintf("cpa-key-policy: inspection of %s panicked: %v", job.item.AuthIndex, recovered))
 				}
 			}()
-			s.inspect(ctx, job, runs)
+			s.inspect(ctx, job, p.questions)
 			s.mu.Lock()
 			p.Done++
 			s.mu.Unlock()
@@ -340,7 +362,8 @@ func (s *Service) runRound(ctx context.Context, p *roundProgress, runs int, jobs
 	if ctx.Err() != nil {
 		return
 	}
-	round := inspectionRound{ID: strconv.FormatInt(p.Started.UnixNano(), 10), Slot: p.Slot, Started: p.Started, Finished: s.now().UTC(), Items: make([]roundItem, len(jobs))}
+	round := inspectionRound{ID: strconv.FormatInt(p.Started.UnixNano(), 10), Slot: p.Slot, Started: p.Started, Finished: s.now().UTC(),
+		Questions: p.questions, Items: make([]roundItem, len(jobs))}
 	for i, job := range jobs {
 		round.Items[i] = job.item
 	}
@@ -350,24 +373,24 @@ func (s *Service) runRound(ctx context.Context, p *roundProgress, runs int, jobs
 	_ = s.saveInspectionLocked()
 }
 
-// inspect asks one channel runs questions.
-func (s *Service) inspect(ctx context.Context, job *roundJob, runs int) {
+// inspect asks one channel the round's questions one after another.
+func (s *Service) inspect(ctx context.Context, job *roundJob, questions []CandyVariant) {
 	item := &job.item
-	for range runs {
+	for i, question := range questions {
 		if ctx.Err() != nil {
 			return
 		}
-		out, _, err := s.ask(ctx, job.credential, item.Model, item.Effort, CandyPrompt)
+		out, _, err := s.ask(ctx, job.credential, item.Model, item.Effort, question.Prompt())
 		switch {
 		case err != nil:
 			item.Failed++
 			item.Error = errorText(err)
-		case CandyCorrect(out.Answer):
+		case candyVariantCorrect(out.Answer, question.Answer):
 			item.Answered++
 			item.Correct++
 		default:
 			item.Answered++
-			item.Wrong = append(item.Wrong, truncate(out.Answer, inspectionAnswerLimit))
+			item.Misses = append(item.Misses, roundMiss{Question: i, Answer: truncate(out.Answer, inspectionAnswerLimit)})
 		}
 	}
 }
@@ -402,10 +425,50 @@ type InspectionView struct {
 	Days         []InspectionDay    `json:"days"`
 }
 
-// InspectionDay is one local date's results.
+// InspectionDay is one local date's results, by channel and by group.
 type InspectionDay struct {
-	Date  string           `json:"date"`
-	Cells []InspectionCell `json:"cells"`
+	Date   string           `json:"date"`
+	Cells  []InspectionCell `json:"cells"`
+	Groups []InspectionBest `json:"groups"`
+}
+
+// InspectionBest is a group's best channel over a period: Channels counts the
+// channels that answered, BestCorrect and BestAnswered are the best one's
+// answers. Low says two or more answered and even the best is not judged ok:
+// the model or the effort cannot do the question, not one channel.
+type InspectionBest struct {
+	Model        string `json:"model"`
+	Effort       string `json:"effort"`
+	Channels     int    `json:"channels"`
+	BestCorrect  int    `json:"best_correct"`
+	BestAnswered int    `json:"best_answered"`
+	Low          bool   `json:"low"`
+}
+
+type groupKey struct{ model, effort string }
+
+// bestOf adds up a period's channels into their groups' best channels.
+func bestOf(channels map[cellKey]*InspectionCell) map[groupKey]*InspectionBest {
+	groups := map[groupKey]*InspectionBest{}
+	for key, cell := range channels {
+		if cell.Answered == 0 {
+			continue
+		}
+		g := groups[groupKey{key.model, key.effort}]
+		if g == nil {
+			g = &InspectionBest{Model: key.model, Effort: key.effort}
+			groups[groupKey{key.model, key.effort}] = g
+		}
+		g.Channels++
+		// A higher share of right answers wins; on a tie, more answers.
+		if better := cell.Correct*g.BestAnswered - g.BestCorrect*cell.Answered; g.BestAnswered == 0 || better > 0 || better == 0 && cell.Answered > g.BestAnswered {
+			g.BestCorrect, g.BestAnswered = cell.Correct, cell.Answered
+		}
+	}
+	for _, g := range groups {
+		g.Low = g.Channels >= 2 && inspectionVerdict(g.BestAnswered, g.BestCorrect, 0) != "ok"
+	}
+	return groups
 }
 
 // InspectionCell is one channel asked with one model and effort on a day:
@@ -454,7 +517,7 @@ func (s *Service) Inspection(days int) InspectionView {
 	index := map[string]int{}
 	for i := range view.Days {
 		date := now.AddDate(0, 0, -i).Format(dateLayout)
-		view.Days[i] = InspectionDay{Date: date, Cells: []InspectionCell{}}
+		view.Days[i] = InspectionDay{Date: date, Cells: []InspectionCell{}, Groups: []InspectionBest{}}
 		index[date] = i
 	}
 	cells := make([]map[cellKey]*InspectionCell, days)
@@ -477,7 +540,7 @@ func (s *Service) Inspection(days int) InspectionView {
 			cell.Correct += item.Correct
 			cell.Failed += item.Failed
 			cell.Rounds = append(cell.Rounds, InspectionRun{Round: round.ID, Started: round.Started, Scheduled: round.Slot != "",
-				Answered: item.Answered, Correct: item.Correct, Failed: item.Failed, Skipped: item.Skipped, Error: item.Error, WrongAnswers: len(item.Wrong)})
+				Answered: item.Answered, Correct: item.Correct, Failed: item.Failed, Skipped: item.Skipped, Error: item.Error, WrongAnswers: len(item.Misses)})
 		}
 	}
 	for i, byKey := range cells {
@@ -487,6 +550,12 @@ func (s *Service) Inspection(days int) InspectionView {
 		}
 		slices.SortFunc(view.Days[i].Cells, func(a, b InspectionCell) int {
 			return cmp.Or(strings.Compare(a.Model, b.Model), strings.Compare(a.Effort, b.Effort), strings.Compare(a.AuthIndex, b.AuthIndex))
+		})
+		for _, g := range bestOf(byKey) {
+			view.Days[i].Groups = append(view.Days[i].Groups, *g)
+		}
+		slices.SortFunc(view.Days[i].Groups, func(a, b InspectionBest) int {
+			return cmp.Or(strings.Compare(a.Model, b.Model), strings.Compare(a.Effort, b.Effort))
 		})
 	}
 	return view
@@ -512,9 +581,28 @@ func (s *Service) nextRunLocked(now time.Time) time.Time {
 	return time.Time{}
 }
 
-// InspectionAnswers returns one channel's item of a round, with the wrong
-// answers while they are kept.
-func (s *Service) InspectionAnswers(round, authIndex, model, effort string) (any, error) {
+// InspectionAnswers is one channel's share of a round with its wrong answers,
+// each beside the question it answered, while they are kept.
+type InspectionAnswers struct {
+	Answered int              `json:"answered"`
+	Correct  int              `json:"correct"`
+	Failed   int              `json:"failed"`
+	Error    string           `json:"error,omitempty"`
+	Misses   []InspectionMiss `json:"misses"`
+}
+
+// InspectionMiss is a wrong answer and the question with its answer.
+// Question is the question's place in the round from 0; -1 is the published
+// question a 0.24.0 round asked.
+type InspectionMiss struct {
+	Question int    `json:"question"`
+	Prompt   string `json:"prompt"`
+	Expected int    `json:"expected"`
+	Answer   string `json:"answer"`
+}
+
+// InspectionAnswers returns one channel's share of a round.
+func (s *Service) InspectionAnswers(round, authIndex, model, effort string) (InspectionAnswers, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, r := range s.inspection.Rounds {
@@ -522,16 +610,26 @@ func (s *Service) InspectionAnswers(round, authIndex, model, effort string) (any
 			continue
 		}
 		for _, item := range r.Items {
-			if item.AuthIndex == authIndex && item.Model == model && item.Effort == effort {
-				return item, nil
+			if item.AuthIndex != authIndex || item.Model != model || item.Effort != effort {
+				continue
 			}
+			out := InspectionAnswers{Answered: item.Answered, Correct: item.Correct, Failed: item.Failed, Error: item.Error, Misses: []InspectionMiss{}}
+			for _, miss := range item.Misses {
+				question := InspectionMiss{Question: -1, Prompt: CandyPrompt, Expected: 21, Answer: miss.Answer}
+				if miss.Question >= 0 && miss.Question < len(r.Questions) {
+					question.Question, question.Prompt, question.Expected = miss.Question, r.Questions[miss.Question].Prompt(), r.Questions[miss.Question].Answer
+				}
+				out.Misses = append(out.Misses, question)
+			}
+			return out, nil
 		}
 	}
-	return nil, fmt.Errorf("%w: the round may have expired", ErrNotFound)
+	return InspectionAnswers{}, fmt.Errorf("%w: the round may have expired", ErrNotFound)
 }
 
 // InspectionAttention is a channel the rounds of the last 24 hours judge
-// degraded or suspect.
+// degraded or suspect, or a group judged low (no AuthIndex; Answered and
+// Correct are its best channel's).
 type InspectionAttention struct {
 	AuthIndex string `json:"auth_index"`
 	Model     string `json:"model"`
@@ -541,13 +639,14 @@ type InspectionAttention struct {
 	Correct   int    `json:"correct"`
 }
 
-// Attention lists the channels the last 24 hours of rounds judge degraded,
-// then those they judge suspect.
+// Attention lists what the last 24 hours of rounds point at: channels
+// judged degraded, groups judged low, then channels judged suspect. A low
+// group stands in for its channels, which share the same cause.
 func (s *Service) Attention() []InspectionAttention {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	since := s.now().Add(-24 * time.Hour)
-	sums := map[cellKey]*InspectionAttention{}
+	sums := map[cellKey]*InspectionCell{}
 	for _, round := range s.inspection.Rounds {
 		if round.Started.Before(since) {
 			continue
@@ -555,20 +654,30 @@ func (s *Service) Attention() []InspectionAttention {
 		for _, item := range round.Items {
 			key := cellKey{item.AuthIndex, item.Model, item.Effort}
 			if sums[key] == nil {
-				sums[key] = &InspectionAttention{AuthIndex: item.AuthIndex, Model: item.Model, Effort: item.Effort}
+				sums[key] = &InspectionCell{}
 			}
 			sums[key].Answered += item.Answered
 			sums[key].Correct += item.Correct
 		}
 	}
+	groups := bestOf(sums)
 	out := []InspectionAttention{}
-	for _, sum := range sums {
-		if sum.Verdict = inspectionVerdict(sum.Answered, sum.Correct, 0); sum.Verdict == "degraded" || sum.Verdict == "suspect" {
-			out = append(out, *sum)
+	for _, g := range groups {
+		if g.Low {
+			out = append(out, InspectionAttention{Model: g.Model, Effort: g.Effort, Verdict: "group_low", Answered: g.BestAnswered, Correct: g.BestCorrect})
 		}
 	}
+	for key, sum := range sums {
+		if g := groups[groupKey{key.model, key.effort}]; g != nil && g.Low {
+			continue
+		}
+		if verdict := inspectionVerdict(sum.Answered, sum.Correct, 0); verdict == "degraded" || verdict == "suspect" {
+			out = append(out, InspectionAttention{AuthIndex: key.authIndex, Model: key.model, Effort: key.effort, Verdict: verdict, Answered: sum.Answered, Correct: sum.Correct})
+		}
+	}
+	severity := map[string]int{"degraded": 0, "group_low": 1, "suspect": 2}
 	slices.SortFunc(out, func(a, b InspectionAttention) int {
-		return cmp.Or(strings.Compare(a.Verdict, b.Verdict), strings.Compare(a.Model, b.Model), strings.Compare(a.AuthIndex, b.AuthIndex))
+		return cmp.Or(cmp.Compare(severity[a.Verdict], severity[b.Verdict]), strings.Compare(a.Model, b.Model), strings.Compare(a.AuthIndex, b.AuthIndex))
 	})
 	return out
 }
@@ -631,6 +740,15 @@ func (s *Service) openInspection() {
 	if file.Rounds == nil {
 		file.Rounds = []inspectionRound{}
 	}
+	for i := range file.Rounds {
+		for j := range file.Rounds[i].Items {
+			item := &file.Rounds[i].Items[j]
+			for _, answer := range item.Wrong {
+				item.Misses = append(item.Misses, roundMiss{Question: -1, Answer: answer})
+			}
+			item.Wrong = nil
+		}
+	}
 	s.inspection = file
 	if s.canWrite() {
 		if err := persist.CleanupStaleTemps(s.inspectionPath, time.Now()); err != nil {
@@ -652,7 +770,7 @@ func (s *Service) saveInspectionLocked() error {
 	for i := range rounds {
 		if rounds[i].Started.Before(now.Add(-inspectionAnswerRetention)) {
 			for j := range rounds[i].Items {
-				rounds[i].Items[j].Wrong = nil
+				rounds[i].Items[j].Misses = nil
 			}
 		}
 	}

@@ -48,7 +48,7 @@ function RoundItem({ run, cell, timezone }: { run: InspectionRun; cell: Inspecti
       setLoading(false);
     }
   };
-  const wrong = answers?.wrong ?? [];
+  const misses = answers?.misses ?? [];
   return (
     <li className="inspection-round">
       <div className="inspection-round-head">
@@ -63,7 +63,15 @@ function RoundItem({ run, cell, timezone }: { run: InspectionRun; cell: Inspecti
       </div>
       {run.error && <div className="field-hint">{recordError(t, run.error)}</div>}
       {error && <div className="error" role="alert">{error}</div>}
-      {answers && (wrong.length === 0 ? <p className="muted">{t("inspection.cell.answersGone")}</p> : wrong.map((text, index) => <pre key={index} className="code-block inspection-answer">{text}</pre>))}
+      {answers && (misses.length === 0 ? <p className="muted">{t("inspection.cell.answersGone")}</p> : misses.map((miss, index) => (
+        <div key={index} className="inspection-miss">
+          <details>
+            <summary>{miss.question < 0 ? t("inspection.cell.published", { expected: miss.expected }) : t("inspection.cell.question", { index: miss.question + 1, expected: miss.expected })}</summary>
+            <pre className="code-block inspection-answer">{miss.prompt}</pre>
+          </details>
+          <pre className="code-block inspection-answer">{miss.answer}</pre>
+        </div>
+      )))}
     </li>
   );
 }

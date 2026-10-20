@@ -70,7 +70,10 @@ type Observation struct {
 	StatusCode int
 	Latency    time.Duration
 	TTFT       time.Duration
-	At         time.Time
+	// Stream says the response was streamed; only then does TTFT mark the
+	// first token rather than the whole response.
+	Stream bool
+	At     time.Time
 	// RequestedAt is when CPA started the attempt (UsageRecord.RequestedAt);
 	// zero when the host did not send it. TraceID is the downstream
 	// request's; with RequestedAt it names one executor call.
@@ -88,6 +91,28 @@ type Observation struct {
 	// keeps at most 200 characters of it and drops anything that looks like
 	// a credential.
 	ErrorSnippet string
+	// RequestedModel is the model the client asked for; the per-model
+	// statistics key on it (Model when it is empty), without a reasoning
+	// suffix and in lower case, as the model lists name models.
+	RequestedModel string
+	// Tokens are the call's tokens the same way for every provider.
+	Tokens Tokens
+	// Probe says no downstream key sent the attempt: this plugin's detection
+	// and inspection requests, made through host callbacks. They count for
+	// the channel but not in the per-model statistics, which describe client
+	// traffic.
+	Probe bool
+}
+
+// Tokens is one call's tokens read the same way for every provider (see
+// policy.ShapeTokens): Prompt is every input token, cache reads and writes
+// included; Cached the cache reads; Generated every output token, reasoning
+// included; Reasoning the reasoning alone.
+type Tokens struct {
+	Prompt    int64
+	Cached    int64
+	Generated int64
+	Reasoning int64
 }
 
 // Summary aggregates a window of attempts.
@@ -120,6 +145,30 @@ type ErrorEntry struct {
 	Snippet    string    `json:"snippet,omitempty"`
 }
 
+// ModelSummary is one model's share of a channel's window, keyed by the
+// model the clients asked for. CacheHitRate is the cached share of prompt
+// tokens; ReasoningPerAttempt the reasoning tokens per successful attempt;
+// TokensPerSecond the pace of visible output (reasoning left out) after the
+// first token and TTFTAvgMs the mean first-token time, both over the
+// successful streamed attempts that reported a first-token time; for a model
+// that does not stream its reasoning, the first-token time includes it. A
+// rate without samples is 0.
+type ModelSummary struct {
+	Model               string         `json:"model"`
+	Attempts            int64          `json:"attempts"`
+	Failures            int64          `json:"failures"`
+	SuccessRate         float64        `json:"success_rate"`
+	StatusCodes         map[string]int `json:"status_codes,omitempty"`
+	PromptTokens        int64          `json:"prompt_tokens"`
+	CachedTokens        int64          `json:"cached_tokens"`
+	GeneratedTokens     int64          `json:"generated_tokens"`
+	ReasoningTokens     int64          `json:"reasoning_tokens"`
+	CacheHitRate        float64        `json:"cache_hit_rate"`
+	ReasoningPerAttempt float64        `json:"reasoning_per_attempt"`
+	TokensPerSecond     float64        `json:"tokens_per_second"`
+	TTFTAvgMs           int64          `json:"ttft_avg_ms"`
+}
+
 // Point is one hour of a channel's history.
 type Point struct {
 	Hour     time.Time `json:"hour"`
@@ -139,12 +188,16 @@ type View struct {
 	Meta      Meta    `json:"meta"`
 	Last24h   Summary `json:"last_24h"`
 	Today     Summary `json:"today"`
+	// Models24h breaks the last 24 hours down by model, most attempts first.
+	Models24h []ModelSummary `json:"models_24h"`
 }
 
 // Detail adds history and recent errors to a View.
 type Detail struct {
 	View
 	Last7d Summary `json:"last_7d"`
+	// Models7d breaks the last 7 days down by model, most attempts first.
+	Models7d []ModelSummary `json:"models_7d"`
 	// Hours holds the last 168 hours, oldest first, empty hours included.
 	Hours []Point `json:"hours"`
 	// RecentErrors holds up to 20 failed attempts of the last 7 days,

@@ -1,6 +1,7 @@
 package plugin
 
 import (
+	"cmp"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -510,8 +511,8 @@ func (a *App) moduleStates(set *moduleSet) map[string]any {
 }
 
 // channelAttention is a channel the overview points out: a high failure
-// rate, or an inspection verdict (degraded or suspect) with the model it was
-// asked with and its answers.
+// rate, or an inspection verdict (degraded or suspect, or group_low for a
+// whole group, with no auth_index) with the model and the answers.
 type channelAttention struct {
 	AuthIndex   string  `json:"auth_index"`
 	DisplayName string  `json:"display_name"`
@@ -565,6 +566,13 @@ func (a *App) overview() ManagementResponse {
 	if set != nil && set.channels != nil {
 		views := set.channels.List()
 		attention := []channelAttention{}
+		// A channel without a name of its own is named by its group in CPA's
+		// config, as the channel page does, rather than by its auth_index.
+		groups, _ := a.cpaCredentials.groups()
+		names := make(map[string]string, len(views))
+		for _, view := range views {
+			names[view.AuthIndex] = cmp.Or(view.Meta.DisplayName, groups[view.AuthIndex])
+		}
 		var attempts, failures int64
 		var listCost float64
 		for _, view := range views {
@@ -572,19 +580,19 @@ func (a *App) overview() ManagementResponse {
 			failures += view.Today.Failures
 			listCost += view.Today.ListCostUSD
 			if day := view.Last24h; day.Attempts >= failureRateMinimum && 1-day.SuccessRate >= failureRateAttention {
-				attention = append(attention, channelAttention{AuthIndex: view.AuthIndex, DisplayName: view.Meta.DisplayName, Reason: "failure_rate", Value: 1 - day.SuccessRate})
+				attention = append(attention, channelAttention{AuthIndex: view.AuthIndex, DisplayName: names[view.AuthIndex], Reason: "failure_rate", Value: 1 - day.SuccessRate})
 			}
 		}
 		numbers["attempts"] = attempts
 		numbers["failures"] = failures
 		numbers["list_cost_usd"] = listCost
 		if set.quality != nil {
-			names := make(map[string]string, len(views))
-			for _, view := range views {
-				names[view.AuthIndex] = view.Meta.DisplayName
-			}
 			for _, item := range set.quality.Attention() {
-				attention = append(attention, channelAttention{AuthIndex: item.AuthIndex, DisplayName: names[item.AuthIndex], Reason: item.Verdict,
+				name := names[item.AuthIndex]
+				if item.AuthIndex != "" && name == "" {
+					name = groups[item.AuthIndex]
+				}
+				attention = append(attention, channelAttention{AuthIndex: item.AuthIndex, DisplayName: name, Reason: item.Verdict,
 					Value: float64(item.Correct) / float64(item.Answered), Model: item.Model, Effort: item.Effort, Answered: item.Answered, Correct: item.Correct})
 			}
 		}

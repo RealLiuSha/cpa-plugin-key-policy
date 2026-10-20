@@ -573,7 +573,7 @@ func (a *App) handleUsage(raw []byte) ([]byte, error) {
 			// shadow the embedded ones billing does not read.
 			var billing struct {
 				UsageHandleRequest
-				BaseURL, AuthID, AuthIndex, RequestedAt, Latency, TTFT, Failure json.RawMessage
+				BaseURL, AuthID, AuthIndex, RequestedAt, Latency, TTFT, Stream, Failure json.RawMessage
 			}
 			if billingErr := json.Unmarshal(raw, &billing); billingErr != nil {
 				billable, err = false, billingErr
@@ -607,12 +607,16 @@ func (a *App) handleUsage(raw []byte) ([]byte, error) {
 	// they describe the upstream, not the downstream key.
 	if set := a.modules.Load(); set != nil && set.channels != nil {
 		listCost, _ := a.store.ListCost(event)
+		prompt, cached, generated, reasoning := policy.ShapeTokens(req.Provider, req.ExecutorType, event.Detail)
 		set.channels.Observe(channel.Observation{
 			AuthIndex: req.AuthIndex, AuthID: req.AuthID, Provider: req.Provider, BaseURL: req.BaseURL, Model: req.Model,
-			Failed: req.Failed, StatusCode: req.Failure.StatusCode,
-			Latency: time.Duration(req.Latency), TTFT: time.Duration(req.TTFT), At: time.Now(), RequestedAt: requestedAt, TraceID: req.TraceID,
+			RequestedModel: event.RequestedModel, Failed: req.Failed, StatusCode: req.Failure.StatusCode,
+			Latency: time.Duration(req.Latency), TTFT: time.Duration(req.TTFT), Stream: req.Stream, At: time.Now(), RequestedAt: requestedAt, TraceID: req.TraceID,
 			InputTokens: req.Detail.InputTokens, OutputTokens: req.Detail.OutputTokens,
 			CacheReadTokens: req.Detail.CacheReadTokens, CacheWriteTokens: req.Detail.CacheCreationTokens,
+			Tokens: channel.Tokens{Prompt: prompt, Cached: cached, Generated: generated, Reasoning: reasoning},
+			// Host-callback requests (detection, inspection) carry no key.
+			Probe:        strings.TrimSpace(req.APIKey) == "",
 			ListCostNano: int64(listCost), ErrorSnippet: req.Failure.Body,
 		})
 	}

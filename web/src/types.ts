@@ -355,6 +355,27 @@ export interface ChannelSummary {
   last_at?: string;
 }
 
+// One model's share of a channel's window, keyed by the model clients asked
+// for (lower case, no reasoning suffix). cache_hit_rate is the cached share of
+// prompt tokens, reasoning_per_attempt the reasoning tokens per successful
+// attempt, tokens_per_second the pace after the first token and ttft_avg_ms
+// the mean first-token time; each is 0 without samples.
+export interface ChannelModelSummary {
+  model: string;
+  attempts: number;
+  failures: number;
+  success_rate: number;
+  status_codes?: Record<string, number>;
+  prompt_tokens: number;
+  cached_tokens: number;
+  generated_tokens: number;
+  reasoning_tokens: number;
+  cache_hit_rate: number;
+  reasoning_per_attempt: number;
+  tokens_per_second: number;
+  ttft_avg_ms: number;
+}
+
 // What the operator records about a channel.
 export interface ChannelMeta {
   auth_index: string;
@@ -373,6 +394,8 @@ export interface ChannelView {
   meta: ChannelMeta;
   last_24h: ChannelSummary;
   today: ChannelSummary;
+  // The last 24 hours by model, most attempts first.
+  models_24h?: ChannelModelSummary[];
   rules?: number;
 }
 
@@ -393,6 +416,7 @@ export interface ChannelError {
 
 export interface ChannelDetail extends ChannelView {
   last_7d: ChannelSummary;
+  models_7d?: ChannelModelSummary[];
   hours: ChannelHour[];
   recent_errors: ChannelError[];
 }
@@ -517,8 +541,9 @@ export interface OverviewKeyAttention {
 
 // failure_rate: value is the 24-hour failure rate (0–1). degraded and
 // suspect are the verdicts of the last 24 hours of inspection rounds, with
-// the model asked and the answers.
-export type ChannelAttentionReason = "failure_rate" | "degraded" | "suspect";
+// the model asked and the answers; group_low is a whole inspection group
+// (no auth_index) whose best channel is not ok, with that channel's answers.
+export type ChannelAttentionReason = "failure_rate" | "degraded" | "suspect" | "group_low";
 
 export interface OverviewChannelAttention {
   auth_index: string;

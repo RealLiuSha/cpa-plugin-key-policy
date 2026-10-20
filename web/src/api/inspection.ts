@@ -46,9 +46,21 @@ export interface InspectionCell {
   rounds: InspectionRun[];
 }
 
+// A group's best channel over a day. low: two or more channels answered and
+// even the best is not ok, so the model or the effort is the likelier cause.
+export interface InspectionBest {
+  model: string;
+  effort: string;
+  channels: number;
+  best_correct: number;
+  best_answered: number;
+  low: boolean;
+}
+
 export interface InspectionDay {
   date: string;
   cells: InspectionCell[];
+  groups: InspectionBest[];
 }
 
 export interface InspectionState {
@@ -61,12 +73,23 @@ export interface InspectionState {
   days: InspectionDay[];
 }
 
+// A wrong answer beside the question it answered; rounds ask variants of the
+// candy question, each with its own counts and answer.
+// question is the question's place in the round from 0; -1 is the published
+// question rounds before variants asked.
+export interface InspectionMiss {
+  question: number;
+  prompt: string;
+  expected: number;
+  answer: string;
+}
+
 export interface InspectionAnswers {
   answered: number;
   correct: number;
   failed: number;
   error?: string;
-  wrong?: string[] | null;
+  misses: InspectionMiss[];
 }
 
 // Go encodes empty lists as null.
@@ -87,7 +110,7 @@ export async function fetchInspection(days: number): Promise<InspectionState> {
     running: data.running ?? null,
     next_at: data.next_at,
     storage_error: data.storage_error ?? "",
-    days: (data.days ?? []).map((day) => ({ ...day, cells: (day.cells ?? []).map((cell) => ({ ...cell, rounds: cell.rounds ?? [] })) })),
+    days: (data.days ?? []).map((day) => ({ ...day, cells: (day.cells ?? []).map((cell) => ({ ...cell, rounds: cell.rounds ?? [] })), groups: day.groups ?? [] })),
   };
 }
 
@@ -105,5 +128,5 @@ export async function fetchInspectionAnswers(round: string, cell: InspectionCell
   const { data } = await apiClient().get<InspectionAnswers>(pluginPath("/quality/inspection/answers"), {
     params: { round, auth_index: cell.auth_index, model: cell.model, effort: cell.effort },
   });
-  return data;
+  return { ...data, misses: data.misses ?? [] };
 }

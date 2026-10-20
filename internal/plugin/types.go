@@ -57,7 +57,7 @@ const (
 	PluginID = "cpa-key-policy"
 	// PluginName is what the CPA panel shows for the plugin and its menu.
 	PluginName = "萝卜"
-	Version    = "0.24.0"
+	Version    = "0.27.0"
 )
 
 type Envelope struct {
@@ -178,8 +178,11 @@ type UsageHandleRequest struct {
 	// the whole record, a text field only leaves itself empty.
 	RequestedAt string `json:"RequestedAt"`
 	// Latency and TTFT are time.Duration values, nanoseconds on the wire.
+	// A non-stream response arrives whole, so its TTFT is about its latency;
+	// Stream tells the two apart.
 	Latency int64        `json:"Latency"`
 	TTFT    int64        `json:"TTFT"`
+	Stream  bool         `json:"Stream"`
 	Failure UsageFailure `json:"Failure"`
 	// Model is the upstream model id the request ran on.
 	Model string `json:"Model"`

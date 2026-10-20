@@ -551,7 +551,8 @@
     "channelReason": {
       "failure_rate": "24-hour failure rate {{rate}}",
       "degraded": "Inspection: degraded on {{model}} {{correct}}/{{answered}}",
-      "suspect": "Inspection: suspect on {{model}} {{correct}}/{{answered}}"
+      "suspect": "Inspection: suspect on {{model}} {{correct}}/{{answered}}",
+      "group_low": "Inspection: whole group low on {{model}}, best {{correct}}/{{answered}}"
     },
     "modulesTitle": "Modules",
     "toSettings": "Settings",
@@ -572,7 +573,7 @@
   },
   "channels": {
     "title": "Channels",
-    "description": "Every upstream credential in CPA: CPA's configuration and live state, plus the success rate, latency, cost and balance Luobo derives from usage records.",
+    "description": "Every upstream credential in CPA: CPA's configuration and live state, plus the success rate, latency and per-model quality signals Luobo derives from usage records. Choose a model to compare the channels serving it.",
     "loadFailed": "Failed to load channels",
     "cpaFailed": "Could not read CPA's credential lists ({{error}}); only channels Luobo has recorded are shown.",
     "cpaFailedUnknown": "unknown error",
@@ -589,7 +590,13 @@
       "latency": "Latency p50",
       "ttft": "TTFT p50",
       "rules": "Rules",
-      "models": "Models"
+      "models": "Models",
+      "model": "Model",
+      "modelAttempts": "Requests (24h)",
+      "reasoning": "Reasoning tokens/req",
+      "cache": "Cache hits",
+      "speed": "Output speed",
+      "ttftAvg": "Mean TTFT"
     },
     "origin": {
       "config": "API key",
@@ -617,7 +624,7 @@
     },
     "tabUnsaved": "{{tab}} (unsaved changes)",
     "leaveTitle": "Discard unsaved changes?",
-    "leaveMessage": "This channel's adapter rules, cost and balance settings or notes have changes that are not saved yet; leaving discards them.",
+    "leaveMessage": "This channel's adapter rules or notes have changes that are not saved yet; leaving discards them.",
     "leaveStay": "Keep editing",
     "leaveDiscard": "Discard changes",
     "detailFailed": "Failed to load the channel detail",
@@ -704,7 +711,14 @@
       "ai_providers": "API keys · {{provider}}"
     },
     "countFiltered": "Showing {{shown}} of {{total}} channels",
-    "filteredEmpty": "No channel matches the filter."
+    "filteredEmpty": "No channel matches the filter.",
+    "quality": {
+      "low": "Low",
+      "peer": "Median of the channels serving this model: {{value}}",
+      "hint": "Real requests for {{model}} over the last 24 hours: reasoning tokens, cache hits and output speed (visible output only) well below the other channels of the model (each with at least {{min}} successful requests) are marked Low. A cheaper model or effort swapped in, or a skipped provider cache, are the usual causes. Providers count differently, so only channels of one model are compared."
+    },
+    "modelsTitle": "By model (last 7 days)",
+    "modelsEmpty": "No per-model records in the last 7 days (counted from 0.25.0 on)."
   },
   "adapters": {
     "description": "Rewrites the request body before an attempt goes to this channel; only that attempt is affected.",
@@ -1197,7 +1211,7 @@
   },
   "inspection": {
     "title": "Inspection",
-    "description": "Asks the chosen channels the candy question at fixed times every day, grouped by model, to show which channel got dumber. Rounds are real upstream requests: they spend the channels' quota but bill no key.",
+    "description": "Asks the chosen channels the candy question at fixed times every day, grouped by model, to show which channel got dumber. Each round asks new variants with random counts, flavors and shapes (the same for every channel of the round), so an upstream cannot answer the published question from memory. Rounds are real upstream requests: they spend the channels' quota but bill no key.",
     "loadFailed": "Could not load the inspection",
     "saveFailed": "Could not save the inspection settings",
     "startFailed": "Could not start the inspection",
@@ -1260,7 +1274,9 @@
       "manual": "Manual",
       "showWrong": "Show {{count}} wrong answers",
       "answersGone": "Wrong answers are kept for 14 days; these are gone.",
-      "answersFailed": "Could not read the answers"
+      "answersFailed": "Could not read the answers",
+      "question": "Question {{index}} (answer {{expected}})",
+      "published": "The published question (answer {{expected}})"
     },
     "editor": {
       "newTitle": "Add group",
@@ -1273,6 +1289,10 @@
       "notServing": "No longer serves the model",
       "count": "{{checked}} of {{total}} checked",
       "save": "Save"
-    }
+    },
+    "traffic": "Compare traffic",
+    "best": "Best of group",
+    "bestLow": "Two or more channels answered and even the best is not OK: the model or effort likely cannot do the question; no single channel is to blame",
+    "groupLow": "On the latest day the group's best channel got only {{correct}}/{{answered}}: the model or the effort is the likelier cause, not one channel. Raise the effort, or compare real traffic."
   }
 }

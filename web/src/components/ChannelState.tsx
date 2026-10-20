@@ -20,7 +20,7 @@ export function ChannelStateBadge({ row }: { row: ChannelRow }) {
 export const FAILURE_WARN = 0.05;
 export const FAILURE_DANGER = 0.2;
 
-export function FailurePill({ summary }: { summary?: ChannelSummary }) {
+export function FailurePill({ summary }: { summary?: Pick<ChannelSummary, "attempts" | "failures"> }) {
   const t = useT();
   const rate = failureRate(summary);
   if (rate === null || !(summary!.failures > 0)) return null;

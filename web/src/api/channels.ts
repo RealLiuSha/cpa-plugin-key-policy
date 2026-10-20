@@ -17,6 +17,7 @@ function view(value: ChannelView): ChannelView {
     meta: { ...(value.meta ?? {}), auth_index: value.auth_index },
     last_24h: summary(value.last_24h),
     today: summary(value.today),
+    models_24h: value.models_24h ?? [],
     rules: value.rules ?? 0,
   };
 }
@@ -53,6 +54,7 @@ export async function fetchChannelDetail(authIndex: string): Promise<ChannelDeta
     ...channel,
     ...view(channel),
     last_7d: summary(channel.last_7d),
+    models_7d: channel.models_7d ?? [],
     hours: channel.hours ?? [],
     recent_errors: channel.recent_errors ?? [],
   };

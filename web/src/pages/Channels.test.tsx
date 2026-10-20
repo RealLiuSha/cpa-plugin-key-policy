@@ -28,10 +28,14 @@ const summary = (attempts: number, failures: number): ChannelSummary => ({
 const inferhub: ChannelView = {
   auth_index: "47c2d6c61505edc3", auth_id: "codex:apikey:1a2b3c4d5e6f", provider: "codex", base_url: "https://inferhub.net/v1",
   meta: { auth_index: "47c2d6c61505edc3", display_name: "Inferhub" }, last_24h: summary(10, 3), today: summary(4, 1), rules: 1,
+  models_24h: [{
+    model: "gpt-6.1-sol", attempts: 30, failures: 2, success_rate: 28 / 30, prompt_tokens: 1000, cached_tokens: 800, generated_tokens: 500,
+    reasoning_tokens: 5600, cache_hit_rate: 0.8, reasoning_per_attempt: 200, tokens_per_second: 42.5, ttft_avg_ms: 900,
+  }],
 };
 const gone: ChannelView = { auth_index: "9999000000000001", provider: "claude", base_url: "https://gone.example/v1", meta: { auth_index: "9999000000000001" }, last_24h: summary(0, 0), today: summary(0, 0), rules: 0 };
 const detail: ChannelDetail = {
-  ...inferhub, last_7d: summary(70, 5), hours: [{ hour: "2026-10-18T15:00:00Z", attempts: 3, failures: 1, latency_p50_ms: 2100, list_cost_usd: 0.001 }],
+  ...inferhub, last_7d: summary(70, 5), models_7d: inferhub.models_24h, hours: [{ hour: "2026-10-18T15:00:00Z", attempts: 3, failures: 1, latency_p50_ms: 2100, list_cost_usd: 0.001 }],
   recent_errors: [{ at: "2026-10-18T15:20:00Z", status_code: 502, model: "gpt-6-sol", snippet: "upstream connect error" }],
 };
 
@@ -102,9 +106,16 @@ describe("Channels page", () => {
     await select(".channel-filter-type", "ai_providers:codex");
     expect(vendors()).toEqual(["inferhub.net"]);
     expect(container.querySelector(".channel-table tbody tr")?.textContent).toContain("gpt-6.1-sol, gpt-image-2");
+    // A model chosen, the row shows what the channel did with it.
+    await select(".channel-filter-model", "gpt-6.1-sol");
+    const cells = [...container.querySelectorAll(".channel-table tbody tr td")].map((cell) => cell.textContent);
+    expect(cells.slice(2)).toEqual(["30", "channels.state.configuredchannels.failurePill 6.7%", "93%", "200", "80%", "42.5/s"]);
+    await select(".channel-filter-model", "all");
     // Opening a channel keeps the filter.
     await click(container.querySelector('a.channel-name[href*="47c2d6c61505edc3"]')!);
     expect(container.querySelector('[data-testid="location"]')?.textContent).toBe("?type=ai_providers%3Acodex&auth_index=47c2d6c61505edc3");
+    // The detail lists the channel's models, each linking to its comparison.
+    expect(container.querySelector('.channel-models-table a[href*="model=gpt-6.1-sol"]')).not.toBeNull();
   });
 
   it("opens a channel from the URL, copies a feedback report and saves notes", async () => {
