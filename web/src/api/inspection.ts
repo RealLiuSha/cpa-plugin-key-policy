@@ -20,7 +20,8 @@ export interface InspectionSettings {
 }
 
 // ok: at least two thirds right; suspect: at least one third; failed: no
-// answer at all; skipped: the channel was missing, disabled or cooling.
+// answer at all; skipped: the channel was missing, disabled, cooling or no
+// longer serving the model.
 export type InspectionVerdict = "ok" | "suspect" | "degraded" | "failed" | "skipped";
 
 export interface InspectionRun {

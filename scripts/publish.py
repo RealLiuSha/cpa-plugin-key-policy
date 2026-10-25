@@ -373,7 +373,7 @@ def paired_data(state_path, usage_path):
     return state, usage
 
 
-MODULE_FILES = (PLUGIN + "-adapters.json", PLUGIN + "-search.json",
+MODULE_FILES = (PLUGIN + "-adapters.json", PLUGIN + "-search.json", PLUGIN + "-search-native.json",
                 PLUGIN + "-channels.json", PLUGIN + "-channel-stats.json", PLUGIN + "-quality.json",
                 PLUGIN + "-inspection.json")
 # Written by an instance handing off in a hot replacement; the next instance replays it

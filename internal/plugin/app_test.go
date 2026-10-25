@@ -78,14 +78,18 @@ func TestRegistrationDeclaresRequestPathCapabilitiesOnly(t *testing.T) {
 
 func TestRemovedHostMethodsAreUnknown(t *testing.T) {
 	app := newTestApp(t, appOptions{})
-	raw, err := app.HandleMethod("response.intercept_after", []byte(`{}`))
+	raw, err := app.HandleMethod("response.intercept_stream_chunk", []byte(`{}`))
 	if err != nil {
 		t.Fatal(err)
 	}
 	var env Envelope
 	decode(t, raw, &env)
 	if env.OK || env.Error == nil || env.Error.Code != "unknown_method" || env.Error.HTTPStatus != http.StatusNotFound {
-		t.Fatalf("response.intercept_after envelope = %+v", env)
+		t.Fatalf("response.intercept_stream_chunk envelope = %+v", env)
+	}
+	// response.intercept_after rewrites only a Codex catalog with native models.
+	if raw := handle(t, app, MethodResponseInterceptAfter, map[string]any{"SourceFormat": "openai", "Model": "", "Body": []byte(`{"data":[]}`), "StatusCode": 200}); string(raw) != "{}" {
+		t.Fatalf("response.intercept_after must pass responses through unchanged: %s", raw)
 	}
 	// model.route leaves every request to CPA while search is off.
 	if route := handle(t, app, MethodModelRoute, map[string]any{"SourceFormat": "codex-alpha-search", "RequestedModel": "claude-x"}); string(route) != `{"Handled":false}` {

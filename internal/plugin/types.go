@@ -41,6 +41,11 @@ const (
 	// requests are answered.
 	MethodModelRoute = "model.route"
 
+	// MethodResponseInterceptAfter runs for every successful non-streaming
+	// response and model list once the plugin registers response_interceptor;
+	// only Codex model catalogs are rewritten.
+	MethodResponseInterceptAfter = "response.intercept_after"
+
 	// MethodUsageHandle delivers a finalized usage record (tokens already parsed
 	// by CPA) after a request completes, for streaming and non-streaming
 	// responses alike. It is the only billing entry point.
@@ -57,7 +62,7 @@ const (
 	PluginID = "cpa-key-policy"
 	// PluginName is what the CPA panel shows for the plugin and its menu.
 	PluginName = "萝卜"
-	Version    = "0.27.0"
+	Version    = "0.29.0"
 )
 
 type Envelope struct {
@@ -100,19 +105,23 @@ type ConfigField struct {
 	Description string   `json:"Description"`
 }
 
-// Capabilities lists what this plugin registers. Routing and response
-// rewriting are not among them: CPA routes by its own registry and the
-// response model is whatever upstream reports.
+// Capabilities lists what this plugin registers. CPA routes by its own
+// registry and the response model is whatever upstream reports; the search
+// module alone routes alpha search and rewrites the Codex catalog.
 type Capabilities struct {
 	FrontendAuthProvider          bool `json:"frontend_auth_provider"`
 	FrontendAuthProviderExclusive bool `json:"frontend_auth_provider_exclusive,omitempty"`
 	// ModelRouter is declared only while alpha search routing is switched
 	// on: once any plugin is a router, every model request crosses into it
 	// with its full body.
-	ModelRouter        bool `json:"model_router,omitempty"`
-	RequestInterceptor bool `json:"request_interceptor"`
-	UsagePlugin        bool `json:"usage_plugin"`
-	ManagementAPI      bool `json:"management_api"`
+	ModelRouter bool `json:"model_router,omitempty"`
+	// ResponseInterceptor is declared with the search module too, for native
+	// search: every successful non-streaming response then crosses into the
+	// plugin, which answers all but the Codex catalog from the first members.
+	ResponseInterceptor bool `json:"response_interceptor,omitempty"`
+	RequestInterceptor  bool `json:"request_interceptor"`
+	UsagePlugin         bool `json:"usage_plugin"`
+	ManagementAPI       bool `json:"management_api"`
 }
 
 type IdentifierResponse struct {
@@ -136,15 +145,43 @@ type FrontendAuthResponse struct {
 }
 
 // RequestInterceptRequest is the part of CPA's pluginapi.RequestInterceptRequest
-// this plugin reads. TraceID is the inbound HTTP request id, which links a
-// media generation to its usage record. Headers are a clone of the inbound
-// request headers; there is no query string. Metadata carries request_path,
-// the matched CPA route.
+// request.intercept_before reads. TraceID is the inbound HTTP request id,
+// which links a media generation to its usage record. Headers are a clone of
+// the inbound request headers; there is no query string.
 type RequestInterceptRequest struct {
-	TraceID      string         `json:"TraceID"`
-	SourceFormat string         `json:"SourceFormat"`
-	Headers      http.Header    `json:"Headers"`
-	Metadata     map[string]any `json:"Metadata"`
+	TraceID      string            `json:"TraceID"`
+	SourceFormat string            `json:"SourceFormat"`
+	Headers      http.Header       `json:"Headers"`
+	Metadata     InterceptMetadata `json:"Metadata"`
+}
+
+// AttemptInterceptRequest is the part request.intercept_after reads for one
+// upstream attempt: the model the client asked for and, in Metadata, the
+// attempt's credential. The headers, most of what there is to decode, are
+// left out.
+type AttemptInterceptRequest struct {
+	RequestedModel string            `json:"RequestedModel"`
+	Metadata       InterceptMetadata `json:"Metadata"`
+}
+
+// InterceptMetadata is what the plugin reads of an intercept request's
+// Metadata: request_path, the matched CPA route, and selected_auth_index, the
+// credential of an attempt. The other values are not decoded.
+type InterceptMetadata struct {
+	RequestPath       metadataString `json:"request_path"`
+	SelectedAuthIndex metadataString `json:"selected_auth_index"`
+}
+
+// metadataString is a Metadata value read as a string; a value of another
+// type reads as empty instead of failing the request.
+type metadataString string
+
+func (s *metadataString) UnmarshalJSON(raw []byte) error {
+	var value string
+	if json.Unmarshal(raw, &value) == nil {
+		*s = metadataString(value)
+	}
+	return nil
 }
 
 // RequestInterceptResponse mirrors pluginapi.RequestInterceptResponse. An empty
@@ -158,6 +195,12 @@ type RequestInterceptResponse struct {
 	StatusCode      int         `json:"StatusCode,omitempty"`
 	ResponseHeaders http.Header `json:"ResponseHeaders,omitempty"`
 	ResponseBody    []byte      `json:"ResponseBody,omitempty"`
+}
+
+// ResponseInterceptResponse mirrors pluginapi.ResponseInterceptResponse. An
+// empty response leaves the response unchanged; a non-empty Body replaces it.
+type ResponseInterceptResponse struct {
+	Body []byte `json:"Body,omitempty"`
 }
 
 // UsageHandleRequest is the part of CPA's pluginapi.UsageRecord this plugin

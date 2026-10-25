@@ -194,7 +194,7 @@ type StateView struct {
 // State lists the credentials with their records, which are summaries:
 // Record returns one in full. Host calls stay outside the lock.
 func (s *Service) State() (StateView, error) {
-	credentials, configErr, err := s.credentials()
+	credentials, configErr, err := s.Credentials()
 	if err != nil {
 		return StateView{}, err
 	}
@@ -246,11 +246,11 @@ func (s *Service) planTypes(credentials []Credential) {
 	s.mu.Unlock()
 }
 
-// credentials lists what a test can be pinned to: the auth manager's
+// Credentials lists what a request can be pinned to: the auth manager's
 // credentials, then the API keys of CPA's config ordered by group and name.
 // When the config cannot be read only the former are listed, and configErr
 // says why.
-func (s *Service) credentials() (list []Credential, configErr string, err error) {
+func (s *Service) Credentials() (list []Credential, configErr string, err error) {
 	list, err = listCredentials(s.host, s.now())
 	if err != nil {
 		return nil, "", fmt.Errorf("%w: %v", ErrHost, err)
@@ -423,7 +423,7 @@ func (s *Service) prepare(req *RunRequest) (func(context.Context, context.Cancel
 // selected returns the enabled, available credentials among ids, or all of
 // them.
 func (s *Service) selected(ids []string, all bool) ([]Credential, error) {
-	credentials, _, err := s.credentials()
+	credentials, _, err := s.Credentials()
 	if err != nil {
 		return nil, err
 	}

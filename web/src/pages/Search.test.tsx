@@ -12,7 +12,7 @@ vi.mock("../polling", () => ({ useVisiblePolling: vi.fn() }));
 const { translate } = vi.hoisted(() => ({ translate: (key: string, vars?: Record<string, string | number>) => key + (vars ? ` ${Object.values(vars).join(" ")}` : "") }));
 vi.mock("../i18n", () => ({ useT: () => translate }));
 import Search, { nextSearchChannel } from "./Search";
-import { fetchSearch } from "../api/search";
+import { fetchSearch, nativeState } from "../api/search";
 import { unsavedMessage } from "../store/unsaved";
 
 const channel = (name: string, force_unhealthy = false, model = "{model}"): SearchChannel => ({ name, model, force_unhealthy });
@@ -41,6 +41,7 @@ describe("Search page", () => {
     enabled: true, declared: true,
     settings: { target_model: "gpt-6.1-sol", keep_models: [], channels: [channel("primary"), channel("backup")], probe: { interval_seconds: 60, timeout_seconds: 15, model: "", url: "", user_agent: "", idle_seconds: 0 } },
     status: { channels: [], routed_total: 0, probe_running: false, probe_key_stored: false },
+    native: nativeState(),
   };
 
   beforeEach(() => {

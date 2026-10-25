@@ -192,29 +192,53 @@ func planType(host Host, authIndex string) (plan string, ok bool) {
 	return strings.TrimSpace(claims.Auth.PlanType), true
 }
 
-// executeModel sends a streaming Responses request pinned to credential c;
-// CPA translates it to the provider's protocol. When ctx ends first the
-// stream is closed, which cancels the upstream request, and ctx's cause is
-// returned. On failure status is the upstream HTTP status, or 0 when no
-// complete response arrived; a stream over ModelStreamMaxBytes is cut off
-// with status 200 and an *AnswerError, not worth repeating.
+// executeModel sends a streaming Responses request pinned to credential c
+// and parses its answer. Failures are StreamEvents'; a final response
+// without a usable answer has status 200 and an *AnswerError.
 func executeModel(ctx context.Context, host Host, c Credential, model string, body any, headers http.Header) (_ ModelResponse, _ int, err error) {
-	// A panic in the host bridge or in parsing fails this request only; the
-	// deferred stream close below still runs.
+	// A panic in parsing fails this request only.
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("模型请求异常：%v", recovered)
+		}
+	}()
+	events, status, err := StreamEvents(ctx, host, c, model, body, headers)
+	if err != nil {
+		return ModelResponse{}, status, err
+	}
+	out, status, err := parseModelStream(events)
+	// CPA may end a stream closed for cancellation with a clean done chunk.
+	if err != nil && status == 0 && ctx.Err() != nil {
+		err = context.Cause(ctx)
+	}
+	return out, status, err
+}
+
+// StreamEvents sends a streaming Responses request pinned to credential c;
+// CPA translates it to the provider's protocol. It returns the complete
+// event stream as ParseResponseStream reads it: only the output item, final
+// response and error events are kept. When ctx ends first the stream is
+// closed, which cancels the upstream request, and ctx's cause is returned.
+// On failure status is the upstream HTTP status, or 0 when no complete
+// response arrived; a stream over ModelStreamMaxBytes is cut off with status
+// 200 and an *AnswerError, not worth repeating.
+func StreamEvents(ctx context.Context, host Host, c Credential, model string, body any, headers http.Header) (_ []byte, _ int, err error) {
+	// A panic in the host bridge fails this request only; the deferred
+	// stream close below still runs.
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			err = fmt.Errorf("模型请求异常：%v", recovered)
 		}
 	}()
 	if strings.TrimSpace(c.ID) == "" || strings.TrimSpace(c.Provider) == "" {
-		return ModelResponse{}, 0, errors.New("the credential has no ID or provider to pin the request to")
+		return nil, 0, errors.New("the credential has no ID or provider to pin the request to")
 	}
 	// Keep <, > and & literal, as Codex sends them.
 	var request bytes.Buffer
 	encoder := json.NewEncoder(&request)
 	encoder.SetEscapeHTML(false)
 	if err := encoder.Encode(body); err != nil {
-		return ModelResponse{}, 0, err
+		return nil, 0, err
 	}
 	raw, err := host.Call("host.model.execute_stream", map[string]any{
 		"entry_protocol": "openai-response", "exit_protocol": "openai-response",
@@ -224,15 +248,15 @@ func executeModel(ctx context.Context, host Host, c Credential, model string, bo
 	if err != nil {
 		var hostErr *HostError
 		if errors.As(err, &hostErr) {
-			return ModelResponse{}, hostErr.HTTPStatus, err
+			return nil, hostErr.HTTPStatus, err
 		}
-		return ModelResponse{}, 0, err
+		return nil, 0, err
 	}
 	var stream struct {
 		ID string `json:"stream_id"`
 	}
 	if err := json.Unmarshal(raw, &stream); err != nil || stream.ID == "" {
-		return ModelResponse{}, 0, fmt.Errorf("CPA did not open a model stream: %s", truncate(string(raw), 200))
+		return nil, 0, fmt.Errorf("CPA did not open a model stream: %s", truncate(string(raw), 200))
 	}
 	// CPA closes a stream by itself only once it is read to the end; closing
 	// it early ends the pending read and cancels the upstream request.
@@ -268,20 +292,15 @@ func executeModel(ctx context.Context, host Host, c Credential, model string, bo
 			if ctx.Err() != nil {
 				err = context.Cause(ctx)
 			}
-			return ModelResponse{}, 0, err
+			return nil, 0, err
 		}
 		// The response did arrive but is not usable: status 200, so that a
 		// probe does not ask for it again.
 		if events.size() > ModelStreamMaxBytes {
-			return ModelResponse{}, http.StatusOK, &AnswerError{fmt.Sprintf("模型响应超过 %d MB，已中断", ModelStreamMaxBytes>>20)}
+			return nil, http.StatusOK, &AnswerError{fmt.Sprintf("模型响应超过 %d MB，已中断", ModelStreamMaxBytes>>20)}
 		}
 	}
-	out, status, err := parseModelStream(events.events())
-	// CPA may end a stream closed for cancellation with a clean done chunk.
-	if err != nil && status == 0 && ctx.Err() != nil {
-		err = context.Cause(ctx)
-	}
-	return out, status, err
+	return events.events(), http.StatusOK, nil
 }
 
 // parseModelStream reads a complete event stream. A final response without a

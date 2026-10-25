@@ -2,6 +2,7 @@ package plugin
 
 import (
 	"bytes"
+	"cmp"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,12 +17,14 @@ import (
 	"sync/atomic"
 	"time"
 
+	"cpa-key-policy/internal/adapt"
 	"cpa-key-policy/internal/channel"
 	"cpa-key-policy/internal/plugin/web"
 	"cpa-key-policy/internal/policy"
 	"cpa-key-policy/internal/policy/persist"
 	"cpa-key-policy/internal/pricingmetadata"
 	"cpa-key-policy/internal/search"
+	"cpa-key-policy/internal/search/native"
 )
 
 type App struct {
@@ -48,9 +51,11 @@ type App struct {
 	// latest one was not applied and is cleared once one is.
 	warnings atomic.Pointer[[]string]
 	rejected atomic.Pointer[string]
-	// declaredRouter is what the last registration told CPA about
-	// model_router; the settings can ask for a change that is not yet live.
+	// declaredRouter and declaredNative are what the last registration told
+	// CPA about model_router and response_interceptor; the settings can ask
+	// for a change that is not yet live.
 	declaredRouter atomic.Bool
+	declaredNative atomic.Bool
 	// hostSchema is the lifecycle version the host offered.
 	hostSchema atomic.Uint32
 	// quiesced is set between plugin.quiesce and the next configuration: a
@@ -148,6 +153,8 @@ func (a *App) handleMethod(method string, request []byte) ([]byte, error) {
 		return a.adaptAttempt(request)
 	case MethodModelRoute:
 		return a.routeModel(request)
+	case MethodResponseInterceptAfter:
+		return a.interceptResponse(request)
 	case MethodUsageHandle:
 		return a.handleUsage(request)
 	case MethodManagementRegister:
@@ -417,14 +424,14 @@ func (a *App) quiesce() error {
 // no longer owns the files.
 //
 // CPA refuses every callback of the plugin, stream_close included, before it
-// calls shutdown, so a detection test still reading a model stream ends only
-// when the upstream sends again, and CPA gives the whole shutdown 30 seconds.
-// The order follows from that: the accounting cut first, which also applies
-// the tail of a journal being followed; then the modules, whose channel
-// statistics then include that tail and are written before the detection
-// tests are waited for; the data directory lock last, so every write still
-// owns the files. The tests are always waited for: CPA v8.0.13 unloads the
-// library right after shutdown returns.
+// calls shutdown, so a detection test or native search probe still reading a
+// model stream ends only when the upstream sends again, and CPA gives the
+// whole shutdown 30 seconds. The order follows from that: the accounting cut
+// first, which also applies the tail of a journal being followed; then the
+// modules, whose channel statistics then include that tail and are written
+// before the tests and probes are waited for; the data directory lock last,
+// so every write still owns the files. They are always waited for: CPA
+// v8.0.13 unloads the library right after shutdown returns.
 func (a *App) Shutdown() {
 	a.lifecycleMu.Lock()
 	defer a.lifecycleMu.Unlock()
@@ -433,8 +440,8 @@ func (a *App) Shutdown() {
 	if a.quiesced.Load() || a.owner == nil {
 		// The files are not this instance's: nothing is written.
 		a.store.Stop()
-		if set != nil && set.quality != nil {
-			set.quality.Stop()
+		if set != nil {
+			set.stopProbes()
 		}
 		return
 	}
@@ -453,8 +460,10 @@ func (a *App) Shutdown() {
 
 func (a *App) registration() Registration {
 	set := a.modules.Load()
-	router := a.pluginSettings().SearchEnabled && set != nil && set.search != nil
+	searchOn := a.pluginSettings().SearchEnabled && set != nil
+	router, interceptor := searchOn && set.search != nil, searchOn && set.native != nil
 	a.declaredRouter.Store(router)
+	a.declaredNative.Store(interceptor)
 	return Registration{
 		SchemaVersion: min(SchemaVersion, max(a.hostSchema.Load(), MinHostSchemaVersion)),
 		Metadata: Metadata{
@@ -468,7 +477,7 @@ func (a *App) registration() Registration {
 				{Name: "usage_timezone", Type: "string", Description: "IANA timezone used for natural-day usage buckets. Defaults to Asia/Shanghai."},
 				{Name: "keys", Type: "array", Description: "First-boot downstream key seeds. State is authoritative after initialization."},
 				{Name: "models", Type: "array", Description: "First-boot price rows: upstream model id (name), optional provider qualifier, billing mode and prices."},
-				{Name: "search_enabled", Type: "boolean", Description: "Route Codex alpha search (registers a model router; settings are on the plugin's search page)."},
+				{Name: "search_enabled", Type: "boolean", Description: "Codex web search: native search through each channel's web_search tool, with alpha search as the fallback (registers a model router and a response interceptor; settings are on the plugin's search page)."},
 				{Name: "cpa_config_path", Type: "string", Description: "CPA config.yaml, read only for the upstream keys of detection tests and adapter rule tries and for group names. Defaults to config.yaml."},
 			},
 		},
@@ -476,6 +485,7 @@ func (a *App) registration() Registration {
 			FrontendAuthProvider:          true,
 			FrontendAuthProviderExclusive: false,
 			ModelRouter:                   router,
+			ResponseInterceptor:           interceptor,
 			RequestInterceptor:            true,
 			UsagePlugin:                   true,
 			ManagementAPI:                 true,
@@ -506,43 +516,93 @@ func (a *App) interceptRequest(raw []byte) ([]byte, error) {
 	if _, err := decodeSkippingBody(raw, &req); err != nil {
 		return nil, err
 	}
-	requestPath, _ := req.Metadata["request_path"].(string)
-	denial := a.store.AdmitIntercepted(req.Headers, requestPath, req.TraceID)
+	denial := a.store.AdmitIntercepted(req.Headers, string(req.Metadata.RequestPath), req.TraceID)
 	if denial == nil {
 		return OKEnvelope(RequestInterceptResponse{})
 	}
 	return OKEnvelope(rejectionResponse(req.SourceFormat, denial, time.Now()))
 }
 
-// adaptAttempt runs the channel's adapter rules on one upstream attempt.
-// The body is decoded only when a rule of the selected credential applies to
-// the request path; any problem leaves the attempt unchanged.
+// adaptAttempt prepares one upstream attempt for the selected credential:
+// native search takes the web_search tool out on a channel the operator
+// disabled or that refuses it, then the channel's adapter rules run. The body
+// is decoded only when either applies; any problem leaves the attempt as it
+// is.
 func (a *App) adaptAttempt(raw []byte) ([]byte, error) {
 	set := a.modules.Load()
-	if set == nil || set.adapters == nil {
+	if set == nil {
 		return OKEnvelope(RequestInterceptResponse{})
 	}
-	var req RequestInterceptRequest
+	var req AttemptInterceptRequest
 	value, err := decodeSkippingBody(raw, &req)
 	if err != nil {
 		return OKEnvelope(RequestInterceptResponse{})
 	}
-	authIndex, _ := req.Metadata["selected_auth_index"].(string)
-	requestPath, _ := req.Metadata["request_path"].(string)
-	book := set.adapters.Book()
-	if !book.Match(authIndex, requestPath) {
+	authIndex, requestPath := string(req.Metadata.SelectedAuthIndex), string(req.Metadata.RequestPath)
+	strip := set.native != nil && set.native.Strips(authIndex, req.RequestedModel)
+	var book *adapt.Book
+	if set.adapters != nil {
+		book = set.adapters.Book()
+	}
+	rules := book != nil && book.Match(authIndex, requestPath)
+	if !strip && !rules {
 		return OKEnvelope(RequestInterceptResponse{})
 	}
 	body, err := decodeBodyBytes(value)
 	if err != nil {
 		return OKEnvelope(RequestInterceptResponse{})
 	}
-	rewritten, applied, err := book.Apply(authIndex, requestPath, body)
-	if err != nil || rewritten == nil {
+	changed := false
+	if strip {
+		if stripped, ok := native.StripWebSearch(body); ok {
+			body, changed = stripped, true
+		}
+	}
+	if rules {
+		if rewritten, applied, err := book.Apply(authIndex, requestPath, body); err == nil && rewritten != nil {
+			set.adapters.RecordHits(applied)
+			body, changed = rewritten, true
+		}
+	}
+	if !changed {
 		return OKEnvelope(RequestInterceptResponse{})
 	}
-	set.adapters.RecordHits(applied)
-	return OKEnvelope(RequestInterceptResponse{Body: rewritten})
+	return OKEnvelope(RequestInterceptResponse{Body: body})
+}
+
+// interceptResponse rewrites the Codex model catalog for native search. The
+// host sends every successful non-streaming response and model list here; the
+// catalog is a model list, the only kind without a model, so the members are
+// read in the host's order (SourceFormat, Model and RequestedModel come before
+// the bodies) and the call ends at the first one that rules it out.
+func (a *App) interceptResponse(raw []byte) ([]byte, error) {
+	set := a.modules.Load()
+	if set == nil || set.native == nil {
+		return OKEnvelope(ResponseInterceptResponse{})
+	}
+	catalog := true
+	var value []byte
+	err := scanMembers(raw, func(key, member []byte) bool {
+		switch string(key) {
+		case "SourceFormat":
+			catalog = string(member) == `"openai"`
+		case "Model", "RequestedModel":
+			catalog = string(member) == `""` || string(member) == "null"
+		case "StatusCode":
+			catalog = string(member) == "200"
+		case "Body":
+			value = member
+		}
+		return catalog
+	})
+	if err != nil || !catalog || value == nil {
+		return OKEnvelope(ResponseInterceptResponse{})
+	}
+	body, err := decodeBodyBytes(value)
+	if err != nil || body == nil {
+		return OKEnvelope(ResponseInterceptResponse{})
+	}
+	return OKEnvelope(ResponseInterceptResponse{Body: set.native.RewriteCatalog(body)})
 }
 
 // routeModel answers model.route: alpha search requests only.
@@ -620,6 +680,9 @@ func (a *App) handleUsage(raw []byte) ([]byte, error) {
 			ListCostNano: int64(listCost), ErrorSnippet: req.Failure.Body,
 		})
 	}
+	if set := a.modules.Load(); req.Failed && set != nil && set.native != nil {
+		set.native.ObserveFailure(req.AuthIndex, cmp.Or(req.Alias, req.Model), req.Failure.StatusCode, req.Failure.Body)
+	}
 	a.store.RecordUsage(event)
 	return OKEnvelope(UsageHandleResponse{})
 }
@@ -678,6 +741,8 @@ func (a *App) managementRegistration() ManagementRegistrationResponse {
 			{Method: http.MethodGet, Path: base + "/search", Description: "Alpha search routing settings and live channel state."},
 			{Method: http.MethodPut, Path: base + "/search", Description: "Replace the alpha search routing settings."},
 			{Method: http.MethodPost, Path: base + "/search/import", Description: "Import settings from an alpha-search-model plugin block."},
+			{Method: http.MethodPut, Path: base + "/search/native", Description: "Replace the native search settings."},
+			{Method: http.MethodPost, Path: base + "/search/native/probe", Description: "Probe every channel serving a Codex catalog model for native search now, or one by auth_index."},
 			{Method: http.MethodGet, Path: base + "/settings", Description: "Module state, hook timings, data files and warnings."},
 		}, qualityRoutes(base)...),
 		Resources: []ResourceRoute{
@@ -791,6 +856,10 @@ func (a *App) handleManagement(raw []byte) ([]byte, error) {
 		return OKEnvelope(a.updateSearch(req.Body))
 	case req.Method == http.MethodPost && path == base+"/search/import":
 		return OKEnvelope(a.importSearch(req.Body))
+	case req.Method == http.MethodPut && path == base+"/search/native":
+		return OKEnvelope(a.updateNativeSearch(req.Body))
+	case req.Method == http.MethodPost && path == base+"/search/native/probe":
+		return OKEnvelope(a.probeNativeSearch(req.Body))
 	case req.Method == http.MethodGet && path == base+"/settings":
 		return OKEnvelope(a.settingsPage())
 	case path == base+"/quality" || strings.HasPrefix(path, base+"/quality/"):

@@ -24,6 +24,12 @@ import (
 // compare. Its settings and rounds live in a file of their own: rounds do
 // not push the manual test records out, and clearing those keeps the
 // schedule.
+//
+// A group follows CPA: each round also asks every other channel the operator
+// did not ignore, and CPA answers at once, without an upstream request, when
+// a channel has no such model. The round then adds the channels that serve
+// the model to the group and drops those that stopped serving it or left
+// CPA, so the groups need no upkeep when upstreams change.
 
 // Inspection limits.
 const (
@@ -88,8 +94,9 @@ type inspectionRound struct {
 // roundItem is one channel of a round, asked with its group's model.
 // Answered counts the questions that got an answer, Failed those that did
 // not; Error is the last failure. Skipped says why the channel was not asked:
-// missing from CPA, disabled or cooling down. Wrong holds the wrong answers a
-// 0.24.0 file has; loading moves them into Misses.
+// missing from CPA, disabled, cooling down, or not serving the model any
+// more. Wrong holds the wrong answers a 0.24.0 file has; loading moves them
+// into Misses.
 type roundItem struct {
 	AuthIndex string      `json:"auth_index"`
 	Model     string      `json:"model"`
@@ -225,11 +232,11 @@ func (s *Service) slotDoneLocked(slot string) bool {
 	return slices.ContainsFunc(s.inspection.Rounds, func(r inspectionRound) bool { return r.Slot == slot })
 }
 
-// scheduledLocked reports whether the schedule has anything to run.
+// scheduledLocked reports whether the schedule has anything to run. A group
+// whose channels all left still runs, to find the channels serving its model.
 func (s *Service) scheduledLocked() bool {
 	settings := s.inspection.Settings
-	return settings.Enabled && s.inspectionErr == nil &&
-		slices.ContainsFunc(settings.Groups, func(g InspectionGroup) bool { return len(g.Channels) > 0 })
+	return settings.Enabled && s.inspectionErr == nil && len(settings.Groups) > 0
 }
 
 // Tick starts the round a schedule slot is due for. The plugin calls it
@@ -265,24 +272,32 @@ func (s *Service) StartInspection() error {
 	return s.startRound("")
 }
 
-// roundJob is one channel of a round under way; its goroutine owns item.
+// roundJob is one channel of a round under way; its goroutine owns item and
+// notServing. member says the group asked the channel before the round; any
+// other channel is asked only to find out whether it serves the model now.
 type roundJob struct {
 	credential Credential
 	item       roundItem
+	member     bool
+	notServing bool
 }
 
 // startRound asks every group's channels the same new variants of the candy
-// question; slot names the schedule slot it runs for. Channels missing from
-// CPA, disabled or cooling down are recorded as skipped.
+// question, and every other enabled channel the group does not ignore; slot
+// names the schedule slot it runs for. Members missing from CPA, disabled or
+// cooling down are recorded as skipped; other channels in that state are left
+// alone.
 func (s *Service) startRound(slot string) error {
-	credentials, _, err := s.credentials()
+	credentials, configErr, err := s.Credentials()
 	if err != nil {
 		return err
 	}
 	byIndex := make(map[string]Credential, len(credentials))
+	indexes := []string{}
 	for _, c := range credentials {
 		if _, seen := byIndex[c.AuthIndex]; c.AuthIndex != "" && !seen {
 			byIndex[c.AuthIndex] = c
+			indexes = append(indexes, c.AuthIndex)
 		}
 	}
 	s.mu.Lock()
@@ -299,7 +314,7 @@ func (s *Service) startRound(slot string) error {
 	jobs, skipped := []roundJob{}, 0
 	for _, group := range settings.Groups {
 		for _, index := range group.Channels {
-			job := roundJob{item: roundItem{AuthIndex: index, Model: group.Model, Effort: group.Effort}}
+			job := roundJob{member: true, item: roundItem{AuthIndex: index, Model: group.Model, Effort: group.Effort}}
 			c, ok := byIndex[index]
 			switch {
 			case !ok:
@@ -316,9 +331,16 @@ func (s *Service) startRound(slot string) error {
 			}
 			jobs = append(jobs, job)
 		}
+		for _, index := range indexes {
+			c := byIndex[index]
+			if c.Disabled || c.Unavailable || slices.Contains(group.Channels, index) || slices.Contains(group.Ignored, index) {
+				continue
+			}
+			jobs = append(jobs, roundJob{credential: c, item: roundItem{AuthIndex: index, Model: group.Model, Effort: group.Effort}})
+		}
 	}
 	if len(jobs) == 0 {
-		return fmt.Errorf("%w: no channel is chosen for the inspection", ErrInvalid)
+		return fmt.Errorf("%w: no channel to inspect", ErrInvalid)
 	}
 	started := s.now()
 	rng := rand.New(rand.NewSource(started.UnixNano()))
@@ -330,14 +352,15 @@ func (s *Service) startRound(slot string) error {
 	p := &roundProgress{Slot: slot, Started: started.UTC(), Done: skipped, Total: len(jobs), questions: questions, cancel: cancel}
 	s.round = p
 	s.tasks.Add(1)
-	go s.runRound(ctx, p, jobs)
+	go s.runRound(ctx, p, jobs, configErr == "")
 	return nil
 }
 
 // runRound asks the channels in parallel, each its questions one after
-// another, and records the round once all are done. A cancelled round
-// records nothing.
-func (s *Service) runRound(ctx context.Context, p *roundProgress, jobs []roundJob) {
+// another, records the round once all are done and lets the groups follow
+// what CPA answered. listed says the credential list was complete, so a
+// member missing from it has left CPA. A cancelled round records nothing.
+func (s *Service) runRound(ctx context.Context, p *roundProgress, jobs []roundJob, listed bool) {
 	defer s.finish("inspection", func() { s.round = nil }, p.cancel)
 	var wg sync.WaitGroup
 	for i := range jobs {
@@ -363,17 +386,85 @@ func (s *Service) runRound(ctx context.Context, p *roundProgress, jobs []roundJo
 		return
 	}
 	round := inspectionRound{ID: strconv.FormatInt(p.Started.UnixNano(), 10), Slot: p.Slot, Started: p.Started, Finished: s.now().UTC(),
-		Questions: p.questions, Items: make([]roundItem, len(jobs))}
-	for i, job := range jobs {
-		round.Items[i] = job.item
+		Questions: p.questions, Items: []roundItem{}}
+	for _, job := range jobs {
+		// A channel outside the group that lacks the model was only looked
+		// for.
+		if job.member || !job.notServing {
+			round.Items = append(round.Items, job.item)
+		}
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.inspection.Rounds = append(s.inspection.Rounds, round)
+	s.followCPALocked(jobs, listed)
 	_ = s.saveInspectionLocked()
 }
 
-// inspect asks one channel the round's questions one after another.
+// followCPALocked updates each group's channels from a finished round:
+// channels that answered join, members that no longer serve the model or
+// left CPA leave. It merges into the settings as they are now, which the
+// operator may have saved during the round, so an ignored channel never
+// joins. When no channel of a group served the model, CPA most likely had
+// nothing registered for a moment (a full reload), so its members stay;
+// with an incomplete credential list, so do missing ones. Views share the
+// settings' slices, so changed groups are new slices.
+func (s *Service) followCPALocked(jobs []roundJob, listed bool) {
+	groups := slices.Clone(s.inspection.Settings.Groups)
+	changed := false
+	for i, group := range groups {
+		var joined, left, stopped []string
+		serving := false
+		for _, job := range jobs {
+			index := job.item.AuthIndex
+			if job.item.Model != group.Model || job.item.Effort != group.Effort {
+				continue
+			}
+			switch {
+			case job.notServing:
+				if job.member {
+					stopped = append(stopped, index)
+				}
+			case job.item.Skipped == "missing":
+				if listed {
+					left = append(left, index)
+				}
+			case job.item.Skipped == "":
+				serving = true
+				if !slices.Contains(group.Channels, index) && !slices.Contains(group.Ignored, index) &&
+					len(group.Channels)+len(group.Ignored)+len(joined) < inspectionMaxChannels {
+					joined = append(joined, index)
+				}
+			}
+		}
+		if serving {
+			left = append(left, stopped...)
+		}
+		if len(joined)+len(left) == 0 {
+			continue
+		}
+		channels := slices.DeleteFunc(slices.Clone(group.Channels), func(index string) bool { return slices.Contains(left, index) })
+		groups[i].Channels = append(channels, joined...)
+		changed = true
+		s.logf("info", fmt.Sprintf("cpa-key-policy: inspection group %s (%s) follows CPA: joined %v, left %v", group.Model, group.Effort, joined, left))
+	}
+	if changed {
+		s.inspection.Settings.Groups = groups
+	}
+}
+
+// NotServing reports CPA's answer to a request pinned to a credential that
+// has no such model: its scheduler finds no candidate (auth_not_found),
+// unlike a credential cooling down (auth_unavailable). CPA answers every
+// failed callback with the code host_call_failed, so only the message, which
+// starts with the scheduler's own code, tells them apart.
+func NotServing(err error) bool {
+	var hostErr *HostError
+	return errors.As(err, &hostErr) && strings.HasPrefix(hostErr.Message, "auth_not_found:")
+}
+
+// inspect asks one channel the round's questions one after another. A
+// channel CPA has no such model for is asked once.
 func (s *Service) inspect(ctx context.Context, job *roundJob, questions []CandyVariant) {
 	item := &job.item
 	for i, question := range questions {
@@ -382,6 +473,9 @@ func (s *Service) inspect(ctx context.Context, job *roundJob, questions []CandyV
 		}
 		out, _, err := s.ask(ctx, job.credential, item.Model, item.Effort, question.Prompt())
 		switch {
+		case i == 0 && NotServing(err):
+			job.notServing, item.Skipped = true, "not_serving"
+			return
 		case err != nil:
 			item.Failed++
 			item.Error = errorText(err)

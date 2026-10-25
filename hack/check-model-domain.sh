@@ -40,6 +40,15 @@ while IFS=: read -r file line content; do
       # necessarily carry the host's own field name as a JSON key.
       [[ "${content}" == *"\"${host_field_title}\":"* ]] || unexpected+="${relative}:${line}:${content}"$'\n'
       ;;
+    internal/channel/cpaconfig.go)
+      # CPA's config.yaml keeps a model's client name under the host's own
+      # field name (models[].<field>); only the YAML tag reading it names it.
+      [[ "${content}" == *'`yaml:"'"${host_field}"'"`'* ]] || unexpected+="${relative}:${line}:${content}"$'\n'
+      ;;
+    internal/channel/channel_test.go)
+      # Fixtures of CPA's config.yaml, which uses that field name as a key.
+      [[ "${content}" == *" ${host_field}: "* ]] || unexpected+="${relative}:${line}:${content}"$'\n'
+      ;;
     internal/quality/data/codex_context.json)
       # A verbatim capture of the Codex CLI request context (OpenAI's base
       # instructions and tool descriptions); detection requests send it as is.

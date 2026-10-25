@@ -1,7 +1,7 @@
 import { apiClient, pluginPath, PLUGIN_ID } from "./client";
 import { patchPluginConfig } from "./cpa";
 import { apiErrorCode } from "./error";
-import type { SearchSettings, SearchState, SearchStatus } from "../types";
+import type { NativeSettings, NativeState, SearchSettings, SearchState, SearchStatus } from "../types";
 
 function settings(value: SearchSettings): SearchSettings {
   return { ...value, keep_models: value.keep_models ?? [], channels: value.channels ?? [] };
@@ -11,9 +11,33 @@ function status(value?: SearchStatus | null): SearchStatus {
   return { routed_total: 0, probe_running: false, probe_key_stored: false, ...(value ?? {}), channels: value?.channels ?? [] };
 }
 
+// A plugin older than native search answers without it.
+export function nativeState(value?: Partial<NativeState> | null): NativeState {
+  const settings: NativeSettings = { enabled: false, require_all: false, interval_hours: 12, ...(value?.settings ?? {}), excluded_models: value?.settings?.excluded_models ?? [], disabled_channels: value?.settings?.disabled_channels ?? [] };
+  return {
+    running: false, declared: false, ...(value ?? {}),
+    settings,
+    models: (value?.models ?? []).map((model) => ({ ...model, usable: model.usable ?? [], gaps: model.gaps ?? [] })),
+    channels: (value?.channels ?? []).map((channel) => ({ ...channel, models: channel.models ?? [], probes: channel.probes ?? [] })),
+    names: value?.names ?? {},
+  };
+}
+
 export async function fetchSearch(): Promise<SearchState> {
   const { data } = await apiClient().get<SearchState>(pluginPath("/search"));
-  return { ...data, settings: settings(data.settings), status: status(data.status) };
+  return { ...data, settings: settings(data.settings), status: status(data.status), native: nativeState(data.native) };
+}
+
+export async function saveNativeSearch(next: NativeSettings): Promise<NativeState> {
+  const { data } = await apiClient().put<NativeState>(pluginPath("/search/native"), { settings: next });
+  return nativeState(data);
+}
+
+// authIndex probes one channel; without it every channel serving a Codex
+// catalog model. The round runs on in the plugin.
+export async function probeNativeSearch(authIndex?: string): Promise<NativeState> {
+  const { data } = await apiClient().post<NativeState>(pluginPath("/search/native/probe"), authIndex ? { auth_index: authIndex } : {});
+  return nativeState(data);
 }
 
 // probe.api_key empty keeps the stored key; clearProbeKey removes it.

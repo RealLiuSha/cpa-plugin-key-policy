@@ -38,6 +38,9 @@ type appOptions struct {
 	DailyLimitUSD float64
 	// Clock replaces the store clock before registration; nil keeps time.Now.
 	Clock func() time.Time
+	// Dir is the data directory, for module files written before the
+	// registration; empty means a new temporary one.
+	Dir string
 }
 
 // newTestApp registers the plugin with one key ("priced", secret cpa_priced)
@@ -46,7 +49,11 @@ type appOptions struct {
 // an all-zero row.
 func newTestApp(t *testing.T, opts appOptions) *App {
 	t.Helper()
-	statePath := filepath.ToSlash(filepath.Join(t.TempDir(), "state.json"))
+	dir := opts.Dir
+	if dir == "" {
+		dir = t.TempDir()
+	}
+	statePath := filepath.ToSlash(filepath.Join(dir, "state.json"))
 	config := fmt.Sprintf(`
 enabled: true
 state_file: %q

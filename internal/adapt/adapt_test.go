@@ -73,6 +73,8 @@ func TestPreviewRewrites(t *testing.T) {
 		"edits no usable url":               {images, `{"images":[{"file_id":"f"},"",{"image_url":{"url":""}},null]}`, ""},
 		"edits non-object body":             {images, `["data:a"]`, ""},
 		"edits invalid JSON body":           {images, `{"images":["data:a"]`, ""},
+		"edits trailing comma":              {images, `{"images":["data:a"],}`, ""},
+		"edits unreadable element":          {images, `{"images":["data:b",{"image_url":"data:a",}]}`, ""},
 		"set missing field":                 {quality(`"high"`, false), `{"model":"m"}`, `{"model":"m","quality":"high"}`},
 		"set keeps present field":           {quality(`"high"`, false), `{"quality":"low"}`, ""},
 		"set overwrites present field":      {quality(`"high"`, true), `{"quality":"low","n":1}`, `{"n":1,"quality":"high"}`},

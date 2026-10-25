@@ -65,7 +65,7 @@ describe("Settings page", () => {
       version: "0.18.0",
       plugin_id: "cpa-key-policy",
       display_name: "萝卜",
-      modules: { search: { enabled: true, declared: false }, channels: { tracked: 0 } },
+      modules: { search: { enabled: true, declared: false }, native_search: { enabled: true, declared: true, native_models: 2, fallback_models: 1 }, channels: { tracked: 0 } },
       module_errors: { search: "decode cpa-key-policy-search.json: unexpected EOF" },
       hooks: [],
       config_warnings: [],
@@ -82,5 +82,7 @@ describe("Settings page", () => {
     const toggle = container.querySelector('[data-testid="search-toggle"]');
     expect(toggle?.querySelector(".field-hint")?.textContent).toBe("overview.moduleUnavailable");
     expect(toggle?.textContent).not.toContain("search.stateHint.applying");
+    // Native search registers on its own and says how the models search.
+    expect(container.querySelector('[data-testid="settings-modules"]')?.textContent).toContain("overview.nativeCount 2 1");
   });
 });

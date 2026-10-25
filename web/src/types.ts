@@ -509,6 +509,95 @@ export interface SearchState {
   declared: boolean;
   settings: SearchSettings;
   status: SearchStatus;
+  native: NativeState;
+}
+
+// ===== Native search =====
+
+// What the probes say about one channel running the hosted web_search tool.
+export type NativeChannelState = "unknown" | "supported" | "unstable" | "no_search" | "failing" | "stale" | "rejected" | "disabled";
+// How Codex searches with one model: through the channel serving the turn,
+// or through /v1/alpha/search.
+export type NativeMode = "native" | "fallback" | "excluded" | "off";
+export type NativeProbeResult = "search" | "no_search" | "error";
+
+export interface NativeSettings {
+  enabled: boolean;
+  require_all: boolean;
+  excluded_models: string[];
+  disabled_channels: string[];
+  interval_hours: number;
+}
+
+export interface NativeProbe {
+  at: string;
+  model: string;
+  result: NativeProbeResult;
+  status?: number;
+  error?: string;
+  latency_ms: number;
+  searches?: number;
+  input_tokens?: number;
+  output_tokens?: number;
+}
+
+export interface NativeRejection {
+  at: string;
+  count: number;
+  model: string;
+  status: number;
+  error: string;
+  recheck_at: string;
+}
+
+export interface NativeChannel {
+  auth_index: string;
+  name: string;
+  group?: string;
+  models: string[];
+  state: NativeChannelState;
+  cpa_disabled?: boolean;
+  unavailable?: boolean;
+  // Newest first.
+  probes: NativeProbe[];
+  rejection?: NativeRejection;
+}
+
+export interface NativeGap {
+  auth_index: string;
+  state: NativeChannelState;
+}
+
+// reason explains a fallback: no_channel, no_usable or incomplete.
+export interface NativeModel {
+  model: string;
+  mode: NativeMode;
+  usable: string[];
+  gaps: NativeGap[];
+  reason?: string;
+}
+
+export interface NativeRound {
+  kind: string;
+  started: string;
+  done: number;
+  total: number;
+}
+
+// declared: CPA sends the plugin the Codex catalog; names: the operator's
+// channel names by auth_index; error: why the module could not open.
+export interface NativeState {
+  settings: NativeSettings;
+  models: NativeModel[];
+  channels: NativeChannel[];
+  round?: NativeRound;
+  last_full_round?: string;
+  next_full_round?: string;
+  running: boolean;
+  credentials_error?: string;
+  declared: boolean;
+  names: Record<string, string>;
+  error?: string;
 }
 
 // ===== Overview and settings =====
@@ -517,6 +606,8 @@ export interface SearchState {
 // answer's module_errors says why.
 export interface ModuleStates {
   search: { enabled: boolean; declared: boolean };
+  // Missing when the native search file could not be opened.
+  native_search?: { enabled: boolean; declared: boolean; native_models: number; fallback_models: number; last_full_round?: string };
   adapters?: { rules: number; enabled_rules: number };
   channels?: { tracked: number };
 }

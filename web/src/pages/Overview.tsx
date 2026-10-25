@@ -3,6 +3,7 @@ import { Link } from "react-router-dom";
 import { fetchOverview } from "../api/overview";
 import { extractApiError } from "../api/error";
 import { AuditEventCard } from "./Audit";
+import { nativeModuleState } from "../components/NativeSearch";
 import { channelPath } from "../navigation";
 import { formatCount, formatPercent, formatUSD } from "../format";
 import { useT } from "../i18n";
@@ -105,6 +106,7 @@ function ModulesCard({ overview }: { overview: OverviewResponse }) {
       </div>
       <dl className="overview-facts">
         <div><dt><Link to="/search">{t("overview.moduleSearch")}</Link></dt><dd>{t(`overview.searchState.${searchState}`)}</dd></div>
+        <div><dt><Link to="/search">{t("overview.moduleNative")}</Link></dt><dd>{nativeModuleState(overview.modules, t)}</dd></div>
         <div><dt><Link to="/channels">{t("overview.moduleAdapters")}</Link></dt>{adapters ? <dd>{t("overview.adapterCount", { rules: adapters.rules, enabled: adapters.enabled_rules })}</dd> : <dd className="overview-warn">{t("overview.moduleUnavailable")}</dd>}</div>
       </dl>
     </section>

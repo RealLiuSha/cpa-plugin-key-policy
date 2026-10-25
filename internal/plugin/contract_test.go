@@ -22,7 +22,10 @@ var (
 	// The 萝卜 console routes.
 	overviewFields       = []string{"today", "keys", "channels", "modules", "warnings", "recent_changes"}
 	settingsFields       = []string{"version", "plugin_id", "display_name", "modules", "module_errors", "hooks", "config_warnings", "files", "ui", "ownership", "health", "timezone"}
-	searchStateFields    = []string{"enabled", "declared", "settings", "status"}
+	searchStateFields    = []string{"enabled", "declared", "settings", "status", "native"}
+	nativeStateFields    = []string{"settings", "models", "channels", "running", "declared", "names"}
+	nativeStateOptional  = []string{"round", "last_full_round", "next_full_round", "credentials_error", "error"}
+	nativeSettingsFields = []string{"enabled", "require_all", "excluded_models", "disabled_channels", "interval_hours"}
 	channelViewFields    = []string{"auth_index", "meta", "last_24h", "today", "models_24h", "rules"}
 	channelViewOptional  = []string{"auth_id", "provider", "base_url"}
 	channelSummaryFields = []string{"attempts", "failures", "success_rate", "latency_p50_ms", "latency_p95_ms", "ttft_p50_ms", "ttft_p95_ms", "input_tokens", "output_tokens", "list_cost_usd"}
@@ -33,7 +36,18 @@ func TestConsoleResponseShapes(t *testing.T) {
 	recordUsage(t, app, UsageHandleRequest{AuthIndex: "0123456789abcdef", AuthID: "codex:apikey:1", Provider: "codex", Model: "gpt-5-codex", APIKey: testKeyID, Detail: UsageDetail{InputTokens: 10}})
 	assertShape(t, "GET /overview", managementOK(t, app, http.MethodGet, "/overview", nil, nil), overviewFields, nil)
 	assertShape(t, "GET /settings", managementOK(t, app, http.MethodGet, "/settings", nil, nil), settingsFields, nil)
-	assertShape(t, "GET /search", managementOK(t, app, http.MethodGet, "/search", nil, nil), searchStateFields, nil)
+	search := managementOK(t, app, http.MethodGet, "/search", nil, nil)
+	assertShape(t, "GET /search", search, searchStateFields, nil)
+	var state struct {
+		Native json.RawMessage `json:"native"`
+	}
+	decode(t, search, &state)
+	assertShape(t, "GET /search native", state.Native, nativeStateFields, nativeStateOptional)
+	var native struct {
+		Settings json.RawMessage `json:"settings"`
+	}
+	decode(t, state.Native, &native)
+	assertShape(t, "GET /search native.settings", native.Settings, nativeSettingsFields, nil)
 	assertShape(t, "GET /adapters", managementOK(t, app, http.MethodGet, "/adapters", nil, nil), []string{"rules", "types"}, nil)
 
 	var channels struct {

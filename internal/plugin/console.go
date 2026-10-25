@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"time"
@@ -16,6 +17,7 @@ import (
 	"cpa-key-policy/internal/channel"
 	"cpa-key-policy/internal/policy/audit"
 	"cpa-key-policy/internal/search"
+	"cpa-key-policy/internal/search/native"
 )
 
 // The management console: the routes behind the 萝卜 pages other than keys,
@@ -37,11 +39,11 @@ func moduleUnavailable(name string) ManagementResponse {
 // files.
 func (a *App) moduleWriteError(err error) ManagementResponse {
 	switch {
-	case a.quiesced.Load(), errors.Is(err, adapt.ErrReadOnly), errors.Is(err, search.ErrReadOnly), errors.Is(err, channel.ErrReadOnly):
+	case a.quiesced.Load(), errors.Is(err, adapt.ErrReadOnly), errors.Is(err, search.ErrReadOnly), errors.Is(err, channel.ErrReadOnly), errors.Is(err, native.ErrReadOnly):
 		return a.writeRefused()
 	case errors.Is(err, adapt.ErrNotFound):
 		return jsonError(http.StatusNotFound, "not_found", err.Error())
-	case errors.Is(err, adapt.ErrInvalidRule), errors.Is(err, search.ErrInvalidSettings), errors.Is(err, channel.ErrInvalid):
+	case errors.Is(err, adapt.ErrInvalidRule), errors.Is(err, search.ErrInvalidSettings), errors.Is(err, channel.ErrInvalid), errors.Is(err, native.ErrInvalidSettings):
 		return jsonError(http.StatusBadRequest, "invalid_request", err.Error())
 	default:
 		return jsonError(http.StatusInternalServerError, "persist_failed", err.Error())
@@ -430,7 +432,88 @@ func (a *App) searchState() ManagementResponse {
 		"declared": a.declaredRouter.Load(),
 		"settings": set.search.Settings(),
 		"status":   set.search.Status(),
+		"native":   a.nativeState(set),
 	})
+}
+
+// nativeView is native search on the search page: its status, whether CPA
+// sends the plugin the Codex catalog yet, and the operator's names of the
+// channels. Error says why the module could not open.
+type nativeView struct {
+	native.Status
+	Declared bool              `json:"declared"`
+	Names    map[string]string `json:"names"`
+	Error    string            `json:"error,omitempty"`
+}
+
+func (a *App) nativeState(set *moduleSet) nativeView {
+	if set.native == nil {
+		return nativeView{Status: native.Status{Settings: native.DefaultSettings(), Models: []native.ModelDecision{}, Channels: []native.ChannelStatus{}},
+			Names: map[string]string{}, Error: set.errors["native_search"]}
+	}
+	view := nativeView{Status: set.native.Status(), Declared: a.declaredNative.Load(), Names: map[string]string{}}
+	if set.channels != nil {
+		for _, channel := range set.channels.List() {
+			if name := strings.TrimSpace(channel.Meta.DisplayName); name != "" {
+				view.Names[channel.AuthIndex] = name
+			}
+		}
+	}
+	return view
+}
+
+func (a *App) updateNativeSearch(body []byte) ManagementResponse {
+	set := a.modules.Load()
+	if set == nil || set.native == nil {
+		return moduleUnavailable("native search")
+	}
+	var req struct {
+		Settings native.Settings `json:"settings"`
+	}
+	if err := decodeStrictBody(body, &req); err != nil {
+		return jsonError(http.StatusBadRequest, "invalid_json", err.Error())
+	}
+	before, stored, err := set.native.Update(req.Settings)
+	if err != nil {
+		return a.moduleWriteError(err)
+	}
+	if !reflect.DeepEqual(before, stored) {
+		a.store.RecordChange("update_native_search", "search", map[string]audit.Change{"settings": {From: before, To: stored}})
+	}
+	return jsonResponse(http.StatusOK, a.nativeState(set))
+}
+
+// probeNativeSearch starts a probe round of every channel, or of one, and
+// answers at once with the round under way.
+func (a *App) probeNativeSearch(body []byte) ManagementResponse {
+	set := a.modules.Load()
+	if set == nil || set.native == nil {
+		return moduleUnavailable("native search")
+	}
+	var req struct {
+		AuthIndex string `json:"auth_index,omitempty"`
+	}
+	if err := decodeStrictBody(body, &req); err != nil {
+		return jsonError(http.StatusBadRequest, "invalid_json", err.Error())
+	}
+	authIndex := strings.TrimSpace(req.AuthIndex)
+	switch err := set.native.ProbeNow(authIndex); {
+	case errors.Is(err, native.ErrBusy):
+		return jsonError(http.StatusConflict, "busy", err.Error())
+	case errors.Is(err, native.ErrOff):
+		return jsonError(http.StatusConflict, "search_off", err.Error())
+	case errors.Is(err, native.ErrUnknownChannel):
+		return jsonError(http.StatusNotFound, "not_found", err.Error())
+	case err != nil:
+		return jsonError(http.StatusBadGateway, "cpa_unavailable", err.Error())
+	}
+	// Each check is a paid search request, so who started them is kept.
+	var changes map[string]audit.Change
+	if authIndex != "" {
+		changes = map[string]audit.Change{"channel": {To: authIndex}}
+	}
+	a.store.RecordChange("probe_native_search", "search", changes)
+	return jsonResponse(http.StatusAccepted, a.nativeState(set))
 }
 
 func (a *App) updateSearch(body []byte) ManagementResponse {
@@ -490,6 +573,15 @@ func (a *App) moduleStates(set *moduleSet) map[string]any {
 	}
 	if set == nil {
 		return states
+	}
+	if set.native != nil {
+		status := set.native.Status()
+		counts := map[native.Mode]int{}
+		for _, model := range status.Models {
+			counts[model.Mode]++
+		}
+		states["native_search"] = map[string]any{"enabled": status.Settings.Enabled, "declared": a.declaredNative.Load(),
+			"native_models": counts[native.ModeNative], "fallback_models": counts[native.ModeFallback], "last_full_round": status.LastFullRound}
 	}
 	if set.quality != nil {
 		states["quality"] = map[string]any{"running": set.quality.Running()}
@@ -644,6 +736,7 @@ func (a *App) settingsPage() ManagementResponse {
 		{"audit", filepath.Join(dir, "cpa-key-policy-audit.jsonl")},
 		{"adapters", filepath.Join(dir, adaptersFile)},
 		{"search", filepath.Join(dir, searchFile)},
+		{"native_search", filepath.Join(dir, nativeFile)},
 		{"channels", filepath.Join(dir, channelsFile)},
 		{"channel_stats", filepath.Join(dir, channelStatsFile)},
 		{"quality", filepath.Join(dir, qualityFile)},

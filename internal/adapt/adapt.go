@@ -28,6 +28,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"cpa-key-policy/internal/jsonscan"
 	"cpa-key-policy/internal/policy/persist"
 )
 
@@ -210,11 +211,17 @@ func moveEditImages(doc map[string]json.RawMessage) bool {
 		return false
 	}
 	var urls [][]byte
-	eachElement(images, func(element []byte) {
-		if url := imageURL(element); url != nil {
+	readable := true
+	if err := jsonscan.Elements(images, func(start, end int) bool {
+		url, ok := imageURL(images[start:end])
+		if url != nil {
 			urls = append(urls, url)
 		}
-	})
+		readable = ok
+		return ok
+	}); err != nil || !readable {
+		return false
+	}
 	switch len(urls) {
 	case 0:
 		return false
@@ -230,13 +237,14 @@ func moveEditImages(doc map[string]json.RawMessage) bool {
 // imageURL returns the raw JSON string token holding the URL of one images[]
 // element: the element itself when it is a string; for an object its
 // image_url (a string, or an object with url), otherwise its url. Elements
-// without a non-empty URL return nil.
-func imageURL(element []byte) []byte {
+// without a non-empty URL return nil; ok is false when an object of the
+// element cannot be read, and the body is then left as it is.
+func imageURL(element []byte) (url []byte, ok bool) {
 	if isString(element) {
-		return nonEmptyString(element)
+		return nonEmptyString(element), true
 	}
 	if !isObject(element) {
-		return nil
+		return nil, true
 	}
 	var primary, fallback []byte
 	if !eachMember(element, func(key string, value []byte) {
@@ -247,7 +255,7 @@ func imageURL(element []byte) []byte {
 			fallback = value
 		}
 	}) {
-		return nil
+		return nil, false
 	}
 	if isObject(primary) {
 		nested := primary
@@ -257,13 +265,13 @@ func imageURL(element []byte) []byte {
 				primary = value
 			}
 		}) {
-			return nil
+			return nil, false
 		}
 	}
 	if found := nonEmptyString(primary); found != nil {
-		return found
+		return found, true
 	}
-	return nonEmptyString(fallback)
+	return nonEmptyString(fallback), true
 }
 
 func isString(raw []byte) bool { return len(raw) > 0 && raw[0] == '"' }
@@ -379,15 +387,19 @@ func Preview(rule Rule, body []byte) (out []byte, changed bool, err error) {
 
 // decodeObject indexes the members of a JSON object body by key. Values are
 // the members' raw bytes inside body, not copies: bodies of image edits are
-// tens of megabytes. As with encoding/json, a repeated key keeps its last
-// value. ok is false when body is not exactly one valid JSON object.
+// tens of megabytes, which jsonscan crosses with IndexByte instead of
+// validating every byte. As with encoding/json, a repeated key keeps its last
+// value. ok is false when body is not exactly one JSON object whose members
+// can be read. Values are not validated: a malformed one is written back as
+// it is, and the upstream refuses it as it would the original body.
 func decodeObject(body []byte) (doc map[string]json.RawMessage, ok bool) {
-	start := skipSpace(body, 0)
-	if start == len(body) || body[start] != '{' || !json.Valid(body) {
+	start := jsonscan.SkipSpace(body, 0)
+	end, err := jsonscan.SkipValue(body, start)
+	if err != nil || body[start] != '{' || jsonscan.SkipSpace(body, end) != len(body) {
 		return nil, false
 	}
 	doc = make(map[string]json.RawMessage)
-	if !eachMember(body[start:], func(key string, value []byte) { doc[key] = value }) {
+	if !eachMember(body, func(key string, value []byte) { doc[key] = value }) {
 		return nil, false
 	}
 	return doc, true
@@ -431,143 +443,40 @@ func appendString(dst []byte, s string) []byte {
 	return append(dst, '"')
 }
 
-// The walker below reads JSON that json.Valid has already accepted, so it
-// only tracks where strings and nested values end. On any other input it
-// still stays in bounds and terminates; it just yields meaningless slices.
-
-// eachMember calls fn with every key and raw value of the JSON object at the
-// start of obj, in order. It reports false when a member cannot be read.
+// eachMember calls fn with every unquoted key and raw value of the JSON
+// object obj, in order. It reports false when a member cannot be read.
 func eachMember(obj []byte, fn func(key string, value []byte)) bool {
-	i := skipSpace(obj, 1)
-	for i < len(obj) && obj[i] == '"' {
-		keyEnd := stringEnd(obj, i)
-		key, ok := unquoteKey(obj[i:keyEnd])
-		if !ok {
-			return false
+	readable := true
+	err := jsonscan.Members(obj, func(raw []byte, start, end int) bool {
+		key, ok := unquoteKey(raw)
+		if ok {
+			fn(key, obj[start:end])
 		}
-		i = skipSpace(obj, keyEnd)
-		if i == len(obj) || obj[i] != ':' {
-			return false
-		}
-		i = skipSpace(obj, i+1)
-		end := valueEnd(obj, i)
-		if end == i {
-			return false
-		}
-		fn(key, obj[i:end])
-		i = skipSpace(obj, end)
-		if i < len(obj) && obj[i] == ',' {
-			i = skipSpace(obj, i+1)
-		}
-	}
-	return true
+		readable = ok
+		return ok
+	})
+	return err == nil && readable
 }
 
-// eachElement calls fn with every raw element of the JSON array at the
-// start of arr, in order.
-func eachElement(arr []byte, fn func(value []byte)) {
-	i := skipSpace(arr, 1)
-	for i < len(arr) && arr[i] != ']' {
-		end := valueEnd(arr, i)
-		if end == i {
-			return
-		}
-		fn(arr[i:end])
-		i = skipSpace(arr, end)
-		if i < len(arr) && arr[i] == ',' {
-			i = skipSpace(arr, i+1)
-		}
-	}
-}
-
-// unquoteKey decodes an object key token. Keys without escapes, which is
-// nearly all of them, skip encoding/json.
+// unquoteKey decodes the text between a key's quotes. Keys without escapes,
+// which is nearly all of them, skip encoding/json; written back, a control
+// character JSON forbids unescaped would come out escaped, so it fails here.
 func unquoteKey(raw []byte) (string, bool) {
-	if len(raw) < 2 || raw[len(raw)-1] != '"' {
-		return "", false
-	}
 	if bytes.IndexByte(raw, '\\') < 0 {
-		return string(raw[1 : len(raw)-1]), true
+		for _, c := range raw {
+			if c < 0x20 {
+				return "", false
+			}
+		}
+		return string(raw), true
 	}
+	quoted := make([]byte, 0, len(raw)+2)
+	quoted = append(append(append(quoted, '"'), raw...), '"')
 	var key string
-	if err := json.Unmarshal(raw, &key); err != nil {
+	if err := json.Unmarshal(quoted, &key); err != nil {
 		return "", false
 	}
 	return key, true
-}
-
-func skipSpace(data []byte, i int) int {
-	for i < len(data) {
-		switch data[i] {
-		case ' ', '\t', '\n', '\r':
-			i++
-		default:
-			return i
-		}
-	}
-	return i
-}
-
-// valueEnd returns the index just past the JSON value starting at data[i].
-func valueEnd(data []byte, i int) int {
-	if i >= len(data) {
-		return len(data)
-	}
-	switch data[i] {
-	case '"':
-		return stringEnd(data, i)
-	case '{', '[':
-		depth := 0
-		for i < len(data) {
-			switch data[i] {
-			case '"':
-				i = stringEnd(data, i)
-				continue
-			case '{', '[':
-				depth++
-			case '}', ']':
-				depth--
-				if depth == 0 {
-					return i + 1
-				}
-			}
-			i++
-		}
-		return len(data)
-	default:
-		// A number, true, false or null runs to the next delimiter.
-		for i < len(data) {
-			switch data[i] {
-			case ',', '}', ']', ' ', '\t', '\n', '\r':
-				return i
-			}
-			i++
-		}
-		return i
-	}
-}
-
-// stringEnd returns the index just past the JSON string whose opening quote
-// is data[i]. A quote closes the string unless an odd run of backslashes
-// precedes it; bytes.IndexByte makes long base64 strings cheap to skip.
-func stringEnd(data []byte, i int) int {
-	start := i + 1
-	for from := start; from < len(data); {
-		quote := bytes.IndexByte(data[from:], '"')
-		if quote < 0 {
-			break
-		}
-		quote += from
-		backslashes := 0
-		for j := quote - 1; j >= start && data[j] == '\\'; j-- {
-			backslashes++
-		}
-		if backslashes%2 == 0 {
-			return quote + 1
-		}
-		from = quote + 1
-	}
-	return len(data)
 }
 
 func invalidf(format string, args ...any) error {

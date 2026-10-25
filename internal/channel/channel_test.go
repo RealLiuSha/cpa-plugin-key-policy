@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -797,5 +798,51 @@ func TestObserveIsSafeForConcurrentUse(t *testing.T) {
 	views := r.List()
 	if len(views) != 2 || views[0].Last24h.Attempts != 4000 || views[0].Last24h.Failures != 400 || views[1].AuthIndex != indexB || views[1].Last24h.Attempts != 500 {
 		t.Fatalf("views = %+v", views)
+	}
+}
+
+func TestReadCPAConfigListsTheModelsEachKeyServes(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	config := `force-model-prefix: true
+api-keys:
+  codex:
+    - name: main
+      base-url: https://up.example
+      models:
+        - name: gpt-6-sol
+      keys:
+        - api-key: sk-group-models
+        - api-key: sk-prefixed
+          prefix: /zeu/
+          excluded-models: ["gpt-6-sol?"]
+        - api-key: sk-own-models
+          excluded-models: ["*-luna"]
+          models:
+            - name: gpt-6-sol
+              alias: alphasearch-nb-gpt-6-sol
+            - name: gpt-6-luna
+            - name: gpt-6-astra
+    - name: plain
+      base-url: https://plain.example
+      keys:
+        - api-key: sk-no-models
+`
+	if err := os.WriteFile(path, []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := ReadCPAConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	models := map[string][]string{}
+	for _, credential := range got {
+		models[credential.APIKey] = credential.Models
+	}
+	// Under force-model-prefix a prefixed key serves only the prefixed name;
+	// "?" in a pattern is no wildcard.
+	if !slices.Equal(models["sk-group-models"], []string{"gpt-6-sol"}) || !slices.Equal(models["sk-prefixed"], []string{"zeu/gpt-6-sol"}) ||
+		!slices.Equal(models["sk-own-models"], []string{"alphasearch-nb-gpt-6-sol", "gpt-6-astra"}) ||
+		models["sk-no-models"] != nil {
+		t.Fatalf("models = %v", models)
 	}
 }

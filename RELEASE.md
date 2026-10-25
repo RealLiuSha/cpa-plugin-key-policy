@@ -28,7 +28,7 @@ python3 scripts/publish.py \
 1. 检查工具、实际容器/镜像、插件运行版本、配置、挂载、配对数据（state 与 usage 版本须为 6 或 7；v7 的 live 文件引用了 history 时，history 文件必须存在且配对）和磁盘空间。
 2. 在源码快照上生成前端，执行前端测试/typecheck、`npm audit --omit=dev --audit-level=moderate`（只审计打进页面的生产依赖）、Go race 测试/vet 和已有版本、领域门禁；使用固定 Linux 构建镜像生成 `.so` 和迁移检查程序。
 3. 上传独立候选包，核对 SHA-256；此时 CPA 仍运行，配置未切换。
-4. 在远端实例锁内再次核对配置和运行版本，用新版本的检查程序确认它接受当前插件配置段，再正常停止 CPA，不使用 Docker 强制杀死超时。将最终落盘配置、旧插件、state、usage、history、审计、旧版本留下的恢复点（`.before-v5.json`、`.before-v6.json`、`.before-v7.json` 及其归档）、state 同目录的六个模块文件（`cpa-key-policy-adapters.json`、`-search.json`、`-channels.json`、`-channel-stats.json`、`-quality.json`、`-inspection.json`）和没回放过的交接日志 `cpa-key-policy-handoff.jsonl` 复制到实例专属备份目录，逐文件保存原路径、权限和校验和。备份清单在停机后重算，停机时才第一次写出的文件（例如检测历史）也在内。
+4. 在远端实例锁内再次核对配置和运行版本，用新版本的检查程序确认它接受当前插件配置段，再正常停止 CPA，不使用 Docker 强制杀死超时。将最终落盘配置、旧插件、state、usage、history、审计、旧版本留下的恢复点（`.before-v5.json`、`.before-v6.json`、`.before-v7.json` 及其归档）、state 同目录的七个模块文件（`cpa-key-policy-adapters.json`、`-search.json`、`-search-native.json`、`-channels.json`、`-channel-stats.json`、`-quality.json`、`-inspection.json`）和没回放过的交接日志 `cpa-key-policy-handoff.jsonl` 复制到实例专属备份目录，逐文件保存原路径、权限和校验和。备份清单在停机后重算，停机时才第一次写出的文件（例如检测历史）也在内。
 5. 对停机后的真实文件运行迁移检查：v6 数据在 state 同目录的临时目录里离线转换为 v7 并逐项比对，通过后核对待移出文件与备份一致，把 v6 state、usage 和所有 `.before-v*.json` 恢复点移出活动目录（它们已在备份里），换入三个 v7 文件（沿用原 state 的属主与权限），审计日志保留；v7 数据只做加载检查。以检查报告的价格行数作为启动后的预期模型数（v6 → v7 会合并指向同一上游模型的行），安装独立版本文件，只更新 `store.version` 及已有的 `release-tag`，保留 state 路径、时区和其余 YAML 内容，然后启动原容器。
 6. 验证 `/healthz`、实际插件版本与加载路径、内嵌页面摘要、Key 数量与价格行数量、state/usage 版本等于检查报告的 `target_version`、启动前后 `policy_sha256` 一致。数据目录里有界面覆盖文件 `cpa-key-policy-ui/index.html` 时（插件 `/settings` 报告 `ui.source: override`），面板显示的是覆盖页面，不比对内嵌页面摘要，结束时会提示删掉覆盖文件才能用上新版界面。成功后输出版本、备份和发布记录位置。
 
@@ -43,6 +43,19 @@ python3 scripts/publish.py \
 自动验收覆盖插件真实加载及数据检查，不发送收费模型请求，也不修改业务 Key、倍率或额度。它不等于普通/流式模型请求的完整业务验收；如发布需要该层验证，应在恢复正常使用前执行受控请求。
 
 ## 本次变化
+
+### 0.29.0：原生搜索
+
+- 新增「原生搜索」：Codex 按 CPA 下发的模型目录决定怎么搜索，Responses Lite 模型只能调用少数上游才支持的 `/v1/alpha/search`。插件经宿主回调把带 `web_search` 工具的简短请求固定发到每个 codex 渠道，检测它是否真的执行搜索：每轮每个渠道一次，默认 12 小时一轮全量，新渠道随即检测，失败的渠道每小时复检；每次检测都是一次付费的真实请求。目录模型有承接渠道「支持」后，插件在目录里关掉它的 Responses Lite，Codex 约 5 分钟内改用对话里的 `web_search` 工具；没有可用渠道时留在 alpha search。页面上可以禁用渠道、排除模型、选覆盖策略（任一渠道 / 全部渠道）和检测间隔。被禁用或拒绝该工具的渠道上，插件在 `request.intercept_after` 里去掉工具，连同历史里回放的 `web_search_call` 项（否则 CPA 会为它们重新声明工具）。原生搜索默认开启，但只在 `search_enabled` 打开时注册。
+- 接口：`GET /search` 多 `native`；新增 `PUT /search/native`（审计 `update_native_search`）和 `POST /search/native/probe`（审计 `probe_native_search`，进行中 409 `busy`，原生搜索或搜索模块关闭时 409 `search_off`）。概览和设置页多「原生搜索」一行，审计页可以按这两个动作筛选。
+- 性能：`search_enabled` 打开期间 CPA 把每个成功的非流式响应交给插件的响应拦截器，大体积非流式请求多的实例应保持关闭（README 有实测开销）。`request.intercept_after` 只解码用到的字段，每次分配从 142 降到 18；适配规则改用共享的 JSON 扫描，不再对整个请求体跑 `json.Valid`，20 MB 图片编辑的改写从约 39 ms 降到 1.4–3.1 ms，值不再校验、原样写回。
+- 渠道承接的模型按 CPA 的 `prefix` / `force-model-prefix` 规则计算，excluded-models 只有 `*` 是通配符；只影响原生搜索。
+- 文件兼容：新文件 `cpa-key-policy-search-native.json`（publish.py 一并备份，现在共七个模块文件）。回退到 0.28.0 时它被忽略：目录不再改写，客户端约 5 分钟内回到 alpha search。
+
+### 0.28.0：巡检组跟随上游
+
+- 每轮巡检还会问组外没被忽略、没停用、没冷却的渠道；没有该模型的渠道由 CPA 当场返回 `auth_not_found`，不发上游请求、不记录。答上来的渠道加入组，不再提供该模型的成员移出（记一次 `skipped: not_serving`），凭据列表完整时已不在 CPA 里的成员移出；整组都不提供时（多半是 CPA 正在整体重载）成员不动。
+- 前端依赖 follow-redirects 升到 1.16.1，只改 `web/package-lock.json`。
 
 ### 0.27.0：按模型看上游质量，巡检出变体题
 

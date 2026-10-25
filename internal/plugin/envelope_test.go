@@ -45,6 +45,7 @@ func TestDecodeSkippingBody(t *testing.T) {
 		{name: "body last", raw: []byte(`{"TraceID":"t2","Metadata":{"request_path":"/v1/images/edits"},"Body":"e30="}`), wantBody: []byte("{}"), wantPath: "/v1/images/edits"},
 		{name: "null body", raw: []byte(`{"TraceID":"t3","Body":null,"Metadata":{"request_path":"/p"}}`), wantPath: "/p"},
 		{name: "no body", raw: []byte(` {"TraceID":"t4","Metadata":{"request_path":"/q"}} `), wantPath: "/q"},
+		{name: "metadata of another type", raw: []byte(`{"TraceID":"t6","Metadata":{"request_path":7,"selected_auth_index":{"a":1}}}`)},
 		{name: "escaped body string", raw: []byte(`{"Body":"e30=","Metadata":{"request_path":"/e"}}`), wantBody: []byte("{}"), wantPath: "/e"},
 		{name: "truncated", raw: []byte(`{"TraceID":"t5","Body":"e30=`), wantErr: true},
 		{name: "not an object", raw: []byte(`["Body"]`), wantErr: true},
@@ -62,7 +63,7 @@ func TestDecodeSkippingBody(t *testing.T) {
 			if err != nil {
 				t.Fatalf("decode: %v", err)
 			}
-			if path, _ := got.Metadata["request_path"].(string); path != tc.wantPath {
+			if path := string(got.Metadata.RequestPath); path != tc.wantPath {
 				t.Fatalf("request_path = %q, want %q", path, tc.wantPath)
 			}
 			body, err := decodeBodyBytes(value)

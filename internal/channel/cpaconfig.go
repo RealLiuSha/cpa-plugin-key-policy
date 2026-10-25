@@ -18,12 +18,13 @@ import (
 const metaDefaultBaseURL = "https://api.meta.ai/v1"
 
 // cpaDocument holds the credential lists of CPA's config.yaml in both
-// layouts, and the global proxy-url (requests.proxy-url in v8, top-level
-// before). Each list is a pointer so that a present but empty list differs
-// from an absent one.
+// layouts, the global proxy-url (requests.proxy-url in v8, top-level before)
+// and force-model-prefix. Each list is a pointer so that a present but empty
+// list differs from an absent one.
 type cpaDocument struct {
-	ProxyURL string `yaml:"proxy-url"`
-	Requests struct {
+	ProxyURL         string `yaml:"proxy-url"`
+	ForceModelPrefix bool   `yaml:"force-model-prefix"`
+	Requests         struct {
 		ProxyURL *string `yaml:"proxy-url"`
 	} `yaml:"requests"`
 	Grouped      cpaGroupedKeys `yaml:"api-keys"`
@@ -72,9 +73,17 @@ type cpaEntry struct {
 	Prefix         string            `yaml:"prefix"`
 	Headers        map[string]string `yaml:"headers"`
 	ExcludedModels []string          `yaml:"excluded-models"`
+	Models         []cpaModel        `yaml:"models"`
 	Disabled       bool              `yaml:"disabled"`
 	Keys           []cpaKey          `yaml:"keys"`
 	APIKeyEntries  []cpaKey          `yaml:"api-key-entries"`
+}
+
+// cpaModel is one models entry: the upstream name and the name clients use
+// for it, which CPA's config keeps under the host's own field name.
+type cpaModel struct {
+	Name       string `yaml:"name"`
+	ClientName string `yaml:"alias"`
 }
 
 // cpaKey is one key of a v8 group or an openai-compatibility provider. In a
@@ -85,14 +94,16 @@ type cpaKey struct {
 	Prefix         *string           `yaml:"prefix"`
 	Headers        map[string]string `yaml:"headers"`
 	ExcludedModels *[]string         `yaml:"excluded-models"`
+	Models         *[]cpaModel       `yaml:"models"`
 }
 
 // configKey is one credential CPA builds from an entry, with the proxy-url,
-// prefix, headers and excluded-models in effect for it.
+// prefix, headers, excluded-models and models in effect for it.
 type configKey struct {
 	apiKey, proxyURL, prefix string
 	headers                  map[string]string
 	excludedModels           []string
+	models                   []cpaModel
 }
 
 // configKeyDisabled is the excluded-models entry with which CPA's panel
@@ -157,7 +168,7 @@ func ReadCPAConfig(path string) (map[string]Credential, error) {
 		}
 		for _, entry := range *entries {
 			for _, key := range familyKeys(family.kind, v8, entry) {
-				addCredential(credentials, family.kind, family.prefix, entry, key, globalProxy)
+				addCredential(credentials, family.kind, family.prefix, entry, key, globalProxy, doc.ForceModelPrefix)
 			}
 		}
 	}
@@ -186,7 +197,7 @@ func familyKeys(kind string, v8 bool, entry cpaEntry) []configKey {
 		}
 		return out
 	}
-	shared := configKey{apiKey: entry.APIKey, proxyURL: entry.ProxyURL, prefix: entry.Prefix, headers: entry.Headers, excludedModels: entry.ExcludedModels}
+	shared := configKey{apiKey: entry.APIKey, proxyURL: entry.ProxyURL, prefix: entry.Prefix, headers: entry.Headers, excludedModels: entry.ExcludedModels, models: entry.Models}
 	if !v8 {
 		return []configKey{shared}
 	}
@@ -206,12 +217,15 @@ func familyKeys(kind string, v8 bool, entry cpaEntry) []configKey {
 		if key.ExcludedModels != nil {
 			c.excludedModels = *key.ExcludedModels
 		}
+		if key.Models != nil {
+			c.models = *key.Models
+		}
 		out = append(out, c)
 	}
 	return out
 }
 
-func addCredential(credentials map[string]Credential, kind, prefix string, entry cpaEntry, c configKey, globalProxy string) {
+func addCredential(credentials map[string]Credential, kind, prefix string, entry cpaEntry, c configKey, globalProxy string, forceModelPrefix bool) {
 	key, base := strings.TrimSpace(c.apiKey), strings.TrimSpace(entry.BaseURL)
 	switch kind {
 	case "codex", "xai":
@@ -253,8 +267,74 @@ func addCredential(credentials map[string]Credential, kind, prefix string, entry
 		credential.Disabled = slices.ContainsFunc(c.excludedModels, func(model string) bool {
 			return strings.TrimSpace(model) == configKeyDisabled
 		})
+		credential.Models = servedModels(c.models, c.excludedModels, modelPrefix(c.prefix), forceModelPrefix)
 	}
 	credentials[index] = credential
+}
+
+// servedModels lists the names clients ask a key for: each entry's client
+// name, else its name, less those an excluded-models pattern matches. A key
+// with a prefix also serves prefix/name, and under force-model-prefix only
+// that, unless the prefix is the name itself. nil means the key lists no
+// models.
+func servedModels(models []cpaModel, excluded []string, prefix string, forceModelPrefix bool) []string {
+	if len(models) == 0 {
+		return nil
+	}
+	out := []string{}
+	add := func(name string) {
+		if !slices.Contains(out, name) {
+			out = append(out, name)
+		}
+	}
+	for _, m := range models {
+		name := strings.TrimSpace(m.ClientName)
+		if name == "" {
+			name = strings.TrimSpace(m.Name)
+		}
+		if name == "" || slices.ContainsFunc(excluded, func(pattern string) bool { return modelExcluded(pattern, name) }) {
+			continue
+		}
+		if prefix == "" || !forceModelPrefix || prefix == name {
+			add(name)
+		}
+		if prefix != "" {
+			add(prefix + "/" + name)
+		}
+	}
+	return out
+}
+
+// modelExcluded matches an excluded-models pattern as CPA does: without case,
+// "*" standing for any run of characters (slashes included) and every other
+// character for itself.
+func modelExcluded(pattern, model string) bool {
+	pattern = strings.ToLower(strings.TrimSpace(pattern))
+	if pattern == "" {
+		return false
+	}
+	value := strings.ToLower(strings.TrimSpace(model))
+	parts := strings.Split(pattern, "*")
+	if len(parts) == 1 {
+		return pattern == value
+	}
+	head, tail := parts[0], parts[len(parts)-1]
+	if !strings.HasPrefix(value, head) {
+		return false
+	}
+	value = value[len(head):]
+	if !strings.HasSuffix(value, tail) {
+		return false
+	}
+	value = value[:len(value)-len(tail)]
+	for _, segment := range parts[1 : len(parts)-1] {
+		i := strings.Index(value, segment)
+		if i < 0 {
+			return false
+		}
+		value = value[i+len(segment):]
+	}
+	return true
 }
 
 // authIDFor is the ID CPA's config synthesizer gives a credential: kind, ":"

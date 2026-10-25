@@ -3,12 +3,13 @@ import { fetchCpaPlugins, fetchPluginConfig } from "../api/cpa";
 import { apiErrorCode, extractApiError } from "../api/error";
 import { fetchSearch, importSearch, saveSearch } from "../api/search";
 import { ConfirmDialog } from "../components/Modal";
+import NativeSearch from "../components/NativeSearch";
 import SearchToggle from "../components/SearchToggle";
 import { formatCount, formatDateTime } from "../format";
 import { useT } from "../i18n";
 import { useVisiblePolling } from "../polling";
 import { setUnsaved } from "../store/unsaved";
-import type { SearchChannel, SearchChannelStatus, SearchSettings, SearchState } from "../types";
+import type { NativeState, SearchChannel, SearchChannelStatus, SearchSettings, SearchState } from "../types";
 
 type Translate = ReturnType<typeof useT>;
 
@@ -231,6 +232,12 @@ export default function Search() {
   }, [t]);
   useEffect(() => { void refresh(); }, [refresh]);
   useVisiblePolling(() => void refresh(), SEARCH_REFRESH_MS);
+  const refreshNow = useCallback(() => void refresh(), [refresh]);
+  // A native search write is newer than any refresh already under way.
+  const nativeChanged = useCallback((native: NativeState) => {
+    generation.current++;
+    setState((current) => current && { ...current, native });
+  }, []);
   useEffect(() => {
     let alive = true;
     fetchCpaPlugins()
@@ -307,8 +314,9 @@ export default function Search() {
       {!state || !draft ? (!error && <div className="card muted" role="status">{t("keys.loading")}</div>) : (
         <>
           <section className="card">
-            <SearchToggle enabled={state.enabled} declared={state.declared} onChanged={(next) => setState((current) => current && { ...current, enabled: next.enabled, declared: next.declared, status: next.status })} />
+            <SearchToggle enabled={state.enabled} declared={state.declared} onChanged={(next) => setState((current) => current && { ...current, enabled: next.enabled, declared: next.declared, status: next.status, native: next.native })} />
           </section>
+          <NativeSearch native={state.native} searchEnabled={state.enabled} onChanged={nativeChanged} onRefresh={refreshNow} />
           <StatusTable state={state} />
           <form className="card search-form" onSubmit={(event) => void save(event)} aria-label={t("search.settingsTitle")}>
             <h2 className="usage-section-title">{t("search.settingsTitle")}</h2>

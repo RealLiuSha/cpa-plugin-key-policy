@@ -4,6 +4,7 @@ import { extractApiError } from "../api/error";
 import { fetchSettings } from "../api/settings";
 import { copyText } from "../clipboard";
 import LedgerHealthList from "../components/LedgerHealth";
+import { nativeModuleState } from "../components/NativeSearch";
 import SearchToggle from "../components/SearchToggle";
 import { formatBytes, formatCount, formatDateTime, formatMicros } from "../format";
 import { useT } from "../i18n";
@@ -86,6 +87,7 @@ export default function Settings() {
                   />
                 </dd>
               </div>
+              <div><dt><Link to="/search">{t("overview.moduleNative")}</Link></dt><dd>{nativeModuleState(modules, t)}</dd></div>
               <div><dt><Link to="/channels">{t("overview.moduleAdapters")}</Link></dt><dd>{modules.adapters ? t("overview.adapterCount", { rules: modules.adapters.rules, enabled: modules.adapters.enabled_rules }) : t("overview.moduleUnavailable")}</dd></div>
               <div><dt><Link to="/channels">{t("settings.moduleChannels")}</Link></dt><dd>{modules.channels ? t("settings.channelCount", { tracked: modules.channels.tracked }) : t("overview.moduleUnavailable")}</dd></div>
             </dl>

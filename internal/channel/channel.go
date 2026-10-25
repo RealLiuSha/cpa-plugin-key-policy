@@ -213,7 +213,10 @@ type Detail struct {
 // global one; empty means the environment's proxy, and "direct" or "none"
 // means none. Disabled says the key's excluded-models holds "*", which is how
 // CPA's panel disables a config API key: CPA routes no model to it, so a
-// detection test pinned to it can only fail.
+// detection test pinned to it can only fail. Models are the names clients
+// ask the key for (an entry's client name, else its name) less those its
+// excluded-models match; nil means the config lists none, and CPA then
+// registers the provider's own models.
 type Credential struct {
 	AuthIndex string
 	ID        string
@@ -224,6 +227,7 @@ type Credential struct {
 	APIKey    string
 	ProxyURL  string
 	Disabled  bool
+	Models    []string
 }
 
 // Registry owns channel metadata and statistics. Observe is safe

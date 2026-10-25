@@ -4,12 +4,13 @@ import type { SearchState } from "../types";
 const client = vi.hoisted(() => ({ get: vi.fn(), patch: vi.fn() }));
 vi.mock("./client", () => ({ apiClient: () => client, pluginPath: (path: string) => `/plugin${path}`, PLUGIN_ID: "cpa-key-policy" }));
 
-import { SEARCH_APPLY_TIMEOUT_MS, SearchApplyTimeout, setSearchEnabled } from "./search";
+import { SEARCH_APPLY_TIMEOUT_MS, SearchApplyTimeout, nativeState, setSearchEnabled } from "./search";
 
 const state = (enabled: boolean, declared: boolean): SearchState => ({
   enabled, declared,
   settings: { target_model: "gpt-6.1-sol", keep_models: ["gpt-*"], channels: [{ name: "primary", model: "{model}", force_unhealthy: false }], probe: { interval_seconds: 60, timeout_seconds: 15, model: "", url: "http://127.0.0.1:8317/v1/alpha/search", user_agent: "probe", idle_seconds: 0 } },
   status: { channels: [], routed_total: 0, probe_running: false, probe_key_stored: false },
+  native: nativeState(),
 });
 
 beforeEach(() => {
@@ -51,5 +52,15 @@ describe("setSearchEnabled", () => {
     expect(error).toBeInstanceOf(SearchApplyTimeout);
     expect((error as SearchApplyTimeout).last).toMatchObject({ enabled: false, declared: true });
     expect(client.get).toHaveBeenCalledTimes(SEARCH_APPLY_TIMEOUT_MS / 1_000);
+  });
+});
+
+describe("nativeState", () => {
+  it("fills what a plugin without native search leaves out, so the page can still render", () => {
+    const filled = nativeState({ models: [{ model: "gpt-6-sol", mode: "native" } as never], channels: [{ auth_index: "a", name: "a", state: "supported" } as never] });
+    expect(filled.settings.excluded_models).toEqual([]);
+    expect(filled.models[0].gaps).toEqual([]);
+    expect(filled.channels[0].probes).toEqual([]);
+    expect(filled.names).toEqual({});
   });
 });

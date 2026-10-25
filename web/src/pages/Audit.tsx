@@ -84,7 +84,7 @@ export const AUDIT_ACTIONS = [
   "create_key", "update_key", "rotate_key", "delete_key", "reset_usage", "adjust_balance",
   "create_model", "update_model", "delete_model", "import_create_model", "import_update_prices", "migrate_state",
   "update_channel", "delete_channel", "upsert_adapter", "delete_adapter", "try_adapter", "update_search", "import_search",
-  "run_quality", "update_inspection", "start_inspection", "clear_quality",
+  "update_native_search", "probe_native_search", "run_quality", "update_inspection", "start_inspection", "clear_quality",
 ] as const;
 
 // One event as a card: what was done, to what, when, and the changed fields.

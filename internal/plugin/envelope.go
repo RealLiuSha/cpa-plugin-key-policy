@@ -4,7 +4,8 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
-	"errors"
+
+	"cpa-key-policy/internal/jsonscan"
 )
 
 // Host requests for authentication, routing and request interception carry
@@ -17,7 +18,7 @@ import (
 // Every slice returned here may point into the request buffer, which the
 // host owns and frees when the call returns; callers copy what they keep.
 
-var errMalformedEnvelope = errors.New("malformed host request")
+var errMalformedEnvelope = jsonscan.ErrMalformed
 
 // decodeSkippingBody decodes raw into v without the top-level Body member and
 // returns that member's raw JSON value (a string literal or null, nil when
@@ -36,13 +37,13 @@ func decodeSkippingBody(raw []byte, v any) (body []byte, err error) {
 // decodes, so only a custom UnmarshalJSON that keeps its input could hold on
 // to the host buffer.
 func splitBody(raw []byte) (rest, body []byte, err error) {
-	i := skipSpace(raw, 0)
+	i := jsonscan.SkipSpace(raw, 0)
 	if i >= len(raw) || raw[i] != '{' {
 		return nil, nil, errMalformedEnvelope
 	}
 	i++
 	for {
-		i = skipSpace(raw, i)
+		i = jsonscan.SkipSpace(raw, i)
 		if i >= len(raw) {
 			return nil, nil, errMalformedEnvelope
 		}
@@ -51,21 +52,21 @@ func splitBody(raw []byte) (rest, body []byte, err error) {
 			return raw, nil, nil
 		}
 		memberStart := i
-		keyEnd, err := skipString(raw, i)
+		keyEnd, err := jsonscan.SkipString(raw, i)
 		if err != nil {
 			return nil, nil, err
 		}
 		key := raw[i+1 : keyEnd-1]
-		i = skipSpace(raw, keyEnd)
+		i = jsonscan.SkipSpace(raw, keyEnd)
 		if i >= len(raw) || raw[i] != ':' {
 			return nil, nil, errMalformedEnvelope
 		}
-		valueStart := skipSpace(raw, i+1)
-		valueEnd, err := skipValue(raw, valueStart)
+		valueStart := jsonscan.SkipSpace(raw, i+1)
+		valueEnd, err := jsonscan.SkipValue(raw, valueStart)
 		if err != nil {
 			return nil, nil, err
 		}
-		next := skipSpace(raw, valueEnd)
+		next := jsonscan.SkipSpace(raw, valueEnd)
 		if next >= len(raw) {
 			return nil, nil, errMalformedEnvelope
 		}
@@ -98,6 +99,13 @@ func splitBody(raw []byte) (rest, body []byte, err error) {
 	}
 }
 
+// scanMembers calls visit with each top-level member of a host request, its
+// key and raw value, until visit returns false. A member visit does not
+// decode costs what crossing it costs: one IndexByte per string.
+func scanMembers(raw []byte, visit func(key, value []byte) bool) error {
+	return jsonscan.Members(raw, func(key []byte, start, end int) bool { return visit(key, raw[start:end]) })
+}
+
 // decodeBodyBytes turns the raw Body value from splitBody into the bytes the
 // host encoded. It allocates the decoded copy.
 func decodeBodyBytes(value []byte) ([]byte, error) {
@@ -119,91 +127,4 @@ func decodeBodyBytes(value []byte) ([]byte, error) {
 		return nil, err
 	}
 	return out[:n], nil
-}
-
-func skipSpace(raw []byte, i int) int {
-	for i < len(raw) {
-		switch raw[i] {
-		case ' ', '\t', '\r', '\n':
-			i++
-		default:
-			return i
-		}
-	}
-	return i
-}
-
-// skipString returns the index just past the string literal starting at i.
-// A string is crossed with IndexByte: once to the next quote, then from escape
-// to escape up to that quote.
-func skipString(raw []byte, i int) (int, error) {
-	if i >= len(raw) || raw[i] != '"' {
-		return 0, errMalformedEnvelope
-	}
-	j := i + 1
-	for {
-		quote := bytes.IndexByte(raw[j:], '"')
-		if quote < 0 {
-			return 0, errMalformedEnvelope
-		}
-		end := j + quote
-		// Step over the escapes before this quote without searching for it
-		// again: searching after every escape is quadratic in a client string
-		// full of escapes (a header of backslashes or of '<', which the host's
-		// json.Marshal writes as \u003c), and those come before Body.
-		for {
-			backslash := bytes.IndexByte(raw[j:end], '\\')
-			if backslash < 0 {
-				return end + 1, nil
-			}
-			j += backslash + 2
-			if j > end {
-				break // the quote at end was escaped
-			}
-		}
-	}
-}
-
-// skipValue returns the index just past the JSON value starting at i.
-func skipValue(raw []byte, i int) (int, error) {
-	if i >= len(raw) {
-		return 0, errMalformedEnvelope
-	}
-	switch raw[i] {
-	case '"':
-		return skipString(raw, i)
-	case '{', '[':
-		depth := 0
-		for j := i; j < len(raw); j++ {
-			switch raw[j] {
-			case '"':
-				end, err := skipString(raw, j)
-				if err != nil {
-					return 0, err
-				}
-				j = end - 1
-			case '{', '[':
-				depth++
-			case '}', ']':
-				depth--
-				if depth == 0 {
-					return j + 1, nil
-				}
-			}
-		}
-		return 0, errMalformedEnvelope
-	default:
-		j := i
-		for j < len(raw) {
-			switch raw[j] {
-			case ',', '}', ']', ' ', '\t', '\r', '\n':
-				if j == i {
-					return 0, errMalformedEnvelope
-				}
-				return j, nil
-			}
-			j++
-		}
-		return 0, errMalformedEnvelope
-	}
 }

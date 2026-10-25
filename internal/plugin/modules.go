@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net/http"
 	"path/filepath"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -14,6 +16,7 @@ import (
 	"cpa-key-policy/internal/channel"
 	"cpa-key-policy/internal/quality"
 	"cpa-key-policy/internal/search"
+	"cpa-key-policy/internal/search/native"
 )
 
 // Module files live next to the key store's state file. They are separate
@@ -22,6 +25,7 @@ import (
 const (
 	adaptersFile     = "cpa-key-policy-adapters.json"
 	searchFile       = "cpa-key-policy-search.json"
+	nativeFile       = "cpa-key-policy-search-native.json"
 	channelsFile     = "cpa-key-policy-channels.json"
 	channelStatsFile = "cpa-key-policy-channel-stats.json"
 	qualityFile      = "cpa-key-policy-quality.json"
@@ -42,15 +46,16 @@ const (
 var qualityHandOffLimit = 15 * time.Second
 
 // moduleSet is what one data directory holds besides the key store: the
-// adapter rules, the alpha search router, the channel registry and the
-// detection tests. It is opened once per directory and swapped atomically, so
-// the request path reads it without locks. A module whose file cannot be
-// opened stays nil and its error is shown on the settings page; the rest of
-// the plugin works.
+// adapter rules, the alpha search router, native search, the channel
+// registry and the detection tests. It is opened once per directory and
+// swapped atomically, so the request path reads it without locks. A module
+// whose file cannot be opened stays nil and its error is shown on the
+// settings page; the rest of the plugin works.
 type moduleSet struct {
 	dir      string
 	adapters *adapt.Manager
 	search   *search.Router
+	native   *native.Manager
 	channels *channel.Registry
 	quality  *quality.Service
 	errors   map[string]string
@@ -97,6 +102,15 @@ func (a *App) openModules(dir string) *moduleSet {
 		CanWrite:          func() bool { return !set.detached.Load() && a.canWrite() },
 		Logf:              a.logf,
 	})
+	if set.native, err = native.Open(native.Options{
+		Path:     filepath.Join(dir, nativeFile),
+		CanWrite: func() bool { return !set.detached.Load() && a.canWrite() },
+		Logf:     a.logf,
+		Upstream: nativeUpstream{app: a, quality: set.quality},
+	}); err != nil {
+		set.native = nil
+		set.errors["native_search"] = err.Error()
+	}
 	for name, message := range set.errors {
 		a.logf("warn", fmt.Sprintf("cpa-key-policy: %s module unavailable: %s", name, message))
 	}
@@ -111,16 +125,26 @@ const channelHandoff = "channel"
 
 // handOff prepares the modules for a hot replacement: the search probes and
 // the detection tests stop, and the channel statistics are written and from
-// the same instant passed to journal as well. A detection request CPA is
-// still opening cannot be cut short, so the tests get qualityHandOffLimit to
-// end; one that ends later closes its own stream and saves nothing.
+// the same instant passed to journal as well. A detection or native search
+// request CPA is still opening cannot be cut short, so both are cancelled
+// first and together get qualityHandOffLimit to end; one that ends later
+// closes its own stream and saves nothing.
 func (set *moduleSet) handOff(journal func(channel.Observation), logf func(level, message string)) error {
 	if set.search != nil {
 		set.search.Stop()
 	}
+	deadline := time.Now().Add(qualityHandOffLimit)
+	if set.native != nil {
+		set.native.HandOff(0)
+	}
 	if set.quality != nil {
 		if left := set.quality.HandOff(qualityHandOffLimit); left > 0 {
 			logf("warn", fmt.Sprintf("cpa-key-policy: %d detection tests still wait on CPA for a first response; handing off without them", left))
+		}
+	}
+	if set.native != nil {
+		if left := set.native.HandOff(max(time.Until(deadline), 0)); left > 0 {
+			logf("warn", "cpa-key-policy: a native search probe still waits on CPA for a first response; handing off without it")
 		}
 	}
 	if set.channels != nil {
@@ -150,10 +174,10 @@ func (a *App) replayHandoff(module string, payload json.RawMessage) {
 }
 
 // close stops what a replaced module set still runs and saves its
-// statistics. The detection tests end before it returns: CPA may free the
-// host callbacks right after a shutdown. At shutdown a test can wait for the
-// upstream's next chunk, so the statistics are written before it too, and
-// once more for the attempts of the tests just cancelled.
+// statistics. The detection tests and the native search round end before it
+// returns. At shutdown either can wait for the upstream's next chunk, so the
+// statistics are written before them too, and once more for the attempts of
+// those just cancelled.
 func (set *moduleSet) close() {
 	if set.search != nil {
 		set.search.Stop()
@@ -161,11 +185,23 @@ func (set *moduleSet) close() {
 	if set.channels != nil {
 		_ = set.channels.FlushStats()
 	}
+	set.stopProbes()
+	if set.channels != nil {
+		_ = set.channels.FlushStats()
+	}
+}
+
+// stopProbes cancels the native search round and the detection tests, then
+// waits for both: CPA may free the host callbacks right after a shutdown.
+func (set *moduleSet) stopProbes() {
+	if set.native != nil {
+		set.native.HandOff(0)
+	}
 	if set.quality != nil {
 		set.quality.Stop()
 	}
-	if set.channels != nil {
-		_ = set.channels.FlushStats()
+	if set.native != nil {
+		set.native.Stop()
 	}
 }
 
@@ -179,6 +215,10 @@ func (set *moduleSet) close() {
 func (set *moduleSet) detach(logf func(level, message string)) {
 	if set.search != nil {
 		set.search.Stop()
+	}
+	if set.native != nil {
+		set.detached.Store(true)
+		set.native.HandOff(0)
 	}
 	if set.quality != nil {
 		set.detached.Store(true)
@@ -242,6 +282,11 @@ func (a *App) runBackground(ctx context.Context) {
 					set.quality.Tick()
 				}
 			})
+			a.safely("native search schedule", func() {
+				if set := a.modules.Load(); set != nil && set.native != nil {
+					set.native.Tick()
+				}
+			})
 		case <-stats.C:
 			a.safely("channel statistics flush", func() {
 				if set := a.modules.Load(); set != nil && set.channels != nil {
@@ -265,16 +310,30 @@ func (a *App) safely(what string, work func()) {
 	work()
 }
 
-// syncSearch starts or stops the alpha search probes to match the settings.
+// syncSearch starts or stops the alpha search probes and the native search
+// rounds to match the settings. A native search round is cancelled, not
+// waited for, as in detach: its probe may wait on CPA to open a stream, CPA
+// applies no configuration until the register returns, and this instance
+// serves on.
 func (a *App) syncSearch(set *moduleSet, settings pluginSettings) {
-	if set == nil || set.search == nil {
+	if set == nil {
 		return
 	}
-	if settings.SearchEnabled && !a.quiesced.Load() {
-		set.search.Start()
-		return
+	on := settings.SearchEnabled && !a.quiesced.Load()
+	if set.search != nil {
+		if on {
+			set.search.Start()
+		} else {
+			set.search.Stop()
+		}
 	}
-	set.search.Stop()
+	if set.native != nil {
+		if on {
+			set.native.Start()
+		} else {
+			set.native.HandOff(0)
+		}
+	}
 }
 
 // logf writes one line to CPA's log through host.log, so it lands in
@@ -356,6 +415,60 @@ func (c *cpaConfigCache) qualityCredentials() ([]quality.Credential, error) {
 		})
 	}
 	return out, c.err
+}
+
+// models gives the models CPA's config lists for each API key by auth_index;
+// a key listing none is absent.
+func (c *cpaConfigCache) models() map[string][]string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.refreshLocked()
+	out := make(map[string][]string, len(c.byIndex))
+	for index, credential := range c.byIndex {
+		if credential.Models != nil {
+			out[index] = slices.Clone(credential.Models)
+		}
+	}
+	return out
+}
+
+// nativeUpstream is CPA as native search probes it: the detection module's
+// credentials, with the models CPA's config lists for each API key, and
+// model streams pinned to one of them.
+type nativeUpstream struct {
+	app     *App
+	quality *quality.Service
+}
+
+// Credentials fails when CPA's config cannot be read: without its API keys
+// the list is incomplete, and native search would drop their evidence.
+func (u nativeUpstream) Credentials() ([]native.Credential, error) {
+	list, configErr, err := u.quality.Credentials()
+	if err != nil {
+		return nil, err
+	}
+	if configErr != "" {
+		return nil, fmt.Errorf("read CPA config: %s", configErr)
+	}
+	models := u.app.cpaCredentials.models()
+	out := make([]native.Credential, 0, len(list))
+	for _, c := range list {
+		credential := native.Credential{AuthIndex: c.AuthIndex, ID: c.ID, Provider: c.Provider, Name: c.Name, Group: c.Group,
+			Disabled: c.Disabled, Unavailable: c.Unavailable}
+		if c.Source == quality.SourceProvider {
+			credential.Models = models[c.AuthIndex]
+		}
+		out = append(out, credential)
+	}
+	return out, nil
+}
+
+func (u nativeUpstream) Stream(ctx context.Context, c native.Credential, model string, body any, headers http.Header) ([]byte, int, error) {
+	events, status, err := quality.StreamEvents(ctx, qualityHost{u.app}, quality.Credential{ID: c.ID, AuthIndex: c.AuthIndex, Provider: c.Provider}, model, body, headers)
+	if err != nil && quality.NotServing(err) {
+		return nil, status, fmt.Errorf("%w: %v", native.ErrNotServing, err)
+	}
+	return events, status, err
 }
 
 func (c *cpaConfigCache) refreshLocked() {

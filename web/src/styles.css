@@ -1209,6 +1209,33 @@ ul.overview-warnings { padding-left: 28px; display: flex; flex-direction: column
 .search-channel-actions { display: flex; gap: 6px; margin-top: 22px; }
 .search-channel-actions .btn { min-width: 36px; }
 .search-probe-cost { line-height: 1.6; }
+.native-search { display: flex; flex-direction: column; gap: 12px; }
+.native-search .usage-section-title { margin: 0; }
+.native-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; flex-wrap: wrap; }
+.native-head .field-hint { margin: 4px 0 0; max-width: 780px; line-height: 1.6; }
+.native-head-actions { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.native-schedule { margin: 0; font-size: 13px; }
+.native-table.card.table-wrap { overflow-x: auto; }
+.native-table table { min-width: 780px; }
+.native-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.native-chip { display: inline-flex; align-items: center; padding: 2px 8px; border: 1px solid var(--border); border-radius: 999px; background: var(--panel-2); font-size: 12px; white-space: nowrap; }
+.native-chip.ok { color: var(--ok); border-color: var(--ok-border); background: var(--ok-soft); }
+.native-chip.warn { color: var(--warn-text); border-color: color-mix(in srgb, var(--warn) 45%, transparent); background: color-mix(in srgb, var(--warn) 12%, transparent); }
+.native-chip.danger { color: var(--danger); border-color: var(--danger-border); background: var(--danger-soft); }
+.native-models { max-width: 240px; overflow-wrap: anywhere; }
+.native-error { color: var(--muted); overflow-wrap: anywhere; }
+.native-history { display: inline-flex; align-items: center; gap: 4px; }
+.native-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--border); }
+.native-dot.result-search { background: var(--ok); }
+.native-dot.result-no_search { background: var(--danger); }
+.native-dot.result-error { background: var(--warn); }
+.native-row-actions { display: flex; justify-content: flex-end; gap: 6px; flex-wrap: wrap; }
+.native-row-actions .btn, .native-model { white-space: nowrap; }
+.native-note { margin: 0; line-height: 1.6; }
+.native-policy { display: flex; flex-direction: column; gap: 10px; padding-top: 12px; border-top: 1px solid var(--border); }
+.native-coverage { display: flex; flex-direction: column; gap: 8px; margin: 0; padding: 0; border: 0; }
+.native-coverage .check-row > span { display: flex; flex-direction: column; gap: 2px; }
+.native-interval { display: flex; flex-direction: column; gap: 6px; max-width: 360px; }
 
 /* ===== Quality ===== */
 .quality-actions { display: flex; gap: 8px; flex-wrap: wrap; }

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -17,13 +18,16 @@ import (
 // fakeHost is CPA's side of the callbacks: an auth manager list (files, by
 // default empty: it leaves out the config's API keys), and model streams that
 // answer at once, or hold until closed when hold is set. events replaces the
-// answer's event stream; a gate holds execute_stream until it is closed.
+// answer's event stream; a gate holds execute_stream until it is closed;
+// notServing answers like CPA's scheduler for a model a credential lacks.
 type fakeHost struct {
 	answer string
 	hold   bool
 	files  string
 	events string
 	gate   chan struct{}
+	// notServing holds "<auth_id> <model>" pairs CPA has no credential for.
+	notServing map[string]bool
 
 	mu      sync.Mutex
 	streams map[string]chan struct{}
@@ -103,11 +107,15 @@ func (h *fakeHost) Call(method string, payload any) (json.RawMessage, error) {
 		h.gets++
 		return json.RawMessage(`{"json":{"plan_type":"plus"}}`), nil
 	case "host.model.execute_stream":
-		h.pinned = append(h.pinned, payload.(map[string]any)["auth_id"].(string))
+		request := payload.(map[string]any)
+		h.pinned = append(h.pinned, request["auth_id"].(string))
 		if h.gate != nil {
 			h.mu.Unlock()
 			<-h.gate
 			h.mu.Lock()
+		}
+		if h.notServing[request["auth_id"].(string)+" "+request["model"].(string)] {
+			return nil, &HostError{Code: "host_call_failed", Message: "auth_not_found: no auth available (providers=codex, model=" + request["model"].(string) + ")"}
 		}
 		h.next++
 		id := fmt.Sprint(h.next)
@@ -315,6 +323,68 @@ func TestInspectionRoundIsJudgedAndSaved(t *testing.T) {
 	}
 	if again := reopened.Inspection(7); !again.Settings.Enabled || len(again.Days[0].Cells) != 3 {
 		t.Fatalf("reopened view = %+v", again)
+	}
+}
+
+// A round lets each group follow CPA: a member CPA no longer serves the
+// model from or no longer has leaves, a channel serving it joins unless the
+// operator ignores it, also when they ignored it during the round, and a
+// channel lacking the model is not recorded. When no channel serves a
+// group's model, as during a CPA reload, its members stay.
+func TestInspectionGroupsFollowCPA(t *testing.T) {
+	dir := t.TempDir()
+	file := func(name, index string) string {
+		return `{"id":"` + name + `.json","auth_index":"` + index + `","name":"` + name + `.json","provider":"codex","path":"/auths/` + name + `.json"}`
+	}
+	host := &fakeHost{answer: "答案：0", gate: make(chan struct{}), notServing: map[string]bool{},
+		files: `{"files":[` + strings.Join([]string{file("codex-a", "1111111111111111"), file("codex-b", "2222222222222222"),
+			file("codex-c", "3333333333333333"), file("codex-d", "4444444444444444"), file("codex-e", "5555555555555555")}, ",") + `]}`}
+	for _, id := range []string{"codex-a.json", "codex-d.json"} {
+		host.notServing[id+" gpt-6-sol"] = true
+	}
+	for _, id := range []string{"codex:apikey:1", "codex-a.json", "codex-b.json", "codex-d.json", "codex-e.json"} {
+		host.notServing[id+" gpt-6-astra"] = true
+	}
+	s := open(t, Options{Path: filepath.Join(dir, "quality.json"), InspectionPath: filepath.Join(dir, "inspection.json"), Host: host})
+	settings := InspectionSettings{Times: []string{"08:00"}, Runs: 1, Groups: []InspectionGroup{
+		{Model: "gpt-6-sol", Effort: "low", Channels: []string{"0123456789abcdef", "1111111111111111", "ffffffffffffffff"}, Ignored: []string{"3333333333333333"}},
+		{Model: "gpt-6-astra", Effort: "low", Channels: []string{"0123456789abcdef"}, Ignored: []string{"3333333333333333"}},
+	}}
+	if _, _, err := s.SetInspection(settings); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.StartInspection(); err != nil {
+		t.Fatal(err)
+	}
+	// Five channels per group are asked; codex-c, ignored, never is.
+	waitFor(t, "the round's requests", func() bool { return host.requests() == 10 })
+	settings.Groups[0].Ignored = append(settings.Groups[0].Ignored, "5555555555555555")
+	if _, _, err := s.SetInspection(settings); err != nil {
+		t.Fatal(err)
+	}
+	close(host.gate)
+	waitIdle(t, s)
+
+	view := s.Inspection(1)
+	if sol, astra := view.Settings.Groups[0].Channels, view.Settings.Groups[1].Channels; !slices.Equal(sol, []string{"0123456789abcdef", "2222222222222222"}) ||
+		!slices.Equal(astra, []string{"0123456789abcdef"}) {
+		t.Fatalf("channels: gpt-6-sol %v, gpt-6-astra %v", sol, astra)
+	}
+	recorded := map[string]string{}
+	for _, cell := range view.Days[0].Cells {
+		recorded[cell.Model+" "+cell.AuthIndex] = cell.Verdict + " " + cell.Rounds[0].Skipped
+	}
+	want := map[string]string{
+		"gpt-6-sol 0123456789abcdef": "degraded ", "gpt-6-sol 1111111111111111": "skipped not_serving", "gpt-6-sol ffffffffffffffff": "skipped missing",
+		"gpt-6-sol 2222222222222222": "degraded ", "gpt-6-sol 5555555555555555": "degraded ", "gpt-6-astra 0123456789abcdef": "skipped not_serving",
+	}
+	if !maps.Equal(recorded, want) {
+		t.Fatalf("recorded %v, want %v", recorded, want)
+	}
+	host.mu.Lock()
+	defer host.mu.Unlock()
+	if slices.Contains(host.pinned, "codex-c.json") {
+		t.Fatal("an ignored channel was asked")
 	}
 }
 
