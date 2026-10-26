@@ -44,6 +44,19 @@ python3 scripts/publish.py \
 
 ## 本次变化
 
+### 0.30.0：自动排除不搜索的渠道
+
+相对 0.29.0 的变化。
+
+- 起因：Kimera（codex-11）的 gpt-6-sol、gpt-6.1-sol 不执行原生搜索，探测早就记下了，但 CPA 照样把这两个模型的会话派给它；LoboOS 的搜索请求带 `tool_choice: required`，Kimera 先丢掉工具再回 400 E1001 `required tool choice has no available tool`。请求链路只能剥工具、不能换渠道，剥工具对这类请求也没用。
+- 判断改按（渠道, 模型）：`cpa-key-policy-search-native.json` 的每个渠道多 `pairs`（每个模型连续未搜索次数、最近一次检测、拒绝），拒绝从渠道级移到模型级（剥工具也只剥被拒绝的模型）。渠道对一个模型的状态先看这个模型自己的检测，没有才借用同渠道其他模型的；已确认不搜索的模型不再把同渠道其他模型拖成「不稳定」。没搜索一次的模型 15 分钟后单独复检，不等轮换。旧文件加载时从探测历史推出 `pairs`，旧的渠道级 `rejection` 移到被拒绝的模型下。
+- 拒绝识别多认 `required tool choice has no available tool`（400/404/422），记为该模型的拒绝，10 分钟后复检。
+- 新增自动排除（原生搜索设置 `auto_exclude`，默认开启）：原生搜索模式下的模型，CPA 配置 Key 被确认不搜索（连续两次未搜索，或拒绝后一次检测仍未搜索）且还有别的渠道「支持」这个模型时，插件往 CPA config.yaml 里这个 Key 的 `excluded-models` 加上该模型；按检测间隔试放复检（每次翻倍，最长 7 天），复检搜索了就撤销。最后一个会搜索的渠道没了、模型离开原生搜索时一分钟内撤销，关掉原生搜索或自动排除时立即撤销，关掉搜索模块时一分钟内撤销。CPA 停用的 Key 和 OAuth 凭据不动；启动后 2 分钟内、凭据列表读不全时不新增。每次写入合并成一次、只改目标 Key 自己的 `excluded-models`（撤销后文件逐字节回到原样；沿用分组列表的 v8 Key 不动，显示原因），要求文件是 CPA 写出的排版、写前重读比对、原地写入不换 inode。操作员在页面上「解除」或手工删掉插件写的条目，都视为保留该渠道，恢复前不再自动排除；插件没写过的条目从不删除。
+- 接口：`GET /search` 的 `native` 多 `exclusions`（每条：渠道、模型、`state` 为 active/pending/trial/blocked/kept、证据、下次试放、错误）和可选的 `exclusion_error`，`channels[].model_states` 是渠道对每个模型的状态，`settings.auto_exclude`；新增 `POST /search/native/exclusions {auth_index, model, action: release|resume}`（审计 `update_native_exclusion`）。插件每次写 CPA 配置记审计 `native_exclusions`（操作者 `native_search`），main.log 记一行。`cpa_config_path` 不再只读。
+- 界面：搜索页原生搜索多「自动排除」一节（开关需确认、列表、解除 / 恢复自动），模型行列出被自动排除的渠道，渠道行按模型显示状态；审计页可按两个新动作筛选。
+- 升级影响：默认开启，升级后（启动满 2 分钟）凡是已确认不搜索、且有别的渠道会搜索的 CPA 配置 Key 会被写进 `excluded-models`，CPA 随即重载一次配置。凭据 ID 不变，会话粘滞保留，只有绑在被排除那一对上的会话改派（本地用 CPA 0db1902 实测：12 个会话里只有绑在被排除渠道、请求被排除模型的 1 个改派）。按 llm-reeka 2026-10-26 的证据预演，升级后不会写任何条目：确认不搜索的只有 codex-17 的 gpt-6-luna，codex-11 的 6-sol、6.1-sol 各一次未搜索，这两把 Key 都已在 CPA 停用（`*`），插件不动。
+- 回退：0.29.0 忽略 `pairs`、`exclusions` 和 `auto_exclude`，但已写进 config.yaml 的条目不会撤销。回退前先在页面关掉自动排除（撤掉全部条目），或回退后手工删掉；这些条目只是普通的 `excluded-models` 项。
+
 ### 0.29.0：原生搜索
 
 - 新增「原生搜索」：Codex 按 CPA 下发的模型目录决定怎么搜索，Responses Lite 模型只能调用少数上游才支持的 `/v1/alpha/search`。插件经宿主回调把带 `web_search` 工具的简短请求固定发到每个 codex 渠道，检测它是否真的执行搜索：每轮每个渠道一次，默认 12 小时一轮全量，新渠道随即检测，失败的渠道每小时复检；每次检测都是一次付费的真实请求。目录模型有承接渠道「支持」后，插件在目录里关掉它的 Responses Lite，Codex 约 5 分钟内改用对话里的 `web_search` 工具；没有可用渠道时留在 alpha search。页面上可以禁用渠道、排除模型、选覆盖策略（任一渠道 / 全部渠道）和检测间隔。被禁用或拒绝该工具的渠道上，插件在 `request.intercept_after` 里去掉工具，连同历史里回放的 `web_search_call` 项（否则 CPA 会为它们重新声明工具）。原生搜索默认开启，但只在 `search_enabled` 打开时注册。

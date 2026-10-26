@@ -264,9 +264,12 @@ func addCredential(credentials map[string]Credential, kind, prefix string, entry
 			credential.Provider = "gemini-interactions"
 		}
 		credential.ID = authIDFor(credential.Provider+":apikey", key, base, c.proxyURL, modelPrefix(c.prefix), sortedHeaders(c.headers))
-		credential.Disabled = slices.ContainsFunc(c.excludedModels, func(model string) bool {
-			return strings.TrimSpace(model) == configKeyDisabled
-		})
+		for _, model := range c.excludedModels {
+			if model = strings.TrimSpace(model); model != "" {
+				credential.ExcludedModels = append(credential.ExcludedModels, model)
+			}
+		}
+		credential.Disabled = slices.Contains(credential.ExcludedModels, configKeyDisabled)
 		credential.Models = servedModels(c.models, c.excludedModels, modelPrefix(c.prefix), forceModelPrefix)
 	}
 	credentials[index] = credential

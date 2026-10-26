@@ -1,10 +1,10 @@
 import { useEffect, useId, useState } from "react";
 import { apiErrorCode, extractApiError } from "../api/error";
-import { probeNativeSearch, saveNativeSearch } from "../api/search";
+import { probeNativeSearch, saveNativeSearch, updateNativeExclusion } from "../api/search";
 import { formatDateTime, formatMillis } from "../format";
 import { useT } from "../i18n";
 import { setUnsaved } from "../store/unsaved";
-import type { ModuleStates, NativeChannelState, NativeMode, NativeSettings, NativeState } from "../types";
+import type { ModuleStates, NativeChannelState, NativeExclusion, NativeExclusionState, NativeMode, NativeSettings, NativeState } from "../types";
 import { ConfirmDialog } from "./Modal";
 
 // While a probe round runs the page follows its progress this often.
@@ -15,10 +15,12 @@ const stateTone: Record<NativeChannelState, string> = {
   supported: "ok", unstable: "warn", stale: "warn", unknown: "", no_search: "danger", failing: "danger", rejected: "danger", disabled: "",
 };
 const modeTone: Record<NativeMode, string> = { native: "ok", fallback: "warn", excluded: "", off: "" };
+// Blocked leaves the model's sessions on that channel without search.
+const exclusionTone: Record<NativeExclusionState, string> = { active: "ok", pending: "warn", trial: "warn", blocked: "danger", kept: "" };
 // The answers to a check request that have their own message.
 const probeErrors: Record<string, string> = { busy: "search.native.probeBusy", search_off: "search.native.probeOff", not_found: "search.native.probeNothing" };
 
-type Confirm = { kind: "on" | "off" } | { kind: "disable"; authIndex: string };
+type Confirm = { kind: "on" | "off" | "autoOn" | "autoOff" } | { kind: "disable"; authIndex: string };
 
 // nativeModuleState is the overview and settings line for native search:
 // how many catalog models search natively and how many fall back, once it is
@@ -63,9 +65,12 @@ export default function NativeSearch({ native, searchEnabled, onChanged, onRefre
   }, [round, onRefresh]);
 
   const name = (authIndex: string) => {
-    const channel = native.channels.find((item) => item.auth_index === authIndex);
+    const channel = native.channels.find((item) => item.auth_index === authIndex) ?? native.exclusions.find((item) => item.auth_index === authIndex);
     return native.names[authIndex] || channel?.group || channel?.name || authIndex;
   };
+  // The channels a model is taken off in CPA's config, or given back to on
+  // trial; they no longer show among its gaps.
+  const excludedFrom = (model: string) => native.exclusions.filter((item) => item.model === model && (item.state === "active" || item.state === "trial"));
   const save = async (patch: Partial<NativeSettings>, key: string, done: string) => {
     setBusy(key);
     setMessage(null);
@@ -91,11 +96,29 @@ export default function NativeSearch({ native, searchEnabled, onChanged, onRefre
       setBusy(null);
     }
   };
+  const keep = async (item: NativeExclusion, action: "release" | "resume") => {
+    setBusy(`exclusion:${item.auth_index}:${item.model}`);
+    setMessage(null);
+    try {
+      const next = await updateNativeExclusion(item.auth_index, item.model, action);
+      onChanged(next);
+      setMessage(next.exclusion_error
+        ? { ok: false, text: t("search.native.exclusionWriteFailed", { error: next.exclusion_error }) }
+        : { ok: true, text: t(action === "release" ? "search.native.exclusionReleased" : "search.native.exclusionResumed", { name: name(item.auth_index), model: item.model }) });
+    } catch (reason) {
+      setMessage({ ok: false, text: extractApiError(reason, t("search.native.exclusionFailed")) });
+    } finally {
+      setBusy(null);
+    }
+  };
   const runConfirm = () => {
     const current = confirm;
     setConfirm(null);
     if (!current) return;
-    if (current.kind === "disable") {
+    if (current.kind === "autoOn" || current.kind === "autoOff") {
+      const on = current.kind === "autoOn";
+      void save({ auto_exclude: on }, "auto", t(on ? "search.native.autoTurnedOn" : "search.native.autoTurnedOff"));
+    } else if (current.kind === "disable") {
       void save({ disabled_channels: [...settings.disabled_channels, current.authIndex] }, `channel:${current.authIndex}`, t("search.native.channelDisabled", { name: name(current.authIndex) }));
     } else {
       void save({ enabled: current.kind === "on" }, "toggle", t(current.kind === "on" ? "search.native.turnedOn" : "search.native.turnedOff"));
@@ -175,10 +198,13 @@ export default function NativeSearch({ native, searchEnabled, onChanged, onRefre
                     <td>{model.usable.length === 0 ? "—" : (
                       <span className="native-chips">{model.usable.map((index) => <span key={index} className="native-chip ok">{name(index)}</span>)}</span>
                     )}</td>
-                    <td>{model.gaps.length === 0 ? <span className="muted">{t("search.native.noGaps")}</span> : (
+                    <td>{model.gaps.length === 0 && excludedFrom(model.model).length === 0 ? <span className="muted">{t("search.native.noGaps")}</span> : (
                       <span className="native-chips">
                         {model.gaps.map((gap) => (
                           <span key={gap.auth_index} className={`native-chip ${stateTone[gap.state]}`}>{name(gap.auth_index)} · {t(`search.native.state.${gap.state}`)}</span>
+                        ))}
+                        {excludedFrom(model.model).map((item) => (
+                          <span key={`excluded-${item.auth_index}`} className="native-chip">{name(item.auth_index)} · {t(`search.native.exclusion.state.${item.state}`)}</span>
                         ))}
                       </span>
                     )}</td>
@@ -200,6 +226,66 @@ export default function NativeSearch({ native, searchEnabled, onChanged, onRefre
         </div>
       )}
       <p className="notice info native-note" role="note">{t("search.native.gapNote")}</p>
+
+      <div className="native-exclusions-head">
+        <h3 className="search-subtitle">{t("search.native.exclusionsTitle")}</h3>
+        <label className="switch">
+          <input type="checkbox" role="switch" checked={settings.auto_exclude} disabled={working || unavailable} onChange={() => setConfirm({ kind: settings.auto_exclude ? "autoOff" : "autoOn" })} />
+          <span className="track"><span className="thumb" /></span>
+          <span>{t("search.native.autoExcludeLabel")}</span>
+        </label>
+      </div>
+      <p className="field-hint native-note">{t("search.native.exclusionsDescription")}</p>
+      {native.exclusion_error && <div className="error" role="alert">{t("search.native.exclusionWriteFailed", { error: native.exclusion_error })}</div>}
+      {native.exclusions.length === 0 ? <div className="empty-state">{t(settings.auto_exclude ? "search.native.exclusionsEmpty" : "search.native.exclusionsOff")}</div> : (
+        <div className="card table-wrap native-table">
+          <table>
+            <thead>
+              <tr>
+                <th>{t("search.native.col.channel")}</th><th>{t("search.native.col.model")}</th><th>{t("search.native.col.state")}</th>
+                <th>{t("search.native.col.evidence")}</th><th>{t("search.native.col.next")}</th><th>{t("search.native.col.actions")}</th>
+              </tr>
+            </thead>
+            <tbody>
+              {native.exclusions.map((item) => {
+                const key = `${item.auth_index}:${item.model}`;
+                const label = name(item.auth_index);
+                const kept = item.state === "kept";
+                const hint = kept ? `kept_${item.kept_by === "config" ? "config" : "operator"}` : item.state;
+                return (
+                  <tr key={key} data-testid={`native-exclusion-${key}`}>
+                    <td><strong>{label}</strong><div className="field-hint mono">{item.auth_index}</div></td>
+                    <td className="mono native-model">{item.model}</td>
+                    <td>
+                      <span className={`badge ${exclusionTone[item.state]}`}>{t(`search.native.exclusion.state.${item.state}`)}</span>
+                      <div className="field-hint">{t(`search.native.exclusion.hint.${hint}`)}</div>
+                      {item.error && <div className="native-error">{item.error}</div>}
+                    </td>
+                    <td>
+                      {t("search.native.exclusion.evidence", { count: item.no_search })}
+                      {item.rejection && <div className="field-hint">{t("search.native.exclusion.refused", { at: formatDateTime(item.rejection.at), status: item.rejection.status })}</div>}
+                      <div className="field-hint">{t("search.native.exclusion.since", { at: formatDateTime(item.since) })}</div>
+                    </td>
+                    <td>
+                      {item.state === "active" && item.retry_at ? t("search.native.exclusion.retryAt", { at: formatDateTime(item.retry_at) })
+                        : item.state === "trial" && item.trial_at ? t("search.native.exclusion.trialAt", { at: formatDateTime(item.trial_at) })
+                          : kept && item.kept_at ? t("search.native.exclusion.keptAt", { at: formatDateTime(item.kept_at) }) : "—"}
+                      {item.trials > 0 && <div className="field-hint">{t("search.native.exclusion.trials", { count: item.trials })}</div>}
+                    </td>
+                    <td className="native-row-actions">
+                      <button type="button" className="btn sm" disabled={working || unavailable}
+                        aria-label={t(kept ? "search.native.resumeFor" : "search.native.releaseFor", { name: label, model: item.model })}
+                        onClick={() => void keep(item, kept ? "resume" : "release")}>
+                        {t(busy === `exclusion:${key}` ? "keyForm.submitting" : kept ? "search.native.resume" : "search.native.release")}
+                      </button>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
 
       <h3 className="search-subtitle">{t("search.native.channelsTitle")}</h3>
       {native.channels.length === 0 ? <div className="empty-state">{t("search.native.channelsEmpty")}</div> : (
@@ -225,7 +311,19 @@ export default function NativeSearch({ native, searchEnabled, onChanged, onRefre
                       {channel.cpa_disabled && <span className="badge">{t("search.native.cpaDisabled")}</span>}
                       {channel.unavailable && <span className="badge warn">{t("search.native.cooling")}</span>}
                     </td>
-                    <td className="mono native-models">{channel.models.join(", ")}</td>
+                    <td className="native-models">
+                      <span className="native-chips">
+                        {channel.models.map((model) => {
+                          // The channel's state for the model, where it differs from its state as a whole.
+                          const own = channel.model_states[model];
+                          return (
+                            <span key={model} className={`native-chip mono ${own && own !== channel.state ? stateTone[own] : ""}`}>
+                              {own && own !== channel.state ? `${model} · ${t(`search.native.state.${own}`)}` : model}
+                            </span>
+                          );
+                        })}
+                      </span>
+                    </td>
                     <td><span className={`badge ${stateTone[channel.state]}`}>{t(`search.native.state.${channel.state}`)}</span></td>
                     <td>
                       {last ? (
@@ -303,10 +401,10 @@ export default function NativeSearch({ native, searchEnabled, onChanged, onRefre
 
       {confirm && (
         <ConfirmDialog
-          title={t(confirm.kind === "disable" ? "search.native.disableTitle" : confirm.kind === "on" ? "search.native.onTitle" : "search.native.offTitle")}
-          message={confirm.kind === "disable" ? t("search.native.disableConfirm", { name: name(confirm.authIndex) }) : t(confirm.kind === "on" ? "search.native.onConfirm" : "search.native.offConfirm")}
+          title={t(`search.native.${confirm.kind}Title`)}
+          message={confirm.kind === "disable" ? t("search.native.disableConfirm", { name: name(confirm.authIndex) }) : t(`search.native.${confirm.kind}Confirm`)}
           cancelLabel={t("keyForm.cancel")}
-          confirmLabel={t(confirm.kind === "disable" ? "search.native.disableApply" : confirm.kind === "on" ? "search.native.onApply" : "search.native.offApply")}
+          confirmLabel={t(`search.native.${confirm.kind}Apply`)}
           onCancel={() => setConfirm(null)}
           onConfirm={runConfirm}
         />

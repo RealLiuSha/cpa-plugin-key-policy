@@ -216,18 +216,21 @@ type Detail struct {
 // detection test pinned to it can only fail. Models are the names clients
 // ask the key for (an entry's client name, else its name) less those its
 // excluded-models match; nil means the config lists none, and CPA then
-// registers the provider's own models.
+// registers the provider's own models. ExcludedModels is the excluded-models
+// list in effect for the key (its own, else its v8 group's), trimmed; an
+// openai-compatibility key has none.
 type Credential struct {
-	AuthIndex string
-	ID        string
-	Provider  string
-	Kind      string
-	Group     string
-	BaseURL   string
-	APIKey    string
-	ProxyURL  string
-	Disabled  bool
-	Models    []string
+	AuthIndex      string
+	ID             string
+	Provider       string
+	Kind           string
+	Group          string
+	BaseURL        string
+	APIKey         string
+	ProxyURL       string
+	Disabled       bool
+	Models         []string
+	ExcludedModels []string
 }
 
 // Registry owns channel metadata and statistics. Observe is safe

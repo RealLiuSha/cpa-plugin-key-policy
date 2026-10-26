@@ -13,12 +13,13 @@ function status(value?: SearchStatus | null): SearchStatus {
 
 // A plugin older than native search answers without it.
 export function nativeState(value?: Partial<NativeState> | null): NativeState {
-  const settings: NativeSettings = { enabled: false, require_all: false, interval_hours: 12, ...(value?.settings ?? {}), excluded_models: value?.settings?.excluded_models ?? [], disabled_channels: value?.settings?.disabled_channels ?? [] };
+  const settings: NativeSettings = { enabled: false, require_all: false, auto_exclude: false, interval_hours: 12, ...(value?.settings ?? {}), excluded_models: value?.settings?.excluded_models ?? [], disabled_channels: value?.settings?.disabled_channels ?? [] };
   return {
     running: false, declared: false, ...(value ?? {}),
     settings,
     models: (value?.models ?? []).map((model) => ({ ...model, usable: model.usable ?? [], gaps: model.gaps ?? [] })),
-    channels: (value?.channels ?? []).map((channel) => ({ ...channel, models: channel.models ?? [], probes: channel.probes ?? [] })),
+    channels: (value?.channels ?? []).map((channel) => ({ ...channel, models: channel.models ?? [], model_states: channel.model_states ?? {}, probes: channel.probes ?? [] })),
+    exclusions: value?.exclusions ?? [],
     names: value?.names ?? {},
   };
 }
@@ -37,6 +38,14 @@ export async function saveNativeSearch(next: NativeSettings): Promise<NativeStat
 // catalog model. The round runs on in the plugin.
 export async function probeNativeSearch(authIndex?: string): Promise<NativeState> {
   const { data } = await apiClient().post<NativeState>(pluginPath("/search/native/probe"), authIndex ? { auth_index: authIndex } : {});
+  return nativeState(data);
+}
+
+// release keeps the channel serving the model: its automatic exclusion ends
+// and stays off until resumed. The plugin edits CPA's config before it
+// answers; a failed edit shows on the exclusion and is retried.
+export async function updateNativeExclusion(authIndex: string, model: string, action: "release" | "resume"): Promise<NativeState> {
+  const { data } = await apiClient().post<NativeState>(pluginPath("/search/native/exclusions"), { auth_index: authIndex, model, action });
   return nativeState(data);
 }
 

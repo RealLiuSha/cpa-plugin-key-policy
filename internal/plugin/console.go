@@ -516,6 +516,45 @@ func (a *App) probeNativeSearch(body []byte) ManagementResponse {
 	return jsonResponse(http.StatusAccepted, a.nativeState(set))
 }
 
+// updateNativeExclusion releases an automatic exclusion, so the channel
+// keeps serving the model, or resumes it. The choice holds even when CPA's
+// config cannot be edited right away; the exclusion shows that error and the
+// edit is retried every minute.
+func (a *App) updateNativeExclusion(body []byte) ManagementResponse {
+	set := a.modules.Load()
+	if set == nil || set.native == nil {
+		return moduleUnavailable("native search")
+	}
+	var req struct {
+		AuthIndex string `json:"auth_index"`
+		Model     string `json:"model"`
+		Action    string `json:"action"`
+	}
+	if err := decodeStrictBody(body, &req); err != nil {
+		return jsonError(http.StatusBadRequest, "invalid_json", err.Error())
+	}
+	var err error
+	switch req.Action {
+	case "release":
+		err = set.native.Release(req.AuthIndex, req.Model)
+	case "resume":
+		err = set.native.Resume(req.AuthIndex, req.Model)
+	default:
+		return jsonError(http.StatusBadRequest, "invalid_request", `action must be "release" or "resume"`)
+	}
+	switch {
+	case errors.Is(err, native.ErrUnknownExclusion):
+		return jsonError(http.StatusNotFound, "not_found", err.Error())
+	case errors.Is(err, native.ErrReadOnly):
+		return a.moduleWriteError(err)
+	}
+	// The audit page shows the target and hides a model field.
+	a.store.RecordChange("update_native_exclusion", strings.TrimSpace(req.AuthIndex)+" "+strings.TrimSpace(req.Model), map[string]audit.Change{
+		"action": {To: req.Action},
+	})
+	return jsonResponse(http.StatusOK, a.nativeState(set))
+}
+
 func (a *App) updateSearch(body []byte) ManagementResponse {
 	set := a.modules.Load()
 	if set == nil || set.search == nil {

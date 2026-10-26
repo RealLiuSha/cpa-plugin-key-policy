@@ -18,9 +18,10 @@ import (
 type pluginSettings struct {
 	// SearchEnabled declares model_router and answers alpha search routing.
 	SearchEnabled bool
-	// CPAConfigPath is CPA's config.yaml, read only for the upstream keys of
-	// balance queries and detection tests; relative paths resolve against
-	// CPA's working directory.
+	// CPAConfigPath is CPA's config.yaml, read for the upstream keys of
+	// detection tests and adapter rule tries and edited by native search's
+	// automatic exclusion; relative paths resolve against CPA's working
+	// directory.
 	CPAConfigPath string
 }
 

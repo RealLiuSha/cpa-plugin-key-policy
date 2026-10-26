@@ -14,6 +14,7 @@ import (
 
 	"cpa-key-policy/internal/adapt"
 	"cpa-key-policy/internal/channel"
+	"cpa-key-policy/internal/policy/audit"
 	"cpa-key-policy/internal/quality"
 	"cpa-key-policy/internal/search"
 	"cpa-key-policy/internal/search/native"
@@ -417,24 +418,31 @@ func (c *cpaConfigCache) qualityCredentials() ([]quality.Credential, error) {
 	return out, c.err
 }
 
-// models gives the models CPA's config lists for each API key by auth_index;
-// a key listing none is absent.
-func (c *cpaConfigCache) models() map[string][]string {
+// serving gives, for each API key of CPA's config by auth_index, the models
+// the config lists (nil: none) and its excluded-models in effect.
+func (c *cpaConfigCache) serving() map[string][2][]string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.refreshLocked()
-	out := make(map[string][]string, len(c.byIndex))
+	out := make(map[string][2][]string, len(c.byIndex))
 	for index, credential := range c.byIndex {
-		if credential.Models != nil {
-			out[index] = slices.Clone(credential.Models)
-		}
+		out[index] = [2][]string{slices.Clone(credential.Models), slices.Clone(credential.ExcludedModels)}
 	}
 	return out
 }
 
+// invalidate makes the next lookup read the config again, as after this
+// plugin edited it.
+func (c *cpaConfigCache) invalidate() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.readAt = time.Time{}
+}
+
 // nativeUpstream is CPA as native search probes it: the detection module's
-// credentials, with the models CPA's config lists for each API key, and
-// model streams pinned to one of them.
+// credentials, with the models CPA's config lists for each API key and its
+// excluded-models, model streams pinned to one of them, and edits of those
+// excluded-models.
 type nativeUpstream struct {
 	app     *App
 	quality *quality.Service
@@ -450,17 +458,60 @@ func (u nativeUpstream) Credentials() ([]native.Credential, error) {
 	if configErr != "" {
 		return nil, fmt.Errorf("read CPA config: %s", configErr)
 	}
-	models := u.app.cpaCredentials.models()
+	serving := u.app.cpaCredentials.serving()
 	out := make([]native.Credential, 0, len(list))
 	for _, c := range list {
 		credential := native.Credential{AuthIndex: c.AuthIndex, ID: c.ID, Provider: c.Provider, Name: c.Name, Group: c.Group,
 			Disabled: c.Disabled, Unavailable: c.Unavailable}
-		if c.Source == quality.SourceProvider {
-			credential.Models = models[c.AuthIndex]
+		if config, ok := serving[c.AuthIndex]; ok && c.Source == quality.SourceProvider {
+			credential.Models, credential.Excluded, credential.InConfig = config[0], config[1], true
 		}
 		out = append(out, credential)
 	}
 	return out, nil
+}
+
+// EditExcluded edits the excluded-models of CPA's config.yaml, which CPA
+// reloads, and records what changed in the audit log.
+func (u nativeUpstream) EditExcluded(edits []native.Edit) ([]native.EditResult, error) {
+	changes := make([]channel.ModelEdit, len(edits))
+	for i, edit := range edits {
+		changes[i] = channel.ModelEdit{AuthIndex: edit.AuthIndex, Model: edit.Model, Exclude: edit.Exclude}
+	}
+	outcomes, err := channel.EditExcludedModels(u.app.pluginSettings().CPAConfigPath, changes)
+	u.app.cpaCredentials.invalidate()
+	if err != nil {
+		return nil, err
+	}
+	results := make([]native.EditResult, len(outcomes))
+	excluded, restored := []string{}, []string{}
+	for i, outcome := range outcomes {
+		switch outcome {
+		case channel.EditApplied, channel.EditUnchanged:
+			results[i] = native.EditDone
+		case channel.EditDisabled:
+			results[i] = native.EditKeyDisabled
+		case channel.EditInherited:
+			results[i] = native.EditKeyInherits
+		case channel.EditNoKey:
+			results[i] = native.EditKeyGone
+		}
+		if outcome != channel.EditApplied {
+			continue
+		}
+		line := fmt.Sprintf("%s %s: %s", edits[i].AuthIndex, edits[i].Model, edits[i].Reason)
+		if edits[i].Exclude {
+			excluded = append(excluded, line)
+		} else {
+			restored = append(restored, line)
+		}
+	}
+	if len(excluded)+len(restored) > 0 {
+		u.app.store.RecordModuleChange("native_search", "native_exclusions", "cpa_config", map[string]audit.Change{
+			"excluded": {To: excluded}, "restored": {To: restored},
+		})
+	}
+	return results, nil
 }
 
 func (u nativeUpstream) Stream(ctx context.Context, c native.Credential, model string, body any, headers http.Header) ([]byte, int, error) {

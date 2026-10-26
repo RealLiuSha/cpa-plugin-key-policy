@@ -26,6 +26,11 @@ type fakeCPA struct {
 	block       chan struct{}
 }
 
+// EditExcluded fails: these credentials are not in a config (configCPA is).
+func (f *fakeCPA) EditExcluded([]Edit) ([]EditResult, error) {
+	return nil, errors.New("fakeCPA has no config")
+}
+
 func (f *fakeCPA) Credentials() ([]Credential, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -118,7 +123,7 @@ func TestClassifyReadsTheHistory(t *testing.T) {
 		{"searches part of the time", &channelRecord{Probes: []Probe{probe(13*time.Hour, ResultNoSearch), probe(time.Hour, ResultSearch)}}, StateUnstable},
 		{"never searches", &channelRecord{Probes: []Probe{probe(time.Hour, ResultNoSearch)}}, StateNoSearch},
 		{"last search too old", &channelRecord{Probes: []Probe{probe(26*time.Hour, ResultSearch)}}, StateStale},
-		{"refused the tool", &channelRecord{Probes: []Probe{probe(time.Hour, ResultSearch)}, Rejection: &Rejection{At: now}}, StateRejected},
+		{"refused the tool", &channelRecord{Probes: []Probe{probe(time.Hour, ResultSearch)}, Pairs: map[string]*pairRecord{"gpt-6-sol": {Rejection: &Rejection{At: now}}}}, StateRejected},
 	} {
 		if got := classify(tc.rec, false, 12, now); got != tc.expect {
 			t.Errorf("%s: state %s, want %s", tc.name, got, tc.expect)
@@ -140,13 +145,14 @@ func TestDecideNeedsFreshSupportAndNamesTheGaps(t *testing.T) {
 	}
 	settings := DefaultSettings()
 
-	d := decide(settings, []string{"gpt-6-sol", "gpt-6-astra"}, credentials, map[string]*channelRecord{}, now)
+	none := func(string, string) bool { return false }
+	d := decide(settings, []string{"gpt-6-sol", "gpt-6-astra"}, credentials, map[string]*channelRecord{}, none, now)
 	if d.native["gpt-6-sol"] || d.models[0].Reason != "no_usable" {
 		t.Fatalf("no evidence yet: %+v", d.models[0])
 	}
 
 	records := map[string]*channelRecord{"a": searched, "b": ignored, "c": searched}
-	d = decide(settings, []string{"gpt-6-sol", "gpt-6-astra"}, credentials, records, now)
+	d = decide(settings, []string{"gpt-6-sol", "gpt-6-astra"}, credentials, records, none, now)
 	if !d.native["gpt-6-sol"] || d.native["gpt-6-astra"] {
 		t.Fatalf("native = %v, want gpt-6-sol only", d.native)
 	}
@@ -158,15 +164,15 @@ func TestDecideNeedsFreshSupportAndNamesTheGaps(t *testing.T) {
 	}
 
 	settings.RequireAll = true
-	if d = decide(settings, []string{"gpt-6-sol"}, credentials, records, now); d.native["gpt-6-sol"] || d.models[0].Reason != "incomplete" {
+	if d = decide(settings, []string{"gpt-6-sol"}, credentials, records, none, now); d.native["gpt-6-sol"] || d.models[0].Reason != "incomplete" {
 		t.Fatalf("require all with a gap: %+v", d.models[0])
 	}
 	settings.DisabledChannels = []string{"b"}
-	if d = decide(settings, []string{"gpt-6-sol"}, credentials, records, now); !d.native["gpt-6-sol"] || !d.strip["b"] {
+	if d = decide(settings, []string{"gpt-6-sol"}, credentials, records, none, now); !d.native["gpt-6-sol"] || !d.strip["b"] {
 		t.Fatalf("require all, gap disabled: native %v strip %v", d.native, d.strip)
 	}
 	settings.ExcludedModels = []string{"GPT-6-SOL"}
-	if d = decide(settings, []string{"gpt-6-sol"}, credentials, records, now); d.native["gpt-6-sol"] || d.models[0].Mode != ModeExcluded {
+	if d = decide(settings, []string{"gpt-6-sol"}, credentials, records, none, now); d.native["gpt-6-sol"] || d.models[0].Mode != ModeExcluded {
 		t.Fatalf("excluded: %+v", d.models[0])
 	}
 }
@@ -303,17 +309,20 @@ func TestRoundsSwitchModelsAndPersist(t *testing.T) {
 		t.Fatalf("reopened: %+v settings %+v", astra, reopened.Settings())
 	}
 
-	// The next full round waits for the interval; it asks the OAuth
-	// credential about gpt-6-sol first, which CPA has no route to.
+	// b did not search once: it is asked again soon, which settles it, and
+	// then not before the next full round. That round waits for the
+	// interval; it asks the OAuth credential about gpt-6-sol first, which
+	// CPA has no route to.
 	before := cpa.calls["b"]
 	c.now = c.now.Add(time.Hour)
 	runTick(m)
-	if cpa.calls["b"] != before {
-		t.Fatal("probed again before the interval")
+	runTick(m)
+	if cpa.calls["b"] != before+1 {
+		t.Fatalf("b probed %d more times before the interval, want the one recheck", cpa.calls["b"]-before)
 	}
 	c.now = c.now.Add(12 * time.Hour)
 	runTick(m)
-	if sol := modeOf(t, m, "gpt-6-sol"); !slices.Equal(sol.Gaps, []Gap{{"a", StateDisabled}, {"b", StateNoSearch}}) || cpa.calls["b"] != before+1 {
+	if sol := modeOf(t, m, "gpt-6-sol"); !slices.Equal(sol.Gaps, []Gap{{"a", StateDisabled}, {"b", StateNoSearch}}) || cpa.calls["b"] != before+2 {
 		t.Fatalf("gpt-6-sol after the second round: %+v", sol)
 	}
 }

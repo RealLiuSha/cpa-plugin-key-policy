@@ -342,6 +342,12 @@ func (s *Store) RecordChange(action, target string, changes map[string]audit.Cha
 	s.recordAudit(audit.Event{Actor: "management", Action: action, Target: target, Changes: changes})
 }
 
+// RecordModuleChange audits a change a module made on its own evidence, such
+// as native search editing CPA's config; actor names the module.
+func (s *Store) RecordModuleChange(actor, action, target string, changes map[string]audit.Change) {
+	s.recordAudit(audit.Event{Actor: actor, Action: action, Target: target, Changes: changes})
+}
+
 func (s *Store) AuditEvents(keyID, action string, limit int) ([]audit.Event, error) {
 	s.mu.RLock()
 	logWriter := s.auditLog

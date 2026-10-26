@@ -23,9 +23,9 @@ var (
 	overviewFields       = []string{"today", "keys", "channels", "modules", "warnings", "recent_changes"}
 	settingsFields       = []string{"version", "plugin_id", "display_name", "modules", "module_errors", "hooks", "config_warnings", "files", "ui", "ownership", "health", "timezone"}
 	searchStateFields    = []string{"enabled", "declared", "settings", "status", "native"}
-	nativeStateFields    = []string{"settings", "models", "channels", "running", "declared", "names"}
-	nativeStateOptional  = []string{"round", "last_full_round", "next_full_round", "credentials_error", "error"}
-	nativeSettingsFields = []string{"enabled", "require_all", "excluded_models", "disabled_channels", "interval_hours"}
+	nativeStateFields    = []string{"settings", "models", "channels", "exclusions", "running", "declared", "names"}
+	nativeStateOptional  = []string{"round", "last_full_round", "next_full_round", "credentials_error", "exclusion_error", "error"}
+	nativeSettingsFields = []string{"enabled", "require_all", "auto_exclude", "excluded_models", "disabled_channels", "interval_hours"}
 	channelViewFields    = []string{"auth_index", "meta", "last_24h", "today", "models_24h", "rules"}
 	channelViewOptional  = []string{"auth_id", "provider", "base_url"}
 	channelSummaryFields = []string{"attempts", "failures", "success_rate", "latency_p50_ms", "latency_p95_ms", "ttft_p50_ms", "ttft_p95_ms", "input_tokens", "output_tokens", "list_cost_usd"}

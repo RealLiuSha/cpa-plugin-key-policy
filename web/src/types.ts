@@ -521,9 +521,12 @@ export type NativeChannelState = "unknown" | "supported" | "unstable" | "no_sear
 export type NativeMode = "native" | "fallback" | "excluded" | "off";
 export type NativeProbeResult = "search" | "no_search" | "error";
 
+// auto_exclude takes a native model off, in CPA's config, the config API
+// keys confirmed not to search for it.
 export interface NativeSettings {
   enabled: boolean;
   require_all: boolean;
+  auto_exclude: boolean;
   excluded_models: string[];
   disabled_channels: string[];
   interval_hours: number;
@@ -550,11 +553,13 @@ export interface NativeRejection {
   recheck_at: string;
 }
 
+// state is the channel's as a whole, model_states its state for each model.
 export interface NativeChannel {
   auth_index: string;
   name: string;
   group?: string;
   models: string[];
+  model_states: Record<string, NativeChannelState>;
   state: NativeChannelState;
   cpa_disabled?: boolean;
   unavailable?: boolean;
@@ -577,6 +582,33 @@ export interface NativeModel {
   reason?: string;
 }
 
+// Where an automatic exclusion of a model from a channel stands: active (CPA's
+// config takes the model off the channel), pending (the next write does),
+// trial (given back until a probe answers), blocked (no other channel
+// searches for the model, so it keeps serving it), kept (the operator keeps
+// it serving the model).
+export type NativeExclusionState = "active" | "pending" | "trial" | "blocked" | "kept";
+
+// no_search: the model's probes in a row on the channel that did not search;
+// kept_by: "operator" (released here) or "config" (the entry was taken out of
+// CPA's config by hand).
+export interface NativeExclusion {
+  auth_index: string;
+  name: string;
+  group?: string;
+  model: string;
+  state: NativeExclusionState;
+  since: string;
+  trials: number;
+  retry_at?: string;
+  trial_at?: string;
+  kept_at?: string;
+  kept_by?: string;
+  error?: string;
+  no_search: number;
+  rejection?: NativeRejection;
+}
+
 export interface NativeRound {
   kind: string;
   started: string;
@@ -590,6 +622,9 @@ export interface NativeState {
   settings: NativeSettings;
   models: NativeModel[];
   channels: NativeChannel[];
+  exclusions: NativeExclusion[];
+  // Why CPA's config could not be edited the last time, if it could not.
+  exclusion_error?: string;
   round?: NativeRound;
   last_full_round?: string;
   next_full_round?: string;

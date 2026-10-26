@@ -20,26 +20,30 @@ var ErrInvalidSettings = errors.New("invalid native search settings")
 
 // Settings is what the operator controls. Native search is on by default;
 // RequireAll switches a model only when every channel serving it supports
-// native search (or is disabled), instead of when one does.
+// native search (or is disabled), instead of when one does. AutoExclude takes
+// a native model off the config API keys confirmed not to search for it, in
+// CPA's config (exclude.go).
 type Settings struct {
 	Enabled          bool     `json:"enabled"`
 	RequireAll       bool     `json:"require_all"`
+	AutoExclude      bool     `json:"auto_exclude"`
 	ExcludedModels   []string `json:"excluded_models"`
 	DisabledChannels []string `json:"disabled_channels"`
 	IntervalHours    int      `json:"interval_hours"`
 }
 
 // DefaultSettings: on, a model switches when one channel supports native
-// search, a full probe round every 12 hours.
+// search, channels that do not search are taken off native models, a full
+// probe round every 12 hours.
 func DefaultSettings() Settings {
-	return Settings{Enabled: true, ExcludedModels: []string{}, DisabledChannels: []string{}, IntervalHours: defaultIntervalHours}
+	return Settings{Enabled: true, AutoExclude: true, ExcludedModels: []string{}, DisabledChannels: []string{}, IntervalHours: defaultIntervalHours}
 }
 
 // Normalize trims and deduplicates the lists, lowercases the channels (CPA's
 // auth_index is lowercase hex) and checks the interval (0 means the default,
 // otherwise 1 to 168 hours). The result shares no slice with s.
 func Normalize(s Settings) (Settings, error) {
-	out := Settings{Enabled: s.Enabled, RequireAll: s.RequireAll, IntervalHours: s.IntervalHours}
+	out := Settings{Enabled: s.Enabled, RequireAll: s.RequireAll, AutoExclude: s.AutoExclude, IntervalHours: s.IntervalHours}
 	if out.IntervalHours == 0 {
 		out.IntervalHours = defaultIntervalHours
 	}

@@ -200,7 +200,9 @@
       "run_quality": "运行检测",
       "start_inspection": "开始巡检",
       "clear_quality": "清除检测记录",
-      "update_inspection": "修改巡检设置"
+      "update_inspection": "修改巡检设置",
+      "native_exclusions": "自动排除（修改 CPA 配置）",
+      "update_native_exclusion": "解除或恢复自动排除"
     },
     "field": {
       "daily_limit_usd": "日额度",
@@ -246,7 +248,10 @@
       "target_model": "目标模型",
       "keep_models": "保留的模型",
       "channels": "搜索渠道",
-      "probe": "健康探测"
+      "probe": "健康探测",
+      "excluded": "排除",
+      "restored": "还给渠道",
+      "action": "操作"
     },
     "value": {
       "on": "启用",
@@ -943,7 +948,9 @@
         "state": "状态",
         "lastProbe": "最近检测",
         "history": "最近记录",
-        "rejections": "拒绝搜索工具"
+        "rejections": "拒绝搜索工具",
+        "evidence": "证据",
+        "next": "下一步"
       },
       "mode": {
         "native": "原生搜索",
@@ -963,7 +970,7 @@
       "modelExcluded": "{{model}} 将继续使用 alpha 搜索。",
       "include": "恢复",
       "exclude": "排除",
-      "gapNote": "搜索在承接这轮对话的渠道上执行，无法按会话改派到别的渠道。“不会搜索的渠道”上的会话没有搜索：不支持的渠道会忽略搜索工具；已禁用或拒绝搜索工具的渠道，萝卜会把工具从请求中去掉。想让所有会话都能搜索，请在 CPA 中把这些模型从这些渠道移除，或改为“所有承接渠道都支持才启用”。",
+      "gapNote": "搜索在承接这轮对话的渠道上执行，无法按会话改派到别的渠道。“不会搜索的渠道”上的会话没有搜索：不支持的渠道会忽略搜索工具；已禁用或拒绝搜索工具的渠道，萝卜会把工具从请求中去掉。开启下方的自动排除后，确认不搜索的 CPA 配置 Key 会在 CPA 中被移出该模型，会话改由会搜索的渠道承接；也可以改为“所有承接渠道都支持才启用”。",
       "channelsTitle": "渠道",
       "channelsEmpty": "还没有承接上述模型的 codex 渠道。",
       "cpaDisabled": "CPA 已停用",
@@ -1007,7 +1014,52 @@
       "onApply": "开启",
       "offTitle": "关闭原生搜索",
       "offConfirm": "关闭后所有模型回到 alpha 搜索，客户端约 5 分钟内生效，检测也会停止。",
-      "offApply": "关闭"
+      "offApply": "关闭",
+      "exclusionsTitle": "自动排除",
+      "autoExcludeLabel": "自动排除不搜索的渠道",
+      "exclusionsDescription": "对使用原生搜索的模型，某个 CPA 配置 Key 被确认不执行搜索（同一模型连续两次检测未搜索，或拒绝搜索工具后再检测一次仍未搜索）时，萝卜在 CPA 的 config.yaml 里给这个 Key 的 excluded-models 加上该模型，CPA 不再把该模型派给它，其他模型照常。只要还有别的渠道会搜索才排除；之后按检测间隔试放（每次翻倍，最长 7 天），复检会搜索就撤销。每次写入都会让 CPA 重载配置；会话粘滞保留，只有这个 Key 上该模型的会话改派到别的渠道。同一分钟内的改动合并成一次写入。CPA 已停用的 Key、沿用分组 excluded-models 的 Key 不动。",
+      "exclusionsEmpty": "没有被自动排除的渠道。",
+      "exclusionsOff": "自动排除已关闭。",
+      "exclusionWriteFailed": "写入 CPA 配置失败，每分钟重试：{{error}}",
+      "exclusionReleased": "已解除：{{name}} 继续承接 {{model}}，恢复前自动排除不再处理它。",
+      "exclusionResumed": "已恢复自动排除：{{name}} 上的 {{model}}。",
+      "exclusionFailed": "操作失败",
+      "release": "解除",
+      "releaseFor": "解除 {{name}} 上 {{model}} 的自动排除",
+      "resume": "恢复自动",
+      "resumeFor": "恢复 {{name}} 上 {{model}} 的自动排除",
+      "autoOnTitle": "开启自动排除",
+      "autoOnConfirm": "开启后，确认不执行原生搜索的 CPA 配置 Key 会在 CPA 的 config.yaml 里被移出对应模型，CPA 随即重载配置（会话粘滞保留）。只在还有别的渠道会搜索时排除，并按检测间隔试放复检。",
+      "autoOnApply": "开启",
+      "autoOffTitle": "关闭自动排除",
+      "autoOffConfirm": "关闭后，萝卜写入 CPA 配置的排除条目全部撤销，被排除的渠道重新承接这些模型，其上的会话没有搜索。",
+      "autoOffApply": "关闭",
+      "autoTurnedOn": "自动排除已开启。",
+      "autoTurnedOff": "自动排除已关闭，排除的模型已还给渠道。",
+      "exclusion": {
+        "state": {
+          "active": "已排除",
+          "pending": "待写入",
+          "trial": "试放中",
+          "blocked": "无法排除",
+          "kept": "已保留"
+        },
+        "hint": {
+          "active": "CPA 不再把该模型派给这个渠道。",
+          "pending": "下次写入 CPA 配置时排除。",
+          "trial": "已暂时还给渠道，等一次检测决定是否继续排除。",
+          "blocked": "没有别的渠道会搜索，排除会让模型失去搜索，所以保留。",
+          "kept_operator": "已在这里解除，恢复前不再自动排除。",
+          "kept_config": "排除条目被人从 CPA 配置中删除，视为操作员的决定，恢复前不再自动排除。"
+        },
+        "evidence": "连续 {{count}} 次检测未搜索",
+        "refused": "{{at}} 拒绝搜索工具（HTTP {{status}}）",
+        "since": "自 {{at}}",
+        "retryAt": "{{at}} 试放复检",
+        "trialAt": "{{at}} 开始试放",
+        "keptAt": "{{at}} 保留",
+        "trials": "已试放 {{count}} 次仍未搜索"
+      }
     }
   },
   "quality": {

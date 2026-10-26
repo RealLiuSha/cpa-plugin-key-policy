@@ -1232,6 +1232,8 @@ ul.overview-warnings { padding-left: 28px; display: flex; flex-direction: column
 .native-row-actions { display: flex; justify-content: flex-end; gap: 6px; flex-wrap: wrap; }
 .native-row-actions .btn, .native-model { white-space: nowrap; }
 .native-note { margin: 0; line-height: 1.6; }
+.native-exclusions-head { margin-top: 12px; display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; }
+.native-exclusions-head .search-subtitle { margin: 0; }
 .native-policy { display: flex; flex-direction: column; gap: 10px; padding-top: 12px; border-top: 1px solid var(--border); }
 .native-coverage { display: flex; flex-direction: column; gap: 8px; margin: 0; padding: 0; border: 0; }
 .native-coverage .check-row > span { display: flex; flex-direction: column; gap: 2px; }

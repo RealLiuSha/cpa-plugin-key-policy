@@ -478,7 +478,7 @@ func (a *App) registration() Registration {
 				{Name: "keys", Type: "array", Description: "First-boot downstream key seeds. State is authoritative after initialization."},
 				{Name: "models", Type: "array", Description: "First-boot price rows: upstream model id (name), optional provider qualifier, billing mode and prices."},
 				{Name: "search_enabled", Type: "boolean", Description: "Codex web search: native search through each channel's web_search tool, with alpha search as the fallback (registers a model router and a response interceptor; settings are on the plugin's search page)."},
-				{Name: "cpa_config_path", Type: "string", Description: "CPA config.yaml, read only for the upstream keys of detection tests and adapter rule tries and for group names. Defaults to config.yaml."},
+				{Name: "cpa_config_path", Type: "string", Description: "CPA config.yaml: read for the upstream keys of detection tests and adapter rule tries and for group names, and edited by native search to take a model off a channel that does not search for it (excluded-models). Defaults to config.yaml."},
 			},
 		},
 		Capabilities: Capabilities{
@@ -743,6 +743,7 @@ func (a *App) managementRegistration() ManagementRegistrationResponse {
 			{Method: http.MethodPost, Path: base + "/search/import", Description: "Import settings from an alpha-search-model plugin block."},
 			{Method: http.MethodPut, Path: base + "/search/native", Description: "Replace the native search settings."},
 			{Method: http.MethodPost, Path: base + "/search/native/probe", Description: "Probe every channel serving a Codex catalog model for native search now, or one by auth_index."},
+			{Method: http.MethodPost, Path: base + "/search/native/exclusions", Description: "Release an automatic exclusion of a model from a channel (the channel keeps serving it), or resume it."},
 			{Method: http.MethodGet, Path: base + "/settings", Description: "Module state, hook timings, data files and warnings."},
 		}, qualityRoutes(base)...),
 		Resources: []ResourceRoute{
@@ -860,6 +861,8 @@ func (a *App) handleManagement(raw []byte) ([]byte, error) {
 		return OKEnvelope(a.updateNativeSearch(req.Body))
 	case req.Method == http.MethodPost && path == base+"/search/native/probe":
 		return OKEnvelope(a.probeNativeSearch(req.Body))
+	case req.Method == http.MethodPost && path == base+"/search/native/exclusions":
+		return OKEnvelope(a.updateNativeExclusion(req.Body))
 	case req.Method == http.MethodGet && path == base+"/settings":
 		return OKEnvelope(a.settingsPage())
 	case path == base+"/quality" || strings.HasPrefix(path, base+"/quality/"):

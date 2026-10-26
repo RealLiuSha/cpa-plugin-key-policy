@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"cpa-key-policy/internal/channel"
 )
 
 const (
@@ -153,6 +155,61 @@ func TestNativeSearchSettingsAreValidatedAndAudited(t *testing.T) {
 	reconfigure(t, app, "search_enabled: true\n")
 	if response := managementCall(t, app, http.MethodPost, "/search/native/probe", nil, []byte(`{}`)); response.StatusCode != http.StatusBadGateway {
 		t.Fatalf("probe without CPA = %d %s", response.StatusCode, response.Body)
+	}
+}
+
+// Releasing an automatic exclusion takes its entry out of CPA's config at
+// once, and both the edit and the operator's choice are audited.
+func TestReleasingAnExclusionEditsCPAConfig(t *testing.T) {
+	dir := t.TempDir()
+	const kept = "codex-api-key:\n    - api-key: \"sk-kimera\"\n      base-url: \"https://kimera.example\"\n      models:\n        - name: \"gpt-6-sol\"\n"
+	excluded := strings.Replace(kept, "      models:", "      excluded-models:\n        - \"gpt-6-sol\"\n      models:", 1)
+	cpaConfig := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(cpaConfig, []byte(excluded), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	credentials, err := channel.ReadCPAConfig(cpaConfig)
+	if err != nil || len(credentials) != 1 {
+		t.Fatalf("credentials %v: %v", credentials, err)
+	}
+	var index string
+	for index = range credentials {
+	}
+	now := time.Now().UTC()
+	file := fmt.Sprintf(`{"version":1,"settings":{"enabled":true,"auto_exclude":true,"excluded_models":[],"disabled_channels":[],"interval_hours":12},
+ "catalog":[{"slug":"gpt-6-sol","seen_at":%q}],
+ "credentials":[{"auth_index":%q,"id":"codex:apikey:k","provider":"codex","name":"k","models":[],"in_config":true,"excluded":["gpt-6-sol"]}],
+ "channels":[{"auth_index":%q,"probes":[],"pairs":{"gpt-6-sol":{"no_search":2}}}],
+ "exclusions":[{"auth_index":%q,"model":"gpt-6-sol","since":%q,"written":true}]}`,
+		now.Format(time.RFC3339Nano), index, index, index, now.Format(time.RFC3339Nano))
+	if err := os.WriteFile(filepath.Join(dir, nativeFile), []byte(file), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	app := newTestApp(t, appOptions{Dir: dir})
+	reconfigure(t, app, "cpa_config_path: "+cpaConfig+"\n")
+
+	if response := managementCall(t, app, http.MethodPost, "/search/native/exclusions", nil, []byte(`{"auth_index":"`+index+`","model":"gpt-6-astra","action":"release"}`)); response.StatusCode != http.StatusNotFound {
+		t.Fatalf("release of no exclusion = %d %s", response.StatusCode, response.Body)
+	}
+	if response := managementCall(t, app, http.MethodPost, "/search/native/exclusions", nil, []byte(`{"auth_index":"`+index+`","model":"gpt-6-sol","action":"drop"}`)); response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("unknown action = %d %s", response.StatusCode, response.Body)
+	}
+	var state struct {
+		Exclusions []struct {
+			State  string `json:"state"`
+			KeptBy string `json:"kept_by"`
+		} `json:"exclusions"`
+	}
+	decode(t, managementOK(t, app, http.MethodPost, "/search/native/exclusions", nil, []byte(`{"auth_index":"`+index+`","model":"gpt-6-sol","action":"release"}`)), &state)
+	if len(state.Exclusions) != 1 || state.Exclusions[0].State != "kept" || state.Exclusions[0].KeptBy != "operator" {
+		t.Fatalf("after release: %+v", state)
+	}
+	if raw, _ := os.ReadFile(cpaConfig); string(raw) != kept {
+		t.Fatalf("CPA config after release:\n%s", raw)
+	}
+	audit := string(managementOK(t, app, http.MethodGet, "/audit", nil, nil))
+	if !strings.Contains(audit, `"native_exclusions"`) || !strings.Contains(audit, `"update_native_exclusion"`) || !strings.Contains(audit, "kept by the operator") {
+		t.Fatalf("audit = %s", audit)
 	}
 }
 

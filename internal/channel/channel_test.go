@@ -846,3 +846,93 @@ api-keys:
 		t.Fatalf("models = %v", models)
 	}
 }
+
+// EditExcludedModels changes only the edited keys' own excluded-models in a
+// file laid out as CPA writes it, and taking the entries out again restores
+// the file byte for byte; a disabled key, a key that takes its v8 group's list
+// and a file laid out otherwise are left as they are.
+func TestEditExcludedModelsTouchesOnlyTheEntry(t *testing.T) {
+	const config = `api-keys:
+    codex:
+        - base-url: "https://kimera.example"
+          excluded-models:
+            - "gpt-image-*"
+          keys:
+            - api-key: "sk-kimera"
+              models:
+                - name: "gpt-6-sol"
+              weight: 1
+          name: "codex-11"
+        - base-url: "https://zeu.example"
+          keys:
+            - api-key: "sk-zeu"
+              excluded-models:
+                - "gpt-image-*"
+              models:
+                - name: "gpt-6-sol"
+              weight: 8
+            - api-key: "sk-zeu-2"
+              weight: 1
+            - api-key: "sk-off"
+              excluded-models:
+                - "*"
+          name: "codex-15"
+# Older layout, kept by CPA beside the v8 one.
+claude-api-key:
+    - api-key: "sk-claude"
+`
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	credentials, err := ReadCPAConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byKey := map[string]string{}
+	for index, credential := range credentials {
+		byKey[credential.APIKey] = index
+	}
+	outcomes, err := EditExcludedModels(path, []ModelEdit{
+		{AuthIndex: byKey["sk-zeu"], Model: "gpt-6-sol", Exclude: true},
+		{AuthIndex: byKey["sk-zeu"], Model: "GPT-IMAGE-*", Exclude: true},
+		{AuthIndex: byKey["sk-zeu-2"], Model: "gpt-6-sol", Exclude: true},
+		{AuthIndex: byKey["sk-kimera"], Model: "gpt-6-sol", Exclude: true},
+		{AuthIndex: byKey["sk-kimera"], Model: "gpt-6-astra", Exclude: true},
+		{AuthIndex: byKey["sk-off"], Model: "gpt-6-sol", Exclude: true},
+		{AuthIndex: byKey["sk-claude"], Model: "claude-x", Exclude: true},
+		{AuthIndex: "0000000000000000", Model: "gpt-6-sol", Exclude: true},
+	})
+	want := []EditOutcome{EditApplied, EditUnchanged, EditApplied, EditInherited, EditInherited, EditDisabled, EditApplied, EditNoKey}
+	if err != nil || !slices.Equal(outcomes, want) {
+		t.Fatalf("outcomes %v, %v; want %v", outcomes, err, want)
+	}
+	credentials, _ = ReadCPAConfig(path)
+	if zeu := credentials[byKey["sk-zeu"]]; !slices.Equal(zeu.ExcludedModels, []string{"gpt-image-*", "gpt-6-sol"}) || len(zeu.Models) != 0 {
+		t.Fatalf("zeu after the edit: %+v", zeu)
+	}
+	for key, want := range map[string][]string{"sk-zeu-2": {"gpt-6-sol"}, "sk-kimera": {"gpt-image-*"}, "sk-off": {"*"}, "sk-claude": {"claude-x"}} {
+		if got := credentials[byKey[key]].ExcludedModels; !slices.Equal(got, want) {
+			t.Fatalf("%s after the edit excludes %v, want %v", key, got, want)
+		}
+	}
+	if _, err := EditExcludedModels(path, []ModelEdit{{AuthIndex: byKey["sk-zeu"], Model: "gpt-6-sol"}, {AuthIndex: byKey["sk-zeu-2"], Model: "gpt-6-sol"},
+		{AuthIndex: byKey["sk-claude"], Model: "claude-x"}}); err != nil {
+		t.Fatal(err)
+	}
+	if raw, _ := os.ReadFile(path); string(raw) != config {
+		t.Fatalf("taking the entries out again left\n%s", raw)
+	}
+
+	// A hand-edited layout would be rewritten as a whole: refused.
+	edited := strings.Replace(config, "weight: 1", "weight:   1", 1)
+	if err := os.WriteFile(path, []byte(edited), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := EditExcludedModels(path, []ModelEdit{{AuthIndex: byKey["sk-zeu"], Model: "gpt-6-sol", Exclude: true}}); !errors.Is(err, ErrConfigLayout) {
+		t.Fatalf("hand-edited layout: %v", err)
+	}
+	if raw, _ := os.ReadFile(path); string(raw) != edited {
+		t.Fatal("a refused edit wrote the file")
+	}
+}

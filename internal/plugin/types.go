@@ -62,7 +62,7 @@ const (
 	PluginID = "cpa-key-policy"
 	// PluginName is what the CPA panel shows for the plugin and its menu.
 	PluginName = "萝卜"
-	Version    = "0.29.0"
+	Version    = "0.30.0"
 )
 
 type Envelope struct {

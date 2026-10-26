@@ -12,14 +12,17 @@
 //
 // The tool runs on whichever channel serves the turn, so a channel that
 // ignores it leaves its sessions without search; the request path can only
-// take the tool out for a channel (disabled by the operator, or refusing it),
-// never move the turn elsewhere. The status names those gaps per model.
+// take the tool out for a channel (disabled by the operator, or refusing it
+// for the model), never move the turn elsewhere. The status names those gaps
+// per model. With AutoExclude, a config API key confirmed not to search for a
+// native model is taken off that model in CPA's config instead, so CPA routes
+// the model's turns to the channels that search (exclude.go).
 //
 // The evidence comes from probes pinned to each channel through CPA (a full
 // round every IntervalHours, a new channel at once, a failing or refusing one
-// again later) and from client requests an upstream refused for the tool.
-// Codex reads the catalog every few minutes, so a change reaches it within
-// that.
+// again later, a model that did not search once again soon) and from client
+// requests an upstream refused for the tool. Codex reads the catalog every
+// few minutes, so a change reaches it within that.
 package native
 
 import (
@@ -55,6 +58,10 @@ const (
 	rejectionRecheck  = 10 * time.Minute
 	rejectionDebounce = time.Minute
 	failingRecheck    = time.Hour
+	// A model whose probe on a channel did not search is probed there again
+	// after pairRecheck, so the evidence settles without waiting for the
+	// rotation to come back to it.
+	pairRecheck = 15 * time.Minute
 )
 
 var (
@@ -76,7 +83,9 @@ var (
 
 // Credential is one codex credential CPA can pin a request to. Models are the
 // names its config lists (nil: the provider's own models); Disabled says CPA
-// routes nothing to it, Unavailable that it is cooling down.
+// routes nothing to it, Unavailable that it is cooling down. InConfig marks an
+// API key of CPA's config.yaml, which a model can be taken off there;
+// Excluded is the excluded-models list in effect for it.
 type Credential struct {
 	AuthIndex   string   `json:"auth_index"`
 	ID          string   `json:"id"`
@@ -86,6 +95,8 @@ type Credential struct {
 	Models      []string `json:"models,omitempty"`
 	Disabled    bool     `json:"disabled,omitempty"`
 	Unavailable bool     `json:"unavailable,omitempty"`
+	InConfig    bool     `json:"in_config,omitempty"`
+	Excluded    []string `json:"excluded,omitempty"`
 }
 
 // Upstream is CPA as the probes see it.
@@ -97,10 +108,15 @@ type Upstream interface {
 	// complete event stream, or the upstream status and an error; it wraps
 	// ErrNotServing when CPA has no route to model on c.
 	Stream(ctx context.Context, c Credential, model string, body any, headers http.Header) ([]byte, int, error)
+	// EditExcluded adds models to, or removes them from, the excluded-models
+	// of config API keys in CPA's config, in one write, and says what became
+	// of each edit; an error means none was applied.
+	EditExcluded(edits []Edit) ([]EditResult, error)
 }
 
 // Rejection is a client request that failed because the upstream refused
-// the web_search tool. It holds until a probe after At searches.
+// the web_search tool for a model. It holds until a probe of that model after
+// At searches.
 type Rejection struct {
 	At        time.Time `json:"at"`
 	Count     int       `json:"count"`
@@ -112,15 +128,123 @@ type Rejection struct {
 
 // channelRecord is the evidence about one channel.
 type channelRecord struct {
-	AuthIndex string     `json:"auth_index"`
-	Probes    []Probe    `json:"probes"`
-	Rejection *Rejection `json:"rejection,omitempty"`
+	AuthIndex string  `json:"auth_index"`
+	Probes    []Probe `json:"probes"`
+	// Pairs is the evidence about each model, which outlives the history.
+	Pairs map[string]*pairRecord `json:"pairs,omitempty"`
+	// LegacyRejection is where 0.29.0 and earlier kept the channel's
+	// refusal; load moves it to its model's pair.
+	LegacyRejection *Rejection `json:"rejection,omitempty"`
 	// NotServing and Served list the catalog models CPA had no route to, or
 	// did route a probe to, on a credential whose config lists none.
 	NotServing []string `json:"not_serving,omitempty"`
 	Served     []string `json:"served,omitempty"`
 	// Rotation picks the model of the next probe among those served.
 	Rotation int `json:"rotation,omitempty"`
+}
+
+// pairRecord is the evidence about one model on a channel: how many of its
+// probes in a row answered without running the tool (a search resets the
+// count, a failure leaves it), its latest probe, and a refusal of the tool by
+// the upstream for that model.
+type pairRecord struct {
+	NoSearch   int        `json:"no_search,omitempty"`
+	LastProbe  time.Time  `json:"last_probe,omitzero"`
+	LastResult Result     `json:"last_result,omitempty"`
+	Rejection  *Rejection `json:"rejection,omitempty"`
+}
+
+// confirmed reports that the channel does not search for the model: two
+// probes in a row did not, or one did not and the upstream refused the tool.
+// A refusal alone is not enough; a client can be refused for its own request.
+func (p *pairRecord) confirmed() bool {
+	return p != nil && (p.NoSearch >= 2 || p.NoSearch >= 1 && p.Rejection != nil)
+}
+
+// observe adds a probe of the pair's model.
+func (p *pairRecord) observe(probe Probe, now time.Time) {
+	p.LastProbe, p.LastResult = probe.At, probe.Result
+	switch probe.Result {
+	case ResultSearch:
+		p.NoSearch = 0
+	case ResultNoSearch:
+		p.NoSearch++
+	}
+	if r := p.Rejection; r != nil {
+		if probe.Result == ResultSearch && probe.At.After(r.At) {
+			p.Rejection = nil
+		} else {
+			r.RecheckAt = now.Add(failingRecheck).UTC()
+		}
+	}
+}
+
+func (rec *channelRecord) pair(model string) *pairRecord {
+	if rec == nil {
+		return nil
+	}
+	return rec.Pairs[model]
+}
+
+// pairFor returns the model's pair, adding it when missing.
+func (rec *channelRecord) pairFor(model string) *pairRecord {
+	if rec.Pairs == nil {
+		rec.Pairs = map[string]*pairRecord{}
+	}
+	p := rec.Pairs[model]
+	if p == nil {
+		p = &pairRecord{}
+		rec.Pairs[model] = p
+	}
+	return p
+}
+
+// refusing reports a refusal of any model.
+func (rec *channelRecord) refusing() bool {
+	return rec.latestRejection() != nil
+}
+
+func (rec *channelRecord) anyConfirmed() bool {
+	if rec != nil {
+		for _, p := range rec.Pairs {
+			if p.confirmed() {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// latestRejection is the most recent refusal of any model, for the status.
+func (rec *channelRecord) latestRejection() *Rejection {
+	var latest *Rejection
+	if rec == nil {
+		return nil
+	}
+	for _, p := range rec.Pairs {
+		if r := p.Rejection; r != nil && (latest == nil || r.At.After(latest.At)) {
+			latest = r
+		}
+	}
+	return latest
+}
+
+// migrate gives a record written by 0.29.0 or earlier its pairs: the
+// evidence per model its history holds, and the refusal it kept for the
+// channel, under the refused model.
+func (rec *channelRecord) migrate() {
+	if rec.Pairs != nil && rec.LegacyRejection == nil {
+		return
+	}
+	if rec.Pairs == nil {
+		for _, probe := range rec.Probes {
+			rec.pairFor(probe.Model).observe(probe, probe.At)
+		}
+	}
+	if r := rec.LegacyRejection; r != nil {
+		rec.pairFor(r.Model).Rejection = r
+	}
+	rec.LegacyRejection = nil
 }
 
 type catalogModel struct {
@@ -134,6 +258,7 @@ type fileData struct {
 	Catalog       []catalogModel  `json:"catalog"`
 	Credentials   []Credential    `json:"credentials"`
 	Channels      []channelRecord `json:"channels"`
+	Exclusions    []*exclusion    `json:"exclusions,omitempty"`
 	LastFullRound time.Time       `json:"last_full_round,omitzero"`
 }
 
@@ -156,10 +281,12 @@ type roundState struct {
 }
 
 // job is one channel of a round: models in the order to try, the first one
-// CPA routes being probed.
+// CPA routes being probed. trial is a model given back to the channel to
+// probe it again: until CPA has reloaded its config, it has no route to it.
 type job struct {
 	credential Credential
 	models     []string
+	trial      string
 }
 
 // Options configure Open.
@@ -185,18 +312,27 @@ type Manager struct {
 
 	snapshot atomic.Pointer[decisions]
 
+	// editMu serializes the edits of CPA's config; it is taken before mu.
+	editMu sync.Mutex
+
 	// mu guards everything below; rounds take it only to record.
 	mu          sync.Mutex
 	settings    Settings
 	catalog     map[string]time.Time
 	credentials []Credential
 	credErr     string
-	records     map[string]*channelRecord
-	lastFull    time.Time
-	dirty       bool
-	round       *roundState
-	started     bool
-	startedAt   time.Time
+	// listedAt is when the credentials were last listed, editedAt when CPA's
+	// config was last edited: a list from before an edit may not show it.
+	listedAt   time.Time
+	editedAt   time.Time
+	records    map[string]*channelRecord
+	exclusions map[pair]*exclusion
+	editErr    string
+	lastFull   time.Time
+	dirty      bool
+	round      *roundState
+	started    bool
+	startedAt  time.Time
 }
 
 // Open loads the file at path; a missing one means DefaultSettings and no
@@ -207,7 +343,7 @@ func Open(opts Options) (*Manager, error) {
 		return nil, errors.New("native search needs a file path and CPA")
 	}
 	m := &Manager{path: opts.Path, canWrite: opts.CanWrite, logf: opts.Logf, upstream: opts.Upstream, now: opts.Now,
-		catalog: map[string]time.Time{}, records: map[string]*channelRecord{}}
+		catalog: map[string]time.Time{}, records: map[string]*channelRecord{}, exclusions: map[pair]*exclusion{}}
 	if m.canWrite == nil {
 		m.canWrite = func() bool { return true }
 	}
@@ -227,7 +363,11 @@ func Open(opts Options) (*Manager, error) {
 	}
 	for i := range data.Channels {
 		rec := data.Channels[i]
+		rec.migrate()
 		m.records[rec.AuthIndex] = &rec
+	}
+	for _, e := range data.Exclusions {
+		m.exclusions[pair{e.AuthIndex, e.Model}] = e
 	}
 	if m.canWrite() {
 		if err := persist.CleanupStaleTemps(opts.Path, m.now()); err != nil {
@@ -248,7 +388,8 @@ func load(path string) (fileData, error) {
 	if err != nil {
 		return fileData{}, fmt.Errorf("read native search file: %w", err)
 	}
-	var data fileData
+	// A setting the file predates keeps its default.
+	data := fileData{Settings: DefaultSettings()}
 	if err := json.Unmarshal(raw, &data); err != nil {
 		return fileData{}, fmt.Errorf("decode native search file %s: %w", path, err)
 	}
@@ -280,9 +421,20 @@ func (m *Manager) saveLocked() error {
 	}
 	slices.SortFunc(data.Catalog, func(a, b catalogModel) int { return strings.Compare(a.Slug, b.Slug) })
 	for _, rec := range m.records {
+		for model := range rec.Pairs {
+			if _, seen := m.catalog[model]; !seen {
+				delete(rec.Pairs, model)
+			}
+		}
 		data.Channels = append(data.Channels, *rec)
 	}
 	slices.SortFunc(data.Channels, func(a, b channelRecord) int { return strings.Compare(a.AuthIndex, b.AuthIndex) })
+	for _, e := range m.exclusions {
+		data.Exclusions = append(data.Exclusions, e)
+	}
+	slices.SortFunc(data.Exclusions, func(a, b *exclusion) int {
+		return cmp.Or(strings.Compare(a.AuthIndex, b.AuthIndex), strings.Compare(a.Model, b.Model))
+	})
 	raw, err := json.MarshalIndent(data, "", "  ")
 	if err != nil {
 		return fmt.Errorf("encode native search file: %w", err)
@@ -322,7 +474,7 @@ func (m *Manager) candidatesLocked(now time.Time) []string {
 func (m *Manager) rebuildLocked() {
 	now := m.now()
 	previous := m.snapshot.Load()
-	next := decide(m.settings, m.candidatesLocked(now), m.credentials, m.records, now)
+	next := decide(m.settings, m.candidatesLocked(now), m.credentials, m.records, m.excludableLocked, now)
 	m.snapshot.Store(next)
 	if previous == nil {
 		return
@@ -369,46 +521,61 @@ func (m *Manager) observeCandidates(candidates []string) {
 // taken out on the channel at authIndex: the model is a catalog candidate,
 // which a client sends the tool for while it holds a catalog in which the
 // model searched natively, and the operator disabled the channel or it
-// refused the tool.
+// refused the tool for that model.
 func (m *Manager) Strips(authIndex, model string) bool {
 	d := m.snapshot.Load()
-	return d.strip[authIndex] && d.candidates[model]
+	return d.candidates[model] && (d.strip[authIndex] || d.refused[pair{authIndex, model}])
 }
 
 // StripWebSearch takes the hosted web_search tools out of a request body;
 // ok is false when it has none.
 func StripWebSearch(body []byte) ([]byte, bool) { return stripWebSearch(body) }
 
+// noAvailableTool is how an upstream that drops the web_search tool refuses
+// a request whose tool_choice is required (Kimera: 400 E1001). A catalog
+// candidate is sent the tool with every turn while it searches natively, so
+// "no available tool" means the upstream took the tool out; a client that
+// sent no tool at all costs one recheck probe, which clears the refusal.
+const noAvailableTool = "required tool choice has no available tool"
+
+// refusesTool reports an upstream answer refusing the web_search tool: 400,
+// 404 or 422 naming web_search, or refusing a required tool_choice for want
+// of a tool.
+func refusesTool(status int, message string) bool {
+	if status != http.StatusBadRequest && status != http.StatusNotFound && status != http.StatusUnprocessableEntity {
+		return false
+	}
+	message = strings.ToLower(message)
+	return strings.Contains(message, "web_search") || strings.Contains(message, noAvailableTool)
+}
+
 // ObserveFailure looks at one failed client request: an upstream that refused
-// the web_search tool of a catalog candidate (400, 404 or 422 naming
-// web_search) is marked as refusing, its sessions stop being sent the tool,
-// and it is probed again after rejectionRecheck.
+// the web_search tool of a catalog candidate (refusesTool) is marked as
+// refusing it for that model, its sessions of the model stop being sent the
+// tool, and the model is probed there again after rejectionRecheck.
 func (m *Manager) ObserveFailure(authIndex, model string, status int, message string) {
 	if d := m.snapshot.Load(); authIndex == "" || !d.enabled || !d.candidates[model] {
 		return
 	}
-	if status != http.StatusBadRequest && status != http.StatusNotFound && status != http.StatusUnprocessableEntity {
-		return
-	}
-	if !strings.Contains(strings.ToLower(message), "web_search") {
+	if !refusesTool(status, message) {
 		return
 	}
 	now := m.now()
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	rec := m.recordLocked(authIndex)
+	p := m.recordLocked(authIndex).pairFor(model)
 	count := 1
-	if previous := rec.Rejection; previous != nil {
+	if previous := p.Rejection; previous != nil {
 		count = previous.Count + 1
 		if now.Sub(previous.At) < rejectionDebounce {
 			previous.Count, m.dirty = count, true
 			return
 		}
 	}
-	rec.Rejection = &Rejection{At: now.UTC(), Count: count, Model: model, Status: status, Error: truncate(message), RecheckAt: now.Add(rejectionRecheck).UTC()}
+	p.Rejection = &Rejection{At: now.UTC(), Count: count, Model: model, Status: status, Error: truncate(message), RecheckAt: now.Add(rejectionRecheck).UTC()}
 	m.dirty = true
 	m.rebuildLocked()
-	m.log("warn", fmt.Sprintf("native search: channel %s refused the web_search tool for %s (HTTP %d); its sessions search no more until a probe passes", authIndex, model, status))
+	m.log("warn", fmt.Sprintf("native search: channel %s refused the web_search tool for %s (HTTP %d); its sessions of the model search no more until a probe passes", authIndex, model, status))
 }
 
 func (m *Manager) recordLocked(authIndex string) *channelRecord {
@@ -429,10 +596,20 @@ func (m *Manager) Settings() Settings {
 
 // Update normalizes and stores new settings and returns the previous and
 // stored ones. Equal settings are not written. Switching native search off
-// cancels the round under way. A read-only instance returns ErrReadOnly,
-// invalid settings an error wrapping ErrInvalidSettings; after any error the
-// settings are unchanged.
+// cancels the round under way. The automatic exclusions follow at once:
+// switching them or native search off gives every excluded model back. A
+// read-only instance returns ErrReadOnly, invalid settings an error wrapping
+// ErrInvalidSettings; after any error the settings are unchanged.
 func (m *Manager) Update(next Settings) (previous, stored Settings, err error) {
+	previous, stored, err = m.update(next)
+	if err == nil && !reflect.DeepEqual(previous, stored) {
+		// A failed edit is shown with the exclusions and retried every tick.
+		_, _ = m.reconcile(nil)
+	}
+	return previous, stored, err
+}
+
+func (m *Manager) update(next Settings) (previous, stored Settings, err error) {
 	if !m.canWrite() {
 		return Settings{}, Settings{}, ErrReadOnly
 	}
@@ -513,25 +690,21 @@ func (m *Manager) HandOff(limit time.Duration) int {
 	}
 }
 
-// Tick runs the periodic work: it refreshes the credential list, starts the
-// round that is due and writes pending evidence. The plugin calls it every
-// minute. Before Start it only keeps the decisions current, without asking
-// CPA for anything.
+// Tick runs the periodic work: it refreshes the credential list, brings the
+// automatic exclusions in CPA's config up to date, starts the round that is
+// due and writes pending evidence. The plugin calls it every minute. Before
+// Start it asks CPA for nothing but to give back what it excluded.
 func (m *Manager) Tick() {
 	m.mu.Lock()
 	started := m.started
 	m.mu.Unlock()
-	var credentials []Credential
-	var listErr error
-	if started {
-		credentials, listErr = m.upstream.Credentials()
+	m.refresh(started)
+	if edited, _ := m.reconcile(nil); edited && started {
+		// The round below and the status see CPA's config as edited.
+		m.refresh(true)
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if started {
-		m.applyCredentialsLocked(credentials, listErr)
-	}
-	m.rebuildLocked()
 	now := m.now()
 	if m.started && m.round == nil && m.settings.Enabled && m.credErr == "" && now.Sub(m.startedAt) >= startupGrace {
 		if kind, jobs := m.dueLocked(now); len(jobs) > 0 {
@@ -539,6 +712,22 @@ func (m *Manager) Tick() {
 		}
 	}
 	m.flushLocked()
+}
+
+// refresh lists the credentials, when list says to, and rebuilds the
+// decisions.
+func (m *Manager) refresh(list bool) {
+	var credentials []Credential
+	var listErr error
+	if list {
+		credentials, listErr = m.upstream.Credentials()
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if list {
+		m.applyCredentialsLocked(credentials, listErr)
+	}
+	m.rebuildLocked()
 }
 
 // applyCredentialsLocked keeps the codex credentials of a complete list and
@@ -549,7 +738,7 @@ func (m *Manager) applyCredentialsLocked(listed []Credential, listErr error) {
 		m.credErr = listErr.Error()
 		return
 	}
-	m.credErr = ""
+	m.credErr, m.listedAt = "", m.now()
 	codex := []Credential{}
 	for _, c := range listed {
 		if strings.EqualFold(c.Provider, "codex") && c.AuthIndex != "" && c.ID != "" {
@@ -566,6 +755,12 @@ func (m *Manager) applyCredentialsLocked(listed []Credential, listErr error) {
 	for index := range m.records {
 		if !slices.ContainsFunc(codex, func(c Credential) bool { return c.AuthIndex == index }) {
 			delete(m.records, index)
+		}
+	}
+	for key := range m.exclusions {
+		if !slices.ContainsFunc(codex, func(c Credential) bool { return c.AuthIndex == key.authIndex }) {
+			// The key is gone from CPA's config, its entries with it.
+			delete(m.exclusions, key)
 		}
 	}
 }
@@ -594,8 +789,9 @@ func (m *Manager) servedLocked(c Credential, candidates []string) []string {
 }
 
 // dueLocked picks the round to start: a full round of every channel once the
-// interval passed since the last; else the channels never probed, refusing
-// past their recheck time, or failing for failingRecheck.
+// interval passed since the last; else the channels never probed, with a
+// model due again (focusLocked), or failing for failingRecheck. A channel's
+// due model is the one its job probes first.
 func (m *Manager) dueLocked(now time.Time) (string, []job) {
 	candidates := m.candidatesLocked(now)
 	if len(candidates) == 0 {
@@ -617,27 +813,73 @@ func (m *Manager) dueLocked(now time.Time) (string, []job) {
 			// had none to.
 			models = append(slices.Clone(rec.NotServing), models...)
 		}
+		focus, trial := m.focusLocked(c, rec, candidates, now)
+		if focus != "" {
+			models = moveFirst(models, focus)
+			if trial && !slices.Contains(models, focus) {
+				// The model is back on the channel in CPA's config; the
+				// credential list may not show it yet.
+				models = append([]string{focus}, models...)
+			}
+		}
 		if len(models) == 0 {
 			continue
 		}
+		j := job{credential: c, models: models}
+		if trial {
+			j.trial = focus
+		}
 		if full {
-			jobs = append(jobs, job{credential: c, models: models})
+			jobs = append(jobs, j)
 			continue
 		}
 		switch {
-		case rec == nil || len(rec.Probes) == 0 && rec.Rejection == nil:
+		case rec == nil || len(rec.Probes) == 0 && !rec.refusing():
 			kind = cmp.Or(kind, RoundDiscover)
-		case rec.Rejection != nil && !now.Before(rec.Rejection.RecheckAt):
+		case focus != "":
 			kind = cmp.Or(kind, RoundRecheck)
-			models = moveFirst(models, rec.Rejection.Model)
-		case rec.Rejection == nil && classify(rec, false, m.settings.IntervalHours, now) == StateFailing && now.Sub(rec.Probes[len(rec.Probes)-1].At) >= failingRecheck:
+		case !rec.refusing() && classify(rec, false, m.settings.IntervalHours, now) == StateFailing && now.Sub(rec.Probes[len(rec.Probes)-1].At) >= failingRecheck:
 			kind = cmp.Or(kind, RoundRecheck)
 		default:
 			continue
 		}
-		jobs = append(jobs, job{credential: c, models: models})
+		jobs = append(jobs, j)
 	}
 	return kind, jobs
+}
+
+// focusLocked picks the model of channel c to probe next out of turn, if
+// any: one given back on trial that no probe answered since, else one whose
+// refusal is due for its recheck, else one that did not search once and
+// waited pairRecheck (failingRecheck after a failed probe of it). trial says
+// the model is on trial.
+func (m *Manager) focusLocked(c Credential, rec *channelRecord, candidates []string, now time.Time) (string, bool) {
+	var refused, unsettled string
+	for _, model := range candidates {
+		if e := m.exclusions[pair{c.AuthIndex, model}]; e != nil && !e.TrialAt.IsZero() {
+			if p := rec.pair(model); p == nil || p.LastProbe.Before(e.TrialAt) || p.LastResult == ResultError && now.Sub(p.LastProbe) >= rejectionRecheck {
+				return model, true
+			}
+			continue
+		}
+		p := rec.pair(model)
+		switch {
+		case p == nil || !serves(c, rec, model):
+		case p.Rejection != nil:
+			if refused == "" && !now.Before(p.Rejection.RecheckAt) {
+				refused = model
+			}
+		case unsettled == "" && p.NoSearch == 1:
+			wait := pairRecheck
+			if p.LastResult == ResultError {
+				wait = failingRecheck
+			}
+			if now.Sub(p.LastProbe) >= wait {
+				unsettled = model
+			}
+		}
+	}
+	return cmp.Or(refused, unsettled), false
 }
 
 func moveFirst(models []string, model string) []string {
@@ -743,6 +985,13 @@ func (m *Manager) runJob(ctx context.Context, round *roundState, j job) {
 		case outcomeCancelled:
 			return
 		case outcomeNotServing:
+			if model == j.trial {
+				// CPA has not reloaded its config yet; the next tick asks again.
+				m.mu.Lock()
+				round.done++
+				m.mu.Unlock()
+				return
+			}
 			if j.credential.Models == nil {
 				m.markNotServing(j.credential.AuthIndex, model)
 				continue
@@ -767,8 +1016,8 @@ func (m *Manager) markNotServing(authIndex, model string) {
 	}
 }
 
-// recordProbe keeps a probe in the channel's history. One that searches
-// after a refusal clears it; any other moves its recheck on.
+// recordProbe keeps a probe in the channel's history and in its model's
+// evidence (pairRecord.observe).
 func (m *Manager) recordProbe(round *roundState, authIndex string, probe Probe) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -782,13 +1031,7 @@ func (m *Manager) recordProbe(round *roundState, authIndex string, probe Probe) 
 		rec.Probes = slices.Clone(rec.Probes[len(rec.Probes)-historyLimit:])
 	}
 	rec.Rotation++
-	if r := rec.Rejection; r != nil {
-		if probe.Result == ResultSearch && probe.At.After(r.At) {
-			rec.Rejection = nil
-		} else {
-			r.RecheckAt = m.now().Add(failingRecheck).UTC()
-		}
-	}
+	rec.pairFor(probe.Model).observe(probe, m.now())
 	round.done++
 	m.dirty = true
 	m.rebuildLocked()

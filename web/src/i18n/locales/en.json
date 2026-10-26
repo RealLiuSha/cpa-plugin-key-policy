@@ -200,7 +200,9 @@
       "run_quality": "Run detection",
       "start_inspection": "Start inspection",
       "clear_quality": "Clear detection records",
-      "update_inspection": "Change inspection settings"
+      "update_inspection": "Change inspection settings",
+      "native_exclusions": "Automatic exclusion (CPA config edited)",
+      "update_native_exclusion": "Release or resume an automatic exclusion"
     },
     "field": {
       "daily_limit_usd": "Daily quota",
@@ -246,7 +248,10 @@
       "target_model": "Target model",
       "keep_models": "Kept models",
       "channels": "Search channels",
-      "probe": "Health probes"
+      "probe": "Health probes",
+      "excluded": "Excluded",
+      "restored": "Given back",
+      "action": "Action"
     },
     "value": {
       "on": "enabled",
@@ -943,7 +948,9 @@
         "state": "State",
         "lastProbe": "Last check",
         "history": "Recent checks",
-        "rejections": "Refused the tool"
+        "rejections": "Refused the tool",
+        "evidence": "Evidence",
+        "next": "Next"
       },
       "mode": {
         "native": "Native",
@@ -963,7 +970,7 @@
       "modelExcluded": "{{model}} stays on alpha search.",
       "include": "Include",
       "exclude": "Exclude",
-      "gapNote": "The search runs on the channel serving the turn and cannot be moved to another one. Sessions on a channel that does not search go without: an unsupported channel ignores the tool, and Luobo takes the tool out of requests to a channel that is disabled or refused it. For every session to search, remove these models from those channels in CPA, or require every serving channel to pass.",
+      "gapNote": "The search runs on the channel serving the turn and cannot be moved to another one. Sessions on a channel that does not search go without: an unsupported channel ignores the tool, and Luobo takes the tool out of requests to a channel that is disabled or refused it. With automatic exclusion below, a CPA config key confirmed not to search is taken off the model in CPA, so its sessions go to the channels that search; or require every serving channel to pass.",
       "channelsTitle": "Channels",
       "channelsEmpty": "No codex channel serves these models yet.",
       "cpaDisabled": "Disabled in CPA",
@@ -1007,7 +1014,52 @@
       "onApply": "Turn on",
       "offTitle": "Turn native search off",
       "offConfirm": "Every model goes back to alpha search within about five minutes, and the checks stop.",
-      "offApply": "Turn off"
+      "offApply": "Turn off",
+      "exclusionsTitle": "Automatic exclusion",
+      "autoExcludeLabel": "Exclude channels that do not search",
+      "exclusionsDescription": "For a model that searches natively, once a CPA config key is confirmed not to run the search (two checks of the model in a row without a search, or one after it refused the tool), Luobo adds the model to the key's excluded-models in CPA's config.yaml: CPA stops sending it that model and keeps sending it the others. It only does so while another channel searches for the model. The model is given back on trial after the check interval (doubling each time, up to 7 days) and the exclusion ends once a check searches. Every write makes CPA reload its config; session bindings stay, and only the sessions of the excluded model on that key move to another channel. Changes within a minute go in one write. Keys CPA disabled, and keys that take their group's excluded-models, are left alone.",
+      "exclusionsEmpty": "No channel is excluded automatically.",
+      "exclusionsOff": "Automatic exclusion is off.",
+      "exclusionWriteFailed": "Cannot write CPA's config, retrying every minute: {{error}}",
+      "exclusionReleased": "Released: {{name}} keeps serving {{model}}; automatic exclusion leaves it alone until resumed.",
+      "exclusionResumed": "Automatic exclusion resumed for {{model}} on {{name}}.",
+      "exclusionFailed": "The change failed",
+      "release": "Release",
+      "releaseFor": "Release the automatic exclusion of {{model}} on {{name}}",
+      "resume": "Resume",
+      "resumeFor": "Resume the automatic exclusion of {{model}} on {{name}}",
+      "autoOnTitle": "Turn on automatic exclusion",
+      "autoOnConfirm": "A CPA config key confirmed not to run native search is then taken off the model in CPA's config.yaml, and CPA reloads its config (session bindings stay). It only happens while another channel searches for the model, and each exclusion is checked again on trial.",
+      "autoOnApply": "Turn on",
+      "autoOffTitle": "Turn off automatic exclusion",
+      "autoOffConfirm": "Every exclusion Luobo wrote into CPA's config is taken out, so those channels serve the models again and their sessions go without search.",
+      "autoOffApply": "Turn off",
+      "autoTurnedOn": "Automatic exclusion is on.",
+      "autoTurnedOff": "Automatic exclusion is off; the excluded models are back on their channels.",
+      "exclusion": {
+        "state": {
+          "active": "Excluded",
+          "pending": "To write",
+          "trial": "On trial",
+          "blocked": "Cannot exclude",
+          "kept": "Kept"
+        },
+        "hint": {
+          "active": "CPA no longer sends this model to the channel.",
+          "pending": "Excluded with the next write of CPA's config.",
+          "trial": "Back on the channel for now; one check decides whether it stays excluded.",
+          "blocked": "No other channel searches for the model; excluding this one would leave it without search.",
+          "kept_operator": "Released here; not excluded again until resumed.",
+          "kept_config": "The entry was taken out of CPA's config by hand, which counts as the operator's choice; not excluded again until resumed."
+        },
+        "evidence": "{{count}} checks in a row without a search",
+        "refused": "Refused the tool {{at}} (HTTP {{status}})",
+        "since": "Since {{at}}",
+        "retryAt": "Trial {{at}}",
+        "trialAt": "On trial since {{at}}",
+        "keptAt": "Kept {{at}}",
+        "trials": "{{count}} trials without a search"
+      }
     }
   },
   "quality": {
